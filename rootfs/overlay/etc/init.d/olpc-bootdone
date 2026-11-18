@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# Last service of the default runlevel: marks the boot as complete.
+
+description="olpc-boy boot-complete marker"
+
+depend() {
+	need olpclog
+	after *
+}
+
+start() {
+	ebegin "Writing REACHED_USERSPACE_OK"
+	/usr/local/sbin/olpc-bootdone
+	eend $?
+}
+stop() { return 0; }

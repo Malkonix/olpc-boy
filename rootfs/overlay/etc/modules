@@ -1,0 +1,8 @@
+# Loaded by the openrc 'modules' service ("modprobe -q", missing ones ignored).
+# Most of these are probably built in; this is only a safety net.
+evdev
+snd-cs5535audio
+olpc-xo1-sci
+olpc_battery
+olpc-xo1-rtc
+geode-rng

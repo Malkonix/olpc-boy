@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+# Power button: sync logs and power off cleanly.
+
+description="olpc-boy power button handler"
+command=/usr/local/sbin/olpc-powerbtn
+command_background=yes
+pidfile=/run/olpc-powerbtn.pid
+
+depend() {
+	need olpclog
+	after mdev hwdrivers modules
+}

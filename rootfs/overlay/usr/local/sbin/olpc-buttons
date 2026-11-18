@@ -1,0 +1,75 @@
+#!/bin/sh
+# Interactive button capture on tty1.  Bounded: ends by itself after
+# OLPC_BUTTONS_SECS (default 60).  Skipped by cmdline olpcboy.nobuttons.
+# Records every event of every /dev/input/event* (evtest) into buttons.log and
+# echoes it on screen as feedback.
+. /usr/libexec/olpcboy/common.sh
+SECS=${OLPC_BUTTONS_SECS:-60}
+LOG=$BOOTDIR/buttons.log
+
+if cmdline_has olpcboy.nobuttons; then
+	echo "buttons capture skipped (olpcboy.nobuttons)"
+	tl "buttons skipped"
+	exit 0
+fi
+
+tl "buttons begin (${SECS}s)"
+printf '\033[2J\033[H'
+printf '\033[1;37;44m%-75s\033[0m\n' " BUTTON TEST   ($SECS seconds)"
+cat <<'MSG'
+
+  Press each button ONCE:
+
+     UP  DOWN  LEFT  RIGHT
+     CIRCLE  CROSS  SQUARE  CHECK
+     ROTATE
+
+  Then flip to EBOOK mode and back.
+
+MSG
+echo "== buttons begin, uptime $(olpc_uptime), ${SECS}s" >>"$LOG"
+
+# one reader per device; each prints "<event> <name>: <line>" atomically
+n=0
+for dev in /dev/input/event*; do
+	[ -c "$dev" ] || continue
+	e=${dev##*/}
+	name=$(cat "/sys/class/input/$e/device/name" 2>/dev/null)
+	[ -z "$name" ] && name=unknown
+	n=$((n + 1))
+	echo "# device $dev name='$name'" >>"$LOG"
+	(
+		timeout "$SECS" evtest "$dev" 2>/dev/null | while IFS= read -r line; do
+			case "$line" in
+			"Event: time"*)
+				case "$line" in
+				*EV_SYN*) continue ;;
+				esac
+				ev=${line#Event: }
+				out="$e [$name] $ev"
+				echo "$out" >>"$LOG"
+				# on-screen: short form
+				printf '%s\n' "$(echo "$e $ev" | cut -c1-75)"
+				;;
+			esac
+		done
+	) &
+done
+if [ "$n" -eq 0 ]; then
+	echo "NO INPUT DEVICES FOUND" | tee -a "$LOG"
+fi
+
+# periodic sync while capturing, then wait for readers (bounded by timeout)
+i=0
+while [ $i -lt $((SECS + 3)) ]; do
+	sleep 2
+	sync
+	i=$((i + 2))
+done
+wait
+echo "== buttons end, uptime $(olpc_uptime)" >>"$LOG"
+sync
+tl "buttons end"
+printf '\033[1;32m\n  Button test finished.\033[0m\n'
+sleep 2
+exit 0

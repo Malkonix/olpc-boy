@@ -1,0 +1,16 @@
+#!/bin/sh
+# olpc-dcon mono|color|status
+# Switch the XO-1 display controller (DCON) between monochrome and colour mode.
+# The sysfs node lives under the DCON i2c device, so locate it instead of
+# hard-coding the path.
+. /usr/libexec/olpcboy/common.sh
+node=$(find /sys/devices -name monochrome 2>/dev/null | head -n1)
+if [ -z "$node" ]; then
+	tl "dcon: no monochrome node in sysfs (DCON driver not bound?)"
+	exit 1
+fi
+case "$1" in
+	mono)  echo 1 >"$node" ;;
+	color) echo 0 >"$node" ;;
+esac
+tl "dcon: $node = $(cat "$node" 2>&1)"

@@ -1,0 +1,108 @@
+#!/bin/sh
+# One-shot hardware/software inventory into $BOOTDIR/inventory/.
+# Every external command is bounded by timeout; a failure is logged, never fatal.
+. /usr/libexec/olpcboy/common.sh
+INV=$BOOTDIR/inventory
+mkdir -p "$INV"
+tl "inventory start"
+
+# cp_proc <file>: copy a /proc or /sys file
+cp_file() {
+	timeout 5 cat "$1" >"$INV/$(echo "$1" | tr '/' '_' | sed 's/^_//').txt" 2>&1
+}
+
+# run <name> <timeout> <cmd...>: output -> inventory/<name>.txt (+ rc line)
+run() {
+	_n=$1; _t=$2; shift 2
+	timeout "$_t" "$@" >"$INV/$_n.txt" 2>&1
+	_rc=$?
+	[ $_rc -ne 0 ] && echo "[rc=$_rc]" >>"$INV/$_n.txt"
+	return 0
+}
+
+for f in /proc/cpuinfo /proc/meminfo /proc/interrupts /proc/iomem /proc/ioports \
+	/proc/cmdline /proc/modules /proc/devices /proc/mtd /proc/partitions \
+	/proc/mounts /proc/bus/input/devices /proc/asound/cards /proc/asound/devices \
+	/proc/version /proc/filesystems /proc/swaps /proc/loadavg /proc/misc \
+	/proc/fb /proc/tty/drivers /proc/sys/kernel/core_pattern /sys/power/state; do
+	[ -r "$f" ] && cp_file "$f"
+done
+
+run lspci-vnn 15 lspci -vnn
+run lsusb-v 20 lsusb -v          # bounded; also the plain tree below
+run lsusb-tree 10 lsusb -t
+run lsusb 10 lsusb
+run fbset-i 5 fbset -fb /dev/fb0 -i
+run dmesg 10 dmesg
+run rc-status 10 rc-status -a
+run free 5 free
+run df 5 df -h
+run ps 5 ps
+run uname 5 uname -a
+run blkid 10 blkid
+run lsmod 5 lsmod
+run aplay-l 10 aplay -l
+run arecord-l 10 arecord -l
+run amixer-contents 10 amixer -c 0 contents
+run amixer-scontrols 10 amixer -c 0 scontrols
+run mtd-list 5 cat /proc/mtd
+run v4l2-list 10 v4l2-ctl --list-devices
+run ip-link 5 ip link
+run rfkill 5 rfkill list
+run sysctl 5 sysctl -a
+
+# sysfs trees, small files only
+{
+	for d in /sys/class/backlight/*; do
+		[ -d "$d" ] || continue
+		echo "== $d"
+		for f in brightness max_brightness actual_brightness bl_power type; do
+			[ -r "$d/$f" ] && echo "$f=$(cat "$d/$f" 2>&1)"
+		done
+	done
+} >"$INV/backlight.txt" 2>&1
+
+{
+	for d in /sys/class/power_supply/*; do
+		[ -d "$d" ] || continue
+		echo "== $d"
+		timeout 3 cat "$d/uevent" 2>&1
+	done
+} >"$INV/power_supply.txt" 2>&1
+
+{
+	for d in /sys/class/input/event*; do
+		[ -d "$d" ] || continue
+		echo "== $d  name=$(cat "$d/device/name" 2>/dev/null)"
+		for c in "$d"/device/capabilities/*; do
+			[ -r "$c" ] && echo "  caps/$(basename "$c")=$(cat "$c")"
+		done
+		echo "  phys=$(cat "$d/device/phys" 2>/dev/null) uniq=$(cat "$d/device/uniq" 2>/dev/null)"
+	done
+} >"$INV/input-capabilities.txt" 2>&1
+
+# any DCON / graphics / mtd / mmc / rtc / watchdog nodes that exist
+{
+	for d in /sys/class/graphics/fb* /sys/class/mtd/mtd[0-9]* /sys/class/mmc_host/* \
+		/sys/class/rtc/* /sys/class/watchdog/* /sys/class/video4linux/* \
+		/sys/class/net/* /sys/class/thermal/*; do
+		[ -e "$d" ] || continue
+		echo "== $d"
+		for f in "$d"/*; do
+			[ -f "$f" ] && [ -r "$f" ] && \
+				echo "  $(basename "$f")=$(timeout 2 head -c 200 "$f" 2>/dev/null | tr '\n' ' ')"
+		done
+	done
+	echo "== dcon"
+	ls -d /sys/devices/platform/dcon* /sys/devices/*/dcon* 2>/dev/null
+	for f in /sys/devices/platform/dcon/*; do
+		[ -f "$f" ] && [ -r "$f" ] && echo "  $(basename "$f")=$(timeout 2 head -c 100 "$f" 2>/dev/null | tr '\n' ' ')"
+	done
+} >"$INV/sysfs-classes.txt" 2>&1
+
+ls -lR /dev >"$INV/dev-listing.txt" 2>&1
+ls /sys/bus/*/devices >"$INV/sys-bus-devices.txt" 2>&1
+
+sync
+tl "inventory done"
+exit 0

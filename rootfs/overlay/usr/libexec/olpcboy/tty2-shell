@@ -1,0 +1,6 @@
+#!/bin/sh
+# login program for tty2 (getty -n -l): root shell without password,
+# for an optional USB keyboard.
+export HOME=/root TERM=${TERM:-linux}
+cd /root 2>/dev/null
+exec /bin/sh -l

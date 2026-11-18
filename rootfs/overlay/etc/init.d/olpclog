@@ -1,0 +1,49 @@
+#!/sbin/openrc-run
+# Early logging service: finds the boot dir, sets up core dumps, keeps the
+# log partition synced.  Robust if /mnt/olpclog is not mounted (the boot dir
+# is then a directory on the root fs, see common.sh).
+
+description="olpc-boy boot logging (boot dir, core dumps, sync loop)"
+
+depend() {
+	after sysfs procfs devfs
+	before modules hwdrivers mdev syslog bootmisc
+}
+
+start() {
+	. /usr/libexec/olpcboy/common.sh
+	ebegin "olpclog: boot dir $BOOTDIR"
+	mkdir -p "$BOOTDIR" /run/olpcboy
+	echo "$BOOTDIR" >/run/olpcboy/bootdir
+	tl "olpclog start (boot dir $BOOTDIR)"
+
+	# make sure the logging fs is writable; if the initramfs could not mount
+	# it, try once more (never fatal)
+	if ! grep -q ' /mnt/olpclog ' /proc/mounts; then
+		tl "WARNING: /mnt/olpclog not mounted, trying LABEL=OLPCLOG"
+		mount /mnt/olpclog 2>>"$BOOTDIR/olpclog.err"
+	fi
+
+	# core dumps into the boot dir: kernel.core_pattern, size-limited by the
+	# rc_ulimit in rc.conf (services) and ulimit -c in /etc/profile (shells)
+	echo "$BOOTDIR/core.%e.%p" >/proc/sys/kernel/core_pattern 2>/dev/null
+	echo 0 >/proc/sys/kernel/core_uses_pid 2>/dev/null
+
+	# console never blank
+	printf '\033[9;0]\033[14;0]' >/dev/tty0 2>/dev/null
+
+	cat /proc/uptime >"$BOOTDIR/uptime.at-olpclog" 2>/dev/null
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile /run/olpcboy/syncloop.pid \
+		--exec /usr/libexec/olpcboy/syncloop
+	eend 0
+}
+
+stop() {
+	. /usr/libexec/olpcboy/common.sh
+	ebegin "olpclog: final sync"
+	tl "olpclog stop (shutdown)"
+	start-stop-daemon --stop --quiet --pidfile /run/olpcboy/syncloop.pid
+	sync
+	eend 0
+}

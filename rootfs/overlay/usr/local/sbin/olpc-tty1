@@ -1,0 +1,48 @@
+#!/bin/sh
+# tty1 driver (respawned by init): selftest -> button capture -> status screen.
+# Never waits for keyboard input.  Selftest/buttons run only once per boot.
+. /usr/libexec/olpcboy/common.sh
+exec </dev/null
+STATE=/run/olpcboy/tty1.state
+mkdir -p /run/olpcboy
+
+if [ ! -e "$STATE" ]; then
+	: >"$STATE"
+	printf '\033[2J\033[H'
+	tl "tty1: selftest start"
+	/usr/local/sbin/olpc-selftest
+	tl "tty1: selftest done"
+	if ! cmdline_has olpcboy.nobuttons; then
+		/usr/local/sbin/olpc-buttons
+	fi
+	tl "tty1: status screen"
+fi
+
+draw() {
+	printf '\033[2J\033[H'
+	printf '\033[1;37;44m%-75s\033[0m\n' " OLPC-BOY   boot $(basename "$(readlink -f "$BOOTDIR")")"
+	echo
+	if [ -f "$BOOTDIR/REACHED_USERSPACE_OK" ]; then
+		printf '\033[1;32m  Userspace reached OK (uptime %ss)\033[0m\n' "$(cat "$BOOTDIR/REACHED_USERSPACE_OK")"
+	else
+		printf '\033[1;31m  Userspace NOT confirmed yet\033[0m\n'
+	fi
+	[ -f "$BOOTDIR/PREVIOUS_BOOT_INCOMPLETE" ] && \
+		printf '\033[1;33m  Previous boot was incomplete!\033[0m\n'
+	echo
+	echo "  Selftest:"
+	if [ -f "$BOOTDIR/selftest.summary" ]; then
+		sed 's/^/    /' "$BOOTDIR/selftest.summary" | head -n 12
+	else
+		echo "    (no result)"
+	fi
+	echo
+	printf '\033[1;37;41m%-75s\033[0m\n' " Hold POWER to shut down, then move the USB stick to the PC"
+	echo
+	echo "  Logs: $BOOTDIR"
+}
+
+while :; do
+	draw
+	sleep 60
+done

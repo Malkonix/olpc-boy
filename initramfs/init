@@ -1,0 +1,312 @@
+#!/bin/sh
+# olpc-boy initramfs /init  (busybox ash, static busybox, no device nodes
+# shipped: everything comes from devtmpfs).
+#
+# Flow:
+#   1. mount proc/sys/devtmpfs, grab the console
+#   2. find + mount the FAT log partition (LABEL=OLPCLOG), create the next
+#      logs/boot-NNNN/ directory, start the kmsg copier
+#   3. find + mount the ext4 root (LABEL=OLPCROOT or olpcboy.root=)
+#   4. point the new root at the boot dir, move mounts, exec switch_root
+# On failure: big message on the console, diagnostics to the log partition,
+# keep retrying forever; a getty on tty2 is available for a USB keyboard.
+# Never use `set -e` here: a failed probe must not abort logging.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+LOGLABEL=OLPCLOG
+ROOTLABEL=OLPCROOT
+WAIT_SECS=20
+
+CON=/dev/console
+LOGMNT=/log
+NEWROOT=/newroot
+BOOTNAME=""     # e.g. boot-0007
+BOOTDIR=""      # absolute path of the boot dir (log partition or tmpfs)
+HAVE_LOG=0
+LOGDEV=""
+ROOTDEV=""
+KMSG_PID=""
+
+# ---------------------------------------------------------------- basics
+mkdir -p /proc /sys /dev /run /tmp /log /newroot
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs -o mode=0755 tmpfs /run
+mkdir -p /run/olpcboy
+
+# grab the console (kernel could not open one: no /dev/console in the cpio)
+if [ -c "$CON" ]; then
+	exec <"$CON" >"$CON" 2>&1
+fi
+# console must never blank/power down: nobody can press a key to wake it
+printf '\033[9;0]\033[14;0]' 2>/dev/null
+
+CMDLINE=$(cat /proc/cmdline)
+
+cmdline_get() {   # cmdline_get key  -> value of key=value (empty if absent)
+	for w in $CMDLINE; do
+		case "$w" in
+		"$1"=*) echo "${w#*=}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+uptime_s() { cut -d' ' -f1 /proc/uptime; }
+
+# tl: timeline entry, to tmpfs and (if available) to the boot dir
+tl() {
+	echo "$(uptime_s) initramfs: $*" >>/run/olpcboy/timeline.log
+	[ -n "$BOOTDIR" ] && echo "$(uptime_s) initramfs: $*" >>"$BOOTDIR/timeline.log"
+}
+
+say() { echo "[olpc-boy] $*"; tl "$*"; }
+
+# ---------------------------------------------------------------- helpers
+find_label() {   # find_label LABEL -> device path on stdout
+	findfs "LABEL=$1" 2>/dev/null
+}
+
+# wait_label LABEL SECS -> prints device, returns 0/1
+wait_label() {
+	_i=0
+	while [ "$_i" -lt "$2" ]; do
+		_d=$(find_label "$1")
+		if [ -n "$_d" ] && [ -b "$_d" ]; then echo "$_d"; return 0; fi
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+num_strip() { _n=$(echo "$1" | sed 's/^0*//'); echo "${_n:-0}"; }
+
+# ---------------------------------------------------------------- log part
+mount_log() {
+	LOGDEV=$(wait_label "$LOGLABEL" "$WAIT_SECS")
+	if [ -z "$LOGDEV" ]; then
+		say "log partition LABEL=$LOGLABEL NOT FOUND after ${WAIT_SECS}s"
+		return 1
+	fi
+	say "log partition is $LOGDEV"
+	# flush: vfat writes data out aggressively; we also run a 1s sync loop
+	mount -t vfat -o rw,noatime,flush "$LOGDEV" "$LOGMNT" 2>/run/olpcboy/mount_log.err \
+		|| mount -o rw,noatime "$LOGDEV" "$LOGMNT" 2>>/run/olpcboy/mount_log.err
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		say "mounting $LOGDEV failed rc=$rc: $(cat /run/olpcboy/mount_log.err)"
+		return 1
+	fi
+	return 0
+}
+
+new_boot_dir() {
+	mkdir -p "$LOGMNT/logs"
+	# previous boot = highest existing boot-NNNN (before we create ours)
+	PREV=$(ls -d "$LOGMNT"/logs/boot-[0-9]* 2>/dev/null | sort | tail -1)
+	c=""
+	[ -f "$LOGMNT/logs/counter" ] && c=$(head -n1 "$LOGMNT/logs/counter" | tr -dc '0-9')
+	n=$(num_strip "$c")
+	if [ -n "$PREV" ]; then      # counter lost/behind: trust the directory list
+		pn=$(num_strip "${PREV##*boot-}")
+		[ "$pn" -gt "$n" ] && n=$pn
+	fi
+	n=$((n + 1))
+	while :; do
+		BOOTNAME=$(printf 'boot-%04d' "$n")
+		[ -e "$LOGMNT/logs/$BOOTNAME" ] || break
+		n=$((n + 1))
+	done
+	mkdir -p "$LOGMNT/logs/$BOOTNAME" || return 1
+	echo "$n" >"$LOGMNT/logs/counter"
+	BOOTDIR="$LOGMNT/logs/$BOOTNAME"
+	: >"$BOOTDIR/STARTED"
+	echo "$(uptime_s)" >"$BOOTDIR/STARTED"
+	# the new root finds this through logs/current as well as /var/log/olpc-current
+	echo "$BOOTNAME" >"$LOGMNT/logs/current"
+	cat /run/olpcboy/timeline.log >>"$BOOTDIR/timeline.log" 2>/dev/null
+	echo "$CMDLINE" >"$BOOTDIR/cmdline.txt"
+
+	if [ -n "$PREV" ] && [ -f "$PREV/STARTED" ] && [ ! -f "$PREV/REACHED_USERSPACE_OK" ]; then
+		echo "previous boot ${PREV##*/} has STARTED but no REACHED_USERSPACE_OK" \
+			>"$BOOTDIR/PREVIOUS_BOOT_INCOMPLETE"
+		say "WARNING: previous boot ${PREV##*/} did not reach userspace"
+	fi
+	sync
+	say "boot dir is $BOOTNAME"
+	return 0
+}
+
+# kmsg copier: ONE long-lived `cat` so it keeps working after switch_root
+# (the initramfs is deleted then; a shell loop could not exec anything).
+start_kmsg_copier() {
+	if [ -c /dev/kmsg ]; then
+		cat /dev/kmsg >>"$1" 2>/dev/null &
+		KMSG_PID=$!
+		echo "$KMSG_PID" >/run/olpcboy/kmsg.pid
+	else
+		say "no /dev/kmsg (CONFIG_DEVKMSG?) - copier not started"
+	fi
+}
+
+# 1s sync loop, only lives until switch_root (olpclog service takes over)
+start_syncer() {
+	( while :; do sync; sleep 1; done ) &
+	SYNC_PID=$!
+}
+
+# ---------------------------------------------------------------- failure
+# Print a big message, dump diagnostics, keep tty2 shell for a USB keyboard.
+SH_STARTED=0
+spawn_tty2_shell() {
+	[ "$SH_STARTED" = 1 ] && return
+	SH_STARTED=1
+	[ -c /dev/tty2 ] && getty -n -l /bin/sh 38400 tty2 </dev/null >/dev/null 2>&1 &
+}
+
+dump_diag() {   # dump_diag file
+	{
+		echo "== uptime $(uptime_s)"
+		echo "== cmdline: $CMDLINE"
+		echo "== /proc/partitions"; cat /proc/partitions
+		echo "== blkid"; timeout 10 blkid
+		echo "== mounts"; cat /proc/mounts
+		echo "== /proc/filesystems"; cat /proc/filesystems
+		echo "== dmesg tail"; dmesg | tail -n 120
+	} >"$1" 2>&1
+}
+
+fail() {   # fail "reason line 1" ["reason line 2"]
+	spawn_tty2_shell
+	{
+		echo
+		echo "########################################################"
+		echo "#                                                      #"
+		echo "#   OLPC-BOY BOOT FAILURE                              #"
+		echo "#                                                      #"
+		echo "########################################################"
+		for l in "$@"; do echo "  $l"; done
+		echo
+		echo "  Partitions seen by the kernel:"
+		sed -n '3,$p' /proc/partitions 2>/dev/null | head -n 8
+		echo
+		echo "  Still retrying every 10 s.  No keyboard needed."
+		echo "  Power off, plug the USB stick in a PC, read logs/."
+	} >"$CON" 2>&1
+	if [ "$HAVE_LOG" = 1 ] && [ -n "$BOOTDIR" ]; then
+		dump_diag "$BOOTDIR/initramfs-failure.txt"
+		echo "$*" >"$BOOTDIR/INITRAMFS_FAILURE"
+		sync
+	fi
+}
+
+# ---------------------------------------------------------------- root
+want_root() {   # sets ROOTDEV from olpcboy.root= or LABEL=OLPCROOT; $1 = wait secs
+	spec=$(cmdline_get olpcboy.root)
+	[ -z "$spec" ] && spec="LABEL=$ROOTLABEL"
+	_i=0
+	while :; do
+		case "$spec" in
+		LABEL=*|UUID=*|PARTUUID=*) ROOTDEV=$(findfs "$spec" 2>/dev/null) ;;
+		/dev/*) ROOTDEV=$spec ;;
+		*) ROOTDEV=$(findfs "LABEL=$spec" 2>/dev/null) ;;
+		esac
+		[ -n "$ROOTDEV" ] && [ -b "$ROOTDEV" ] && return 0
+		[ "$_i" -ge "$1" ] && return 1
+		sleep 1
+		_i=$((_i + 1))
+	done
+}
+
+mount_root() {
+	rm -f /run/olpcboy/mount_root.err
+	mount -t ext4 -o rw,noatime "$ROOTDEV" "$NEWROOT" 2>/run/olpcboy/mount_root.err \
+		|| mount -o rw,noatime "$ROOTDEV" "$NEWROOT" 2>>/run/olpcboy/mount_root.err
+}
+
+# Prepare the new root, then hand over.  Returns only on failure.
+handover() {
+	mkdir -p "$NEWROOT/run" "$NEWROOT/dev" "$NEWROOT/proc" "$NEWROOT/sys" \
+		"$NEWROOT/mnt/olpclog" "$NEWROOT/var/log" 2>/dev/null
+
+	if [ "$HAVE_LOG" = 1 ]; then
+		TARGET=/mnt/olpclog/logs/$BOOTNAME
+	else
+		# no log partition: log to the root fs (persistent, still readable later)
+		TARGET=/var/log/olpc-nolog-boot
+		mkdir -p "$NEWROOT$TARGET"
+		cp /run/olpcboy/timeline.log "$NEWROOT$TARGET/" 2>/dev/null
+		echo "$CMDLINE" >"$NEWROOT$TARGET/cmdline.txt"
+		echo "log partition missing" >"$NEWROOT$TARGET/NO_LOG_PARTITION"
+		BOOTNAME=nolog
+	fi
+	# /var/log/olpc-current -> boot dir; rc.conf / syslog / scripts use this path
+	rm -rf "$NEWROOT/var/log/olpc-current"
+	ln -s "$TARGET" "$NEWROOT/var/log/olpc-current"
+	mkdir -p "$NEWROOT/run/olpcboy"
+	echo "$TARGET" >/run/olpcboy/bootdir
+	echo "$HAVE_LOG" >/run/olpcboy/haslog
+	[ -n "$KMSG_PID" ] && echo "$KMSG_PID" >/run/olpcboy/kmsg.pid
+	cp /run/olpcboy/timeline.log "$NEWROOT/run/olpcboy/" 2>/dev/null
+
+	tl "switching root (root=$ROOTDEV)"
+	[ "$HAVE_LOG" = 1 ] && { cp /proc/mounts "$BOOTDIR/initramfs-mounts.txt"; sync; }
+	[ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
+
+	# order matters: log partition first (needs the mountpoint on the new root)
+	[ "$HAVE_LOG" = 1 ] && mount --move "$LOGMNT" "$NEWROOT/mnt/olpclog"
+	mount --move /dev "$NEWROOT/dev"
+	mount --move /proc "$NEWROOT/proc"
+	mount --move /sys "$NEWROOT/sys"
+	mount --move /run "$NEWROOT/run"
+
+	INIT=$(cmdline_get init)
+	[ -z "$INIT" ] && INIT=/sbin/init
+	exec switch_root "$NEWROOT" "$INIT"
+	# only reached if exec failed; mounts are already moved, so complain
+	echo "switch_root exec failed" >"$CON"
+	return 1
+}
+
+# ================================================================= main
+say "olpc-boy initramfs starting, cmdline: $CMDLINE"
+
+if mount_log; then
+	HAVE_LOG=1
+	if new_boot_dir; then
+		start_kmsg_copier "$BOOTDIR/kmsg.log"
+		start_syncer
+	else
+		say "cannot create boot dir on log partition"
+		HAVE_LOG=0
+		BOOTDIR=""
+	fi
+fi
+if [ "$HAVE_LOG" = 0 ]; then
+	# continue without the stick: kmsg goes to tmpfs (/run survives the move)
+	start_kmsg_copier /run/olpcboy/kmsg.log
+	spawn_tty2_shell
+	echo "NO LOG PARTITION - logging to tmpfs only" >"$CON"
+fi
+
+if want_root "$WAIT_SECS"; then :; else
+	fail "Root filesystem not found (wanted: $(cmdline_get olpcboy.root || echo LABEL=$ROOTLABEL))"
+fi
+
+while :; do
+	if [ -n "$ROOTDEV" ] && [ -b "$ROOTDEV" ]; then
+		say "root device is $ROOTDEV"
+		if mount_root; then
+			say "root mounted"
+			handover   # does not return on success
+			fail "switch_root handover failed" "root=$ROOTDEV"
+		else
+			e=$(cat /run/olpcboy/mount_root.err 2>/dev/null)
+			fail "Cannot mount root $ROOTDEV" "$e"
+		fi
+	fi
+	sleep 10
+	want_root 1
+done

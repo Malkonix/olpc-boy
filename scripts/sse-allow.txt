@@ -1,0 +1,6 @@
+# Files whose SSE code was reviewed and is only reached after a runtime CPUID check
+# (or only for types the system never uses). check-sse.sh downgrades ERROR -> ALLOWED
+# for these.  Format: <shell glob matched against the path inside the rootfs>  # reason
+# qemu-test.sh (CPU without SSE) is the dynamic backstop for these assumptions.
+*/libcrypto.so.3      # OpenSSL x86 asm: SSE2/AES-NI paths gated by OPENSSL_ia32cap_P (set from CPUID)
+*/libgcc_s.so.1       # only half-float (_Float16/__bf16) helpers use SSE; never called by normal code

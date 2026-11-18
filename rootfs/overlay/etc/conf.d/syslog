@@ -1,0 +1,4 @@
+# busybox syslogd -> boot dir on the log partition
+# -O file, -S smaller output, -D drop duplicates
+SYSLOGD_OPTS="-S -D -O /var/log/olpc-current/syslog.log"
+rc_need="olpclog"

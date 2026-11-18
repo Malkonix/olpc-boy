@@ -1,0 +1,47 @@
+#!/bin/sh
+# Power button -> sync logs -> clean poweroff.
+# Listens on every /dev/input/event* with evtest (no grab) and reacts to
+# "KEY_POWER ... value 1".  Re-scan once after 20 s: slow USB/SCI devices.
+. /usr/libexec/olpcboy/common.sh
+FIFO=/run/olpcboy/powerbtn.fifo
+mkdir -p /run/olpcboy
+rm -f "$FIFO"
+mkfifo "$FIFO" || { tl "powerbtn: mkfifo failed"; exit 1; }
+
+start_listeners() {
+	for dev in /dev/input/event*; do
+		[ -c "$dev" ] || continue
+		case " $STARTED " in *" $dev "*) continue ;; esac
+		STARTED="$STARTED $dev"
+		# only devices that can emit KEY_POWER (116); skip the others
+		n=${dev##*event}
+		cap=$(cat "/sys/class/input/event$n/device/capabilities/key" 2>/dev/null)
+		cap_bit "$cap" 116 || continue
+		tl "powerbtn: listening on $dev ($(cat /sys/class/input/event$n/device/name 2>/dev/null))"
+		evtest "$dev" >"$FIFO" 2>/dev/null &
+	done
+}
+
+STARTED=""
+start_listeners
+# keep the fifo open read/write so listeners never get SIGPIPE
+exec 3<>"$FIFO"
+( sleep 20; start_listeners ) 2>/dev/null &
+
+while IFS= read -r line <&3; do
+	case "$line" in
+	*"KEY_POWER"*"value 1"*)
+		tl "POWER button pressed: syncing and powering off"
+		echo "$(olpc_uptime)" >"$BOOTDIR/POWEROFF_REQUESTED"
+		sync
+		printf '\033[2J\033[H\n\n   POWERING OFF...\n   Wait for the screen to go dark,\n   then move the USB stick to the PC.\n' >/dev/tty1 2>/dev/null
+		poweroff &
+		# if the orderly path stalls, force it after 20 s (logs already synced)
+		sleep 20
+		sync
+		tl "poweroff stalled, forcing"
+		sync
+		poweroff -f
+		;;
+	esac
+done

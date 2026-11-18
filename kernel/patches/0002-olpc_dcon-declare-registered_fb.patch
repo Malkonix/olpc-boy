@@ -1,0 +1,19 @@
+Subject: staging: olpc_dcon: declare registered_fb/num_registered_fb locally (built-in only)
+
+--- a/drivers/staging/olpc_dcon/olpc_dcon.c
++++ b/drivers/staging/olpc_dcon/olpc_dcon.c
+@@ -30,6 +30,14 @@
+ 
+ #include "olpc_dcon.h"
+ 
++/*
++ * 6.1 dropped these from <linux/fb.h> but fbmem.c still defines them as
++ * ordinary globals. Fine for a built-in driver (CONFIG_FB_OLPC_DCON=y);
++ * they are not exported to modules.
++ */
++extern struct fb_info *registered_fb[FB_MAX];
++extern int num_registered_fb;
++
+ /* Module definitions */
+ 
+ static ushort resumeline = 898;

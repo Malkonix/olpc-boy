@@ -1,0 +1,10 @@
+#!/bin/sh
+# Last step of the default runlevel: mark the boot as complete.
+. /usr/libexec/olpcboy/common.sh
+echo "$(olpc_uptime)" >"$BOOTDIR/REACHED_USERSPACE_OK"
+tl "REACHED_USERSPACE_OK"
+timeout 5 dmesg >"$BOOTDIR/dmesg.final.txt" 2>&1
+timeout 5 rc-status -a >"$BOOTDIR/rc-status.final.txt" 2>&1
+timeout 5 free >"$BOOTDIR/free.final.txt" 2>&1
+sync
+exit 0

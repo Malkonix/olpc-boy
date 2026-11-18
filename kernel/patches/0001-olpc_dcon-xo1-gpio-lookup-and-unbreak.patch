@@ -1,0 +1,76 @@
+From: olpc-boy
+Subject: staging: olpc_dcon: make XO-1 DCON buildable and probe-able on 6.1
+
+- Drop "depends on BROKEN" (set in 5.19 only because num_registered_fb was to
+  become private to fbmem.c; still public in 6.1, so the driver builds).
+- Fix the GPIO_CS5535 && ACPI dependency (XO-1 has no ACPI; XO-1.5 has no
+  CS5535 GPIO): GPIO_CS5535 || ACPI.
+- Make it bool (registered_fb is no longer exported to modules; see 0002).
+- Register a gpiod lookup table for the CS5535 chip; without it all
+  devm_gpiod_get() calls fail with -ENOENT.
+
+--- a/drivers/staging/olpc_dcon/Kconfig
++++ b/drivers/staging/olpc_dcon/Kconfig
+@@ -1,9 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0
+ config FB_OLPC_DCON
+-	tristate "One Laptop Per Child Display CONtroller support"
++	bool "One Laptop Per Child Display CONtroller support"
+-	depends on OLPC && FB && BROKEN
++	depends on OLPC && FB
+ 	depends on I2C
+-	depends on GPIO_CS5535 && ACPI
++	depends on GPIO_CS5535 || ACPI
+ 	select BACKLIGHT_CLASS_DEVICE
+ 	help
+ 	  In order to support very low power operation, the XO laptop uses a
+--- a/drivers/staging/olpc_dcon/olpc_dcon_xo_1.c
++++ b/drivers/staging/olpc_dcon/olpc_dcon_xo_1.c
+@@ -12,6 +12,8 @@
+ 
++/* machine.h must precede cs5535.h: the latter #defines GPIO_PULL_UP, an enum there */
++#include <linux/gpio/machine.h>
+ #include <linux/cs5535.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <asm/olpc.h>
+@@ -26,6 +27,29 @@
+ 	OLPC_DCON_BLANK,
+ };
+ 
++/*
++ * The descriptor conversion of this driver never added a lookup table for
++ * the CS5535 GPIO chip, so every devm_gpiod_get() below failed with -ENOENT
++ * and the XO-1 probe aborted. Names match gpios_asis[]; line numbers are
++ * OLPC_GPIO_DCON_* from asm/olpc.h. Active-high, like the old integer API.
++ */
++static struct gpiod_lookup_table gpios_table_xo_1 = {
++	.dev_id = NULL,
++	.table = {
++		GPIO_LOOKUP("cs5535-gpio", OLPC_GPIO_DCON_STAT0, "dcon_stat0",
++			    GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("cs5535-gpio", OLPC_GPIO_DCON_STAT1, "dcon_stat1",
++			    GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("cs5535-gpio", OLPC_GPIO_DCON_IRQ, "dcon_irq",
++			    GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("cs5535-gpio", OLPC_GPIO_DCON_LOAD, "dcon_load",
++			    GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP("cs5535-gpio", OLPC_GPIO_DCON_BLANK, "dcon_blank",
++			    GPIO_ACTIVE_HIGH),
++		{ },
++	},
++};
++
+ static const struct dcon_gpio gpios_asis[] = {
+ 	[OLPC_DCON_STAT0] = { .name = "dcon_stat0", .flags = GPIOD_ASIS },
+ 	[OLPC_DCON_STAT1] = { .name = "dcon_stat1", .flags = GPIOD_ASIS },
+@@ -42,6 +66,8 @@
+ 	int ret, i;
+ 	const struct dcon_gpio *pin = &gpios_asis[0];
+ 
++	gpiod_add_lookup_table(&gpios_table_xo_1);
++
+ 	for (i = 0; i < ARRAY_SIZE(gpios_asis); i++) {
+ 		gpios[i] = devm_gpiod_get(&dcon->client->dev, pin[i].name,
+ 					  pin[i].flags);

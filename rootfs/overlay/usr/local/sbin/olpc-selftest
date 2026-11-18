@@ -1,0 +1,304 @@
+#!/bin/sh
+# Hardware self-test for the OLPC XO-1.  One PASS/FAIL/SKIP/INFO line per item,
+# written to $BOOTDIR/selftest.log AND to stdout (tty1).  Every external command
+# is wrapped in timeout; nothing here can block.  READ-ONLY on NAND, does not
+# arm the watchdog, does not suspend.
+. /usr/libexec/olpcboy/common.sh
+LOG=$BOOTDIR/selftest.log
+SUMMARY=$BOOTDIR/selftest.summary
+TMP=/tmp/selftest.$$
+mkdir -p "$TMP"
+NPASS=0; NFAIL=0; NSKIP=0
+FAILED=""
+
+# colors only when stdout is a terminal
+if [ -t 1 ]; then
+	C_P='\033[1;32m'; C_F='\033[1;31m'; C_S='\033[1;33m'; C_I='\033[1;36m'; C_0='\033[0m'
+else
+	C_P=''; C_F=''; C_S=''; C_I=''; C_0=''
+fi
+
+# res <PASS|FAIL|SKIP|INFO> <name> <detail...>
+res() {
+	_st=$1; _nm=$2; shift 2
+	_line=$(printf '%-4s %-11s %s' "$_st" "$_nm" "$*" | cut -c1-75)
+	echo "$(olpc_uptime) $_line" >>"$LOG"
+	case "$_st" in
+	PASS) NPASS=$((NPASS + 1)); _c=$C_P ;;
+	FAIL) NFAIL=$((NFAIL + 1)); _c=$C_F; FAILED="$FAILED $_nm" ;;
+	SKIP) NSKIP=$((NSKIP + 1)); _c=$C_S ;;
+	*) _c=$C_I ;;
+	esac
+	printf "${_c}%s${C_0}\n" "$_line"
+	sync
+}
+
+first_file() {  # first readable file among args
+	for _f in "$@"; do [ -r "$_f" ] && { echo "$_f"; return 0; }; done
+	return 1
+}
+
+tl "selftest begin"
+echo "== selftest begin, uptime $(olpc_uptime), boot dir $BOOTDIR" >>"$LOG"
+printf '\033[1;37;44m %-73s \033[0m\n' "HARDWARE SELFTEST"
+
+# ------------------------------------------------------------------ CPU
+flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null)
+model=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2)
+miss=""
+for f in mmx 3dnow cmov; do
+	case " $flags " in *" $f "*) ;; *) miss="$miss $f" ;; esac
+done
+if [ -z "$miss" ]; then res PASS cpu "mmx 3dnow cmov ok;$model"
+else res FAIL cpu "missing:$miss;$model"; fi
+case " $flags " in
+*" sse "*|*" sse2 "*) res INFO cpu-sse "SSE PRESENT (unexpected on Geode LX)" ;;
+*) res INFO cpu-sse "no sse/sse2 (expected)" ;;
+esac
+
+# ------------------------------------------------------------------ RAM
+kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null)
+if [ -n "$kb" ] && [ "$kb" -ge 200000 ]; then res PASS ram "$((kb / 1024)) MB"
+else res FAIL ram "MemTotal=${kb:-?} kB (<200000)"; fi
+
+# ------------------------------------------------------------------ framebuffer
+if [ -d /sys/class/graphics/fb0 ]; then
+	vs=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+	bpp=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
+	name=$(cat /sys/class/graphics/fb0/name 2>/dev/null)
+	if [ "$vs" = "1200,900" ]; then res PASS fb "1200x900 ${bpp}bpp ($name)"
+	else res FAIL fb "size=$vs bpp=$bpp ($name), want 1200,900"; fi
+else
+	res FAIL fb "/sys/class/graphics/fb0 missing"
+fi
+
+# ------------------------------------------------------------------ DCON / backlight
+bl=""
+for d in /sys/class/backlight/*; do [ -d "$d" ] && { bl=$d; break; }; done
+if [ -n "$bl" ] && [ -w "$bl/brightness" ]; then
+	max=$(cat "$bl/max_brightness" 2>/dev/null)
+	cur=$(cat "$bl/brightness" 2>/dev/null)
+	if [ -n "$max" ] && [ -n "$cur" ]; then
+		if [ "$cur" -gt 1 ]; then test=$((cur - 1)); else test=$((cur + 1)); fi
+		[ "$test" -gt "$max" ] && test=$max
+		echo "$test" >"$bl/brightness" 2>/dev/null
+		back=$(cat "$bl/brightness" 2>/dev/null)
+		echo "$cur" >"$bl/brightness" 2>/dev/null
+		now=$(cat "$bl/brightness" 2>/dev/null)
+		if [ "$back" = "$test" ] && [ "$now" = "$cur" ]; then
+			res PASS backlight "$(basename "$bl") $cur/$max, set/readback/restore ok"
+		else
+			res FAIL backlight "$(basename "$bl") wrote $test read $back restore->$now"
+		fi
+	else
+		res FAIL backlight "$(basename "$bl") unreadable max/cur"
+	fi
+elif [ -n "$bl" ]; then
+	res FAIL backlight "$(basename "$bl") brightness not writable"
+else
+	res FAIL backlight "no /sys/class/backlight/*"
+fi
+mono=$(find /sys/devices -name monochrome 2>/dev/null | head -n1)
+if [ -n "$mono" ]; then res PASS dcon-mono "$mono = $(cat "$mono")"
+else
+	if ls -d /sys/devices/platform/dcon* >/dev/null 2>&1; then
+		res FAIL dcon-mono "dcon present, no monochrome node"
+	else res FAIL dcon-mono "no DCON device in sysfs"; fi
+fi
+
+# ------------------------------------------------------------------ audio
+if [ -s /proc/asound/cards ] && ! grep -q 'no soundcards' /proc/asound/cards; then
+	res PASS audio-card "$(head -n1 /proc/asound/cards | sed 's/^ *//')"
+	# unmute common AC97 controls (names differ; errors ignored)
+	for c in Master PCM Headphone Speaker Mic "Mic Boost" Capture "Capture Switch" "Mic Capture Switch"; do
+		timeout 3 amixer -q -c 0 sset "$c" 80% unmute cap >/dev/null 2>&1
+	done
+	timeout 4 speaker-test -c 2 -t sine -f 440 -l 1 >"$TMP/spk.txt" 2>&1
+	rc=$?
+	# 124 = still playing when timeout stopped it: counts as played
+	if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then res PASS audio-play "speaker-test sine 440Hz rc=$rc"
+	else res FAIL audio-play "speaker-test rc=$rc: $(tail -n1 "$TMP/spk.txt")"; fi
+	rec=0
+	for ch in 1 2; do
+		rm -f "$TMP/mic.wav"
+		timeout 5 arecord -q -D default -f S16_LE -r 8000 -c $ch -d 1 "$TMP/mic.wav" >"$TMP/rec.txt" 2>&1
+		[ $? -eq 0 ] && [ -s "$TMP/mic.wav" ] && { rec=1; break; }
+	done
+	if [ $rec -eq 1 ]; then
+		nz=$(tail -c +45 "$TMP/mic.wav" | tr -d '\000' | wc -c)
+		sz=$(wc -c <"$TMP/mic.wav")
+		if [ "$nz" -gt 0 ]; then res PASS audio-mic "captured ${sz}B, $nz non-zero bytes"
+		else res FAIL audio-mic "captured ${sz}B but pure silence (mic muted?)"; fi
+	else
+		res FAIL audio-mic "arecord failed: $(tail -n1 "$TMP/rec.txt")"
+	fi
+else
+	res FAIL audio-card "no sound card in /proc/asound/cards"
+	res SKIP audio-play "no card"
+	res SKIP audio-mic "no card"
+fi
+
+# ------------------------------------------------------------------ input
+IDX=0
+inputs=""
+for d in /sys/class/input/event*; do
+	[ -d "$d" ] || continue
+	IDX=$((IDX + 1))
+	inputs="$inputs $(basename "$d"):$(cat "$d/device/name" 2>/dev/null | tr ' ' '_')"
+done
+res INFO input-list "$IDX devs:$inputs"
+# does ANY device advertise key/switch code $2 (key=EV_KEY bitmap, sw=EV_SW)?
+any_cap() {   # any_cap <key|sw> <code>
+	for d in /sys/class/input/event*; do
+		[ -r "$d/device/capabilities/$1" ] || continue
+		cap_bit "$(cat "$d/device/capabilities/$1")" "$2" && { basename "$d"; return 0; }
+	done
+	return 1
+}
+# KEY_A=30 keyboard; KP8=72 KP2=80 KP4=75 KP6=77 (dpad)
+for pair in "keyboard:30" "kp8-up:72" "kp2-down:80" "kp4-left:75" "kp6-right:77" \
+	"kp9:73" "kp3:81" "kp7:71" "kp1:79" "pgup:104" "pgdn:109" "home:102" "end:107" "power:116"; do
+	nm=${pair%%:*}; code=${pair##*:}
+	if dev=$(any_cap key "$code"); then res PASS "in-$nm" "key $code on $dev"
+	else
+		case "$nm" in
+		keyboard|kp*|pg*|home|end) res INFO "in-$nm" "key $code not advertised" ;;
+		*) res FAIL "in-$nm" "key $code not advertised" ;;
+		esac
+	fi
+done
+if dev=$(any_cap sw 0); then res PASS in-lid "SW_LID on $dev"; else res FAIL in-lid "SW_LID missing"; fi
+if dev=$(any_cap sw 1); then res PASS in-ebook "SW_TABLET_MODE on $dev"; else res FAIL in-ebook "SW_TABLET_MODE missing"; fi
+
+# ------------------------------------------------------------------ power
+bat=""; ac=""
+for d in /sys/class/power_supply/*; do
+	[ -d "$d" ] || continue
+	t=$(cat "$d/type" 2>/dev/null)
+	[ "$t" = Battery ] && bat=$d
+	[ "$t" = Mains ] && ac=$d
+done
+if [ -n "$bat" ]; then
+	cap=$(cat "$bat/capacity" 2>/dev/null); st=$(cat "$bat/status" 2>/dev/null)
+	if [ -n "$cap" ] && [ -n "$st" ]; then res PASS battery "$(basename "$bat") ${cap}% $st"
+	else res FAIL battery "$(basename "$bat") capacity='$cap' status='$st'"; fi
+else
+	res FAIL battery "no power_supply of type Battery"
+fi
+if [ -n "$ac" ]; then
+	on=$(cat "$ac/online" 2>/dev/null)
+	if [ -n "$on" ]; then res PASS ac "$(basename "$ac") online=$on"; else res FAIL ac "online unreadable"; fi
+else
+	res FAIL ac "no Mains supply"
+fi
+
+# ------------------------------------------------------------------ NAND (READ ONLY)
+if [ -s /proc/mtd ] && [ "$(wc -l </proc/mtd)" -gt 1 ]; then
+	m=/sys/class/mtd/mtd0
+	sz=$(cat $m/size 2>/dev/null); ty=$(cat $m/type 2>/dev/null)
+	bb=$(cat $m/bad_blocks 2>/dev/null)
+	nm=$(sed -n '2p' /proc/mtd | sed 's/.*"\(.*\)"/\1/')
+	res PASS nand "mtd0 '$nm' type=$ty size=$((${sz:-0} / 1048576))MB"
+	if [ -n "$bb" ]; then res INFO nand-bad "bad blocks (sysfs): $bb"
+	else res INFO nand-bad "bad_blocks sysfs node absent"; fi
+else
+	res FAIL nand "no MTD device in /proc/mtd"
+fi
+
+# ------------------------------------------------------------------ SD / USB
+mmc=$(ls -d /sys/class/mmc_host/mmc* 2>/dev/null | wc -l)
+if [ "$mmc" -gt 0 ]; then
+	card=$(ls -d /sys/class/mmc_host/mmc*/mmc*:* 2>/dev/null | head -n1)
+	res PASS sd-host "$mmc host(s)"
+	if [ -n "$card" ]; then res INFO sd-card "card present: $(cat "$card/name" 2>/dev/null)"
+	else res INFO sd-card "no card inserted"; fi
+else
+	res FAIL sd-host "no /sys/class/mmc_host/*"
+fi
+hc=0; ports=0
+for d in /sys/bus/usb/devices/usb[0-9]*; do
+	[ -d "$d" ] || continue
+	hc=$((hc + 1))
+	p=$(cat "$d/maxchild" 2>/dev/null); ports=$((ports + ${p:-0}))
+done
+if [ "$hc" -gt 0 ]; then res PASS usb "$hc root hub(s), $ports ports; $(ls /sys/bus/usb/devices | grep -c '^[0-9]') devices"
+else res FAIL usb "no USB host controller"; fi
+
+# ------------------------------------------------------------------ wifi (explicit, then OFF again)
+if timeout 15 modprobe libertas_usb >"$TMP/wifi.txt" 2>&1; then
+	i=0; ifc=""
+	while [ $i -lt 10 ] && [ -z "$ifc" ]; do
+		for n in /sys/class/net/*; do
+			[ -d "$n/wireless" ] || [ -d "$n/phy80211" ] && { ifc=$(basename "$n"); break; }
+		done
+		[ -z "$ifc" ] && { sleep 1; i=$((i + 1)); }
+	done
+	if [ -n "$ifc" ]; then
+		ip link set "$ifc" up >/dev/null 2>&1
+		sleep 1
+		cnt=$(timeout 15 iwlist "$ifc" scan 2>/dev/null | grep -c ESSID)
+		if [ "${cnt:-0}" -eq 0 ]; then
+			cnt=$(timeout 15 iw dev "$ifc" scan 2>/dev/null | grep -c SSID)
+		fi
+		res PASS wifi "$ifc appeared; scan saw ${cnt:-0} network(s)"
+		ip link set "$ifc" down >/dev/null 2>&1
+	else
+		res FAIL wifi "libertas_usb loaded, no wireless interface in 10s"
+	fi
+	timeout 10 rmmod libertas_usb libertas >/dev/null 2>&1
+	timeout 5 rfkill block wifi >/dev/null 2>&1
+else
+	res FAIL wifi "modprobe libertas_usb: $(tail -n1 "$TMP/wifi.txt")"
+fi
+
+# ------------------------------------------------------------------ camera
+timeout 15 modprobe cafe_ccic >/dev/null 2>&1
+timeout 15 modprobe ov7670 >/dev/null 2>&1
+i=0; while [ ! -c /dev/video0 ] && [ $i -lt 5 ]; do sleep 1; i=$((i + 1)); done
+if [ -c /dev/video0 ]; then
+	rm -f "$TMP/frame.raw"
+	timeout 10 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to="$TMP/frame.raw" >"$TMP/cam.txt" 2>&1
+	rc=$?
+	if [ -s "$TMP/frame.raw" ]; then
+		fsz=$(wc -c <"$TMP/frame.raw")
+		[ "$fsz" -lt 2000000 ] && cp "$TMP/frame.raw" "$BOOTDIR/camera-frame.raw"
+		res PASS camera "/dev/video0 frame ${fsz}B"
+	else
+		res FAIL camera "/dev/video0 ok but no frame (rc=$rc): $(tail -n1 "$TMP/cam.txt")"
+	fi
+else
+	res FAIL camera "no /dev/video0 (cafe_ccic/ov7670)"
+fi
+
+# ------------------------------------------------------------------ misc
+if [ -r /sys/class/rtc/rtc0/date ] || [ -c /dev/rtc0 ]; then
+	res PASS rtc "$(cat /sys/class/rtc/rtc0/date 2>/dev/null) $(cat /sys/class/rtc/rtc0/time 2>/dev/null)"
+else res FAIL rtc "no rtc0"; fi
+if [ -c /dev/watchdog ] || [ -d /sys/class/watchdog/watchdog0 ]; then
+	res PASS watchdog "present (not armed)"
+else res FAIL watchdog "no watchdog device"; fi
+if [ -c /dev/hwrng ] || [ -r /sys/class/misc/hw_random/rng_available ]; then
+	cur=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null)
+	if [ -c /dev/hwrng ]; then
+		n=$(timeout 3 dd if=/dev/hwrng bs=16 count=1 2>/dev/null | wc -c)
+	else n=0; fi
+	res PASS hwrng "current=$cur read ${n}B"
+else res FAIL hwrng "no hw_random"; fi
+if [ -r /sys/power/state ]; then res INFO suspend "/sys/power/state: $(cat /sys/power/state)"
+else res FAIL suspend "/sys/power/state missing"; fi
+
+# ------------------------------------------------------------------ summary
+{
+	echo "PASS $NPASS   FAIL $NFAIL   SKIP $NSKIP"
+	[ -n "$FAILED" ] && echo "failed:$FAILED"
+	echo "uptime $(olpc_uptime)s"
+} >"$SUMMARY"
+cat "$SUMMARY" >>"$LOG"
+echo
+if [ "$NFAIL" -eq 0 ]; then printf "${C_P}"; else printf "${C_F}"; fi
+cat "$SUMMARY"
+printf "${C_0}"
+rm -rf "$TMP"
+sync
+tl "selftest end pass=$NPASS fail=$NFAIL skip=$NSKIP"
+exit 0

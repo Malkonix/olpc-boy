@@ -1,0 +1,45 @@
+# olpc-boy rootfs package list (Alpine 3.18, x86).  One package per line.
+# Keep this minimal: 256 MB RAM, boots from a USB stick.
+
+# --- base system -------------------------------------------------------
+# alpine-base = busybox + openrc + apk-tools + musl + alpine-baselayout +
+# busybox-mdev-openrc (mdev coldplug) + libc-utils
+alpine-base
+# modprobe/depmod/insmod with real module-dependency + blacklist support
+kmod
+# mdev (busybox) is used instead of eudev: we need no udev rules, no
+# persistent naming, and eudev costs RAM and boot time.  Coldplug module
+# loading is done by the openrc 'hwdrivers' service via modalias.
+mdev-conf
+
+# --- storage / filesystems ---------------------------------------------
+e2fsprogs
+dosfstools
+# blkid/findfs/lsblk-style tools: busybox provides blkid + findfs, but
+# util-linux-misc adds the full blkid/wipefs/etc. for debugging.
+util-linux-misc
+# NAND (XO-1 has a CAFE NAND): nanddump, nandtest, flash_* ... (we only READ)
+mtd-utils
+
+# --- hardware diagnostics ----------------------------------------------
+evtest
+pciutils
+usbutils
+# busybox already has fbset, rfkill, hwclock, timeout, lsusb (small);
+# nothing extra needed for them.
+v4l-utils
+
+# --- audio -------------------------------------------------------------
+alsa-lib
+alsa-utils
+
+# --- wifi (supported, OFF by default: libertas is blacklisted for autoload)
+wpa_supplicant
+iw
+wireless-tools
+# ships libertas/usb8388_v9.bin + usb8388_olpc.bin (checked at build time;
+# mkrootfs.sh downloads them from linux-firmware git if ever missing)
+linux-firmware-libertas
+
+# --- remote debugging (installed, NOT enabled) ---------------------------
+dropbear

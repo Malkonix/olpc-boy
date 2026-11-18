@@ -1,0 +1,27 @@
+#!/bin/sh
+# Software boot watchdog: runs in the background (started by the olpc-watchdog
+# service).  If REACHED_USERSPACE_OK does not exist 90 s after start, dump
+# diagnostics.  It never reboots and never touches /dev/watchdog.
+. /usr/libexec/olpcboy/common.sh
+WAIT=${OLPC_WATCHDOG_SECS:-90}
+# Poll against absolute uptime instead of one long sleep: OpenRC may restart this
+# service (pidfile lost when /run is migrated) and a killed sleep must not look
+# like a timeout.
+while :; do
+	[ -e "$BOOTDIR/REACHED_USERSPACE_OK" ] && exit 0
+	[ -e "$BOOTDIR/WATCHDOG_TIMEOUT" ] && exit 0
+	[ "$(cut -d. -f1 /proc/uptime)" -ge "$WAIT" ] && break
+	sleep 5
+done
+if [ ! -e "$BOOTDIR/REACHED_USERSPACE_OK" ]; then
+	tl "WATCHDOG_TIMEOUT: no REACHED_USERSPACE_OK after ${WAIT}s"
+	{
+		echo "watchdog fired at uptime $(olpc_uptime)"
+	} >"$BOOTDIR/WATCHDOG_TIMEOUT"
+	timeout 10 ps >"$BOOTDIR/watchdog-ps.txt" 2>&1
+	timeout 10 rc-status -a >"$BOOTDIR/watchdog-rc-status.txt" 2>&1
+	timeout 10 dmesg >"$BOOTDIR/watchdog-dmesg.txt" 2>&1
+	timeout 10 cat /proc/meminfo /proc/loadavg >"$BOOTDIR/watchdog-meminfo.txt" 2>&1
+	sync
+fi
+exit 0

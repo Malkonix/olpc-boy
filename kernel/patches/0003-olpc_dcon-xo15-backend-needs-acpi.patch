@@ -1,0 +1,26 @@
+Subject: staging: olpc_dcon: build the XO-1.5 backend only with ACPI
+
+--- a/drivers/staging/olpc_dcon/Makefile
++++ b/drivers/staging/olpc_dcon/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+-olpc-dcon-objs += olpc_dcon.o olpc_dcon_xo_1.o olpc_dcon_xo_1_5.o
++olpc-dcon-objs += olpc_dcon.o olpc_dcon_xo_1.o
++olpc-dcon-$(CONFIG_ACPI) += olpc_dcon_xo_1_5.o
+ obj-$(CONFIG_FB_OLPC_DCON)	+= olpc-dcon.o
+ 
+ 
+--- a/drivers/staging/olpc_dcon/olpc_dcon.c
++++ b/drivers/staging/olpc_dcon/olpc_dcon.c
+@@ -796,9 +796,11 @@
+ static int __init olpc_dcon_init(void)
+ {
+ 	/* XO-1.5 */
++#ifdef CONFIG_ACPI	/* the XO-1.5 backend needs ACPI */
+ 	if (olpc_board_at_least(olpc_board(0xd0)))
+ 		pdata = &dcon_pdata_xo_1_5;
+ 	else
++#endif
+ 		pdata = &dcon_pdata_xo_1;
+ 
+ 	return i2c_add_driver(&dcon_driver);

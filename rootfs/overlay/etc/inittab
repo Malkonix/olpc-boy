@@ -1,0 +1,18 @@
+# olpc-boy /etc/inittab (busybox init + openrc).  No keyboard is expected.
+::sysinit:/usr/libexec/olpcboy/tl openrc-sysinit-begin
+::sysinit:/sbin/openrc sysinit
+::sysinit:/usr/libexec/olpcboy/tl openrc-sysinit-end
+::sysinit:/sbin/openrc boot
+::sysinit:/usr/libexec/olpcboy/tl openrc-boot-end
+::wait:/sbin/openrc default
+::wait:/usr/libexec/olpcboy/tl openrc-default-end
+
+# tty1: selftest, button capture, then the status screen (never waits for input)
+tty1::respawn:/usr/local/sbin/olpc-tty1
+# tty2: passwordless root shell for an optional USB keyboard
+tty2::respawn:/sbin/getty -n -l /usr/libexec/olpcboy/tty2-shell 38400 tty2
+
+# no keyboard => ctrl-alt-del only matters with a USB keyboard
+::ctrlaltdel:/sbin/reboot
+::shutdown:/usr/libexec/olpcboy/tl shutdown-begin
+::shutdown:/sbin/openrc shutdown

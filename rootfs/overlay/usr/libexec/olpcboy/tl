@@ -1,0 +1,4 @@
+#!/bin/sh
+# tl "message": append a timeline entry (used from /etc/inittab)
+. /usr/libexec/olpcboy/common.sh
+tl "$*"
