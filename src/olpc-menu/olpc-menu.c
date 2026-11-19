@@ -4,7 +4,7 @@
  *
  * Test hooks (all optional): OLPC_MENU_FAKEFB (file standing in for /dev/fb0), OLPC_MENU_SCAN (base
  * dirs, default /mnt:/media), OLPC_MENU_RUNDIR (default /run/olpcboy), OLPC_MENU_CHORD, OLPC_MENU_RUN,
- * OLPC_MENU_COVERS_BIN, OLPC_MENU_WIFI_BIN, OLPC_MENU_SDMOUNT, OLPC_MENU_POWEROFF, OLPC_MENU_REBOOT,
+ * OLPC_MENU_LOGDIR (per-game run-NNN.stats/.log; default $BOOTDIR, else /var/log/olpc-current, else the run dir), OLPC_MENU_COVERS_BIN, OLPC_MENU_WIFI_BIN, OLPC_MENU_SDMOUNT, OLPC_MENU_POWEROFF, OLPC_MENU_REBOOT,
  * OLPC_MENU_INPUTDIR, OLPC_MENU_DEVDIR, OLPC_MENU_BACKLIGHT (glob pattern, default the backlight class dir plus a star),
  * OLPC_MENU_WIRELESS (default /proc/net/wireless), OLPC_MENU_CFGDIR (where TZ.CFG lives, default
  * /mnt/olpclog), OLPC_MENU_TZFILE (default /etc/TZ), OLPC_MENU_FAKETIME (epoch seconds standing in
@@ -41,6 +41,7 @@
 #include "menulib.h"
 #include "../common/gfx.h"
 #include "../olpc-run/input.h"
+#include "netui.h"
 
 /* ------------------------------------------------------------------ config */
 
@@ -296,7 +297,7 @@ static void ctext(int cx, int y, int sc, uint16_t fg, const char *s)   /* centre
 
 static struct romlist L[NSYS];
 static int total_roms, cur_sys, sel[NSYS], topi[NSYS];
-static enum { SC_LIST, SC_OPTIONS, SC_ERROR } screen;
+static enum { SC_LIST, SC_OPTIONS, SC_ERROR, SC_NET } screen;
 static int list_rows, list_top_y, cov_x, cov_y;
 
 static uint16_t covbuf[COVER_MAX * COVER_MAX];
@@ -323,28 +324,30 @@ static struct rom *cur_rom(void)
 
 /* ------------------------------------------------------------ title-bar indicators */
 
-/* Right-aligned slots, left to right: WiFi, volume, brightness, clock.  Fixed widths, so a value
+/* Right-aligned slots, left to right: WiFi, volume, brightness, battery, clock.  Fixed widths, so a value
  * change repaints only its own slot. */
 #define IND_Y 4
 #define IND_H (TITLE_H - 8)           /* = IND_SLOT_H */
-#define IND_GAP 28
+#define IND_GAP 20
 #define W_WIFI IND_W_WIFI
 #define W_VOL IND_W_VOL
 #define W_BRI IND_W_BRI
+#define W_BAT IND_W_BAT
 #define W_CLOCK 192
 static int ix_clock(void) { return FBW - 24 - W_CLOCK; }
-static int ix_bri(void) { return ix_clock() - IND_GAP - W_BRI; }
+static int ix_bat(void) { return ix_clock() - IND_GAP - W_BAT; }
+static int ix_bri(void) { return ix_bat() - IND_GAP - W_BRI; }
 static int ix_vol(void) { return ix_bri() - IND_GAP - W_VOL; }
 static int ix_wifi(void) { return ix_vol() - IND_GAP - W_WIFI; }
 
-static struct sysstat g_st = { -1, -1, -1, -1, -1, -1 };      /* /run/olpcboy/status */
+static struct sysstat g_st = SYSSTAT_UNKNOWN;      /* /run/olpcboy/status */
 static struct wifistat g_wifi = { WS_OFF, "", "" };           /* /run/olpcboy/wifi.status */
 static int g_bars = 4, g_sys_bri = -1, g_sys_brimax = -1, g_h24;
 static uint64_t sig_due, sysfs_due;
 static int fake_on;
 static time_t fake_base;
 static uint64_t fake_t0;
-static struct { int wifi, vol, mute, bri; char clk[16]; } shown;
+static struct { int wifi, vol, mute, bri, bat, plug, low; char clk[16]; } shown;
 
 static ssize_t slurp(const char *path, char *b, size_t cap)
 {
@@ -482,6 +485,19 @@ static void ind_bri_(int x, uint16_t bg)
 	dirty_add(x, IND_Y, IND_W_BRI, IND_SLOT_H);
 }
 
+static void ind_bat_(int x, uint16_t bg)
+{
+	struct ind_pal p = ind_pal(bg);
+
+	ind_bat(&G, x, IND_Y, &p, g_st.bat, g_st.ac, g_st.chg);
+	dirty_add(x, IND_Y, IND_W_BAT, IND_SLOT_H);
+}
+
+static void draw_hint(const char *s);
+static const char *list_hint(void);
+/* discharging and nearly empty: the list hint turns into a warning */
+static int bat_warn(void) { return g_st.bat >= 0 && g_st.bat <= 5 && g_st.ac != 1 && g_st.chg != 1; }
+
 static void ind_clock(int x, uint16_t bg)
 {
 	unsigned char l1[16];
@@ -503,6 +519,10 @@ static void ind_update(int force)
 	if (force || w != shown.wifi) { shown.wifi = w; ind_wifi_(ix_wifi(), bg); }
 	if (force || v != shown.vol || m != shown.mute) { shown.vol = v; shown.mute = m; ind_vol_(ix_vol(), bg); }
 	if (force || b != shown.bri) { shown.bri = b; ind_bri_(ix_bri(), bg); }
+	if (force || g_st.bat != shown.bat || (g_st.ac == 1 || g_st.chg == 1) != shown.plug) {
+		shown.bat = g_st.bat; shown.plug = g_st.ac == 1 || g_st.chg == 1; ind_bat_(ix_bat(), bg);
+	}
+	if (bat_warn() != shown.low) { shown.low = bat_warn(); if (!force && screen == SC_LIST) draw_hint(list_hint()); }
 	if (force || strcmp(clk, shown.clk)) { snprintf(shown.clk, sizeof shown.clk, "%s", clk); ind_clock(ix_clock(), bg); }
 }
 
@@ -527,6 +547,15 @@ static void draw_hint(const char *s)
 	fill(0, FBH - HINT_H, FBW, HINT_H, C_HINT);
 	ctext(FBW / 2, FBH - HINT_H + 12, 2, C_DIM, s);
 }
+
+/* the WiFi network screen (netui.c) draws into the back buffer through these */
+static void net_title(const char *s)
+{
+	fill(0, 0, FBW, TITLE_H, C_TITLE[cur_sys]);
+	text(24, 12, 3, C_TEXT, (const unsigned char *)s);
+	ind_update(1);
+}
+static struct netui_host net_host;
 
 static void draw_row(int i)       /* i = row on screen */
 {
@@ -649,6 +678,7 @@ static void draw_empty_state(void)
 }
 
 static const char *HINT_LIST = "UP/DOWN move   LEFT/RIGHT system   A play   START options";
+static const char *list_hint(void) { return bat_warn() ? "Battery low - plug in the charger" : HINT_LIST; }
 
 static void draw_main(uint64_t now)
 {
@@ -663,7 +693,7 @@ static void draw_main(uint64_t now)
 		cov_state = CV_BLANK;
 		cover_invalidate(now);
 	}
-	draw_hint(HINT_LIST);
+	draw_hint(list_hint());
 }
 
 /* selection moved: redraw only what changed */
@@ -780,9 +810,11 @@ static void reap_jobs(void)
 	pid_t p;
 
 	g_chld = 0;
-	while ((p = waitpid(-1, &st, WNOHANG)) > 0)
+	while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
+		if (netui_child(p, st)) continue;
 		for (k = 0; k < NJOB; k++)
 			if (jobs[k].pid == p) { job_done(k, st); break; }
+	}
 }
 
 /* ------------------------------------------------------------------ options */
@@ -800,9 +832,7 @@ static void opt_label(int i, char *b, size_t cap)
 		else snprintf(b, cap, "Download covers");
 		break;
 	case 2:
-		if (jobs[JOB_NET].pid || g_wifi.state == WS_CONNECTING) snprintf(b, cap, "WiFi: working...");
-		else if (g_wifi.state == WS_CONNECTED) snprintf(b, cap, "WiFi: ON  - turn off");
-		else snprintf(b, cap, "WiFi: OFF - turn on");
+		snprintf(b, cap, "WiFi networks...");
 		break;
 	case 3: snprintf(b, cap, opt_confirm == 3 ? "Power off: press A again" : "Power off"); break;
 	case 4: snprintf(b, cap, opt_confirm == 4 ? "Reboot: press A again" : "Reboot"); break;
@@ -884,14 +914,9 @@ static void opt_activate(void)
 		}
 		break;
 	case 2:
-		if (jobs[JOB_NET].pid || g_wifi.state == WS_CONNECTING) { snprintf(opt_msg, sizeof opt_msg, "Please wait"); break; }
-		{
-			int on = g_wifi.state == WS_CONNECTED;
-			jobs[JOB_NET].what = on ? NET_DOWN : NET_UP;
-			jobs[JOB_NET].pid = spawn(p_jobout, e_wifi, on ? "down" : "up");
-			snprintf(opt_msg, sizeof opt_msg, on ? "Turning WiFi off" : "Connecting (can take a minute)");
-		}
-		break;
+		screen = SC_NET;                 /* the network screen (netui.c) has its own WiFi on/off entry */
+		netui_open(C_SEL[cur_sys], now_ms());
+		return;
 	case 5:
 		g_overlay = !g_overlay;
 		save_state(1);
@@ -1074,6 +1099,10 @@ static void on_button(int bit, uint64_t now)
 		else if (bit == J_B || bit == J_START) close_options();
 		return;
 	}
+	if (screen == SC_NET) {
+		if (netui_button(bit, now)) { netui_busy_leave(); open_options(); }
+		return;
+	}
 	if (bit == J_A && cur_rom()) launch();
 	else if (bit == J_START) open_options();
 }
@@ -1101,6 +1130,7 @@ static void input_step(uint64_t now)
 	}
 	if (g_resynced) { g_resynced = 0; return; }       /* a game ran: the state is new */
 	taint &= (uint16_t)(held_btns | ~BTNS);
+	if (screen == SC_NET) { netui_dirs(mm, pressed, now); prev_m = mm; return; }
 	/* vertical: press, then repeat from the held state */
 	if (screen != SC_ERROR) {
 		int page = screen == SC_LIST ? list_rows : 1;
@@ -1169,12 +1199,114 @@ static void draw_error(void)
 	draw_hint("Press any button");
 }
 
+/* ---- per-game statistics ----------------------------------------------------------------
+ * olpc-run is started with --stats <logdir>/run-NNN.stats (written once, after the game, so the
+ * emulation loop never touches the stick) and its output is copied to run-NNN.log.  NNN counts
+ * the games of this boot from 001 (continued across a menu respawn by looking at what is in the
+ * directory); only the newest STATS_KEEP games are kept. */
+#define STATS_KEEP 30
+
+static char p_logdir[300];
+
+static void logdir_init(void)
+{
+	struct stat sb;
+	const char *d = getenv("OLPC_MENU_LOGDIR");
+
+	if (!d || !*d) d = envd("BOOTDIR", "/var/log/olpc-current");
+	if (stat(d, &sb) != 0 || !S_ISDIR(sb.st_mode)) d = e_rundir;
+	snprintf(p_logdir, sizeof p_logdir, "%s", d);
+}
+
+/* Number of a "run-NNN.stats" / "run-NNN.log" entry (digits only), else -1. */
+static int run_entry_no(const char *name)
+{
+	char *end;
+	long v;
+
+	if (strncmp(name, "run-", 4) || name[4] < '0' || name[4] > '9') return -1;
+	v = strtol(name + 4, &end, 10);
+	if (v > 100000 || (strcmp(end, ".stats") && strcmp(end, ".log"))) return -1;
+	return (int)v;
+}
+
+/* Next game number: one above the highest run-NNN file of this boot, 1 for the first. */
+static int next_run_no(void)
+{
+	DIR *d = opendir(p_logdir);
+	struct dirent *de;
+	int hi = 0, n;
+
+	if (!d) return 1;
+	while ((de = readdir(d)))
+		if ((n = run_entry_no(de->d_name)) > hi) hi = n;
+	closedir(d);
+	return hi + 1;
+}
+
+/* Remove run-NNN.* older than the newest STATS_KEEP games (cur is the newest). */
+static void prune_runs(int cur)
+{
+	DIR *d = opendir(p_logdir);
+	struct dirent *de;
+	char p[600];
+	int n;
+
+	if (!d) return;
+	while ((de = readdir(d))) {
+		if ((n = run_entry_no(de->d_name)) < 0 || n > cur - STATS_KEEP) continue;
+		snprintf(p, sizeof p, "%s/%s", p_logdir, de->d_name);
+		unlink(p);
+	}
+	closedir(d);
+}
+
+static void copy_file(const char *from, const char *to)
+{
+	char buf[4096];
+	size_t n, tot = 0;
+	FILE *i = fopen(from, "r"), *o;
+
+	if (!i) return;
+	if (!(o = fopen(to, "w"))) { fclose(i); return; }
+	while (tot < 65536 && (n = fread(buf, 1, sizeof buf, i)) > 0) { fwrite(buf, 1, n, o); tot += n; }
+	fclose(i);
+	fclose(o);
+}
+
+/* One summary line in the menu log from a run-NNN.stats file. */
+static void log_stats(const char *path, int no)
+{
+	static const char *const keys[] = { "status", "frames_run", "fps_effective", "underruns", "frame_ms_max",
+					    "overlay_redraws", "overlay_redraw_us_total", "overlay_redraw_us_max" };
+	char val[8][48], line[256];
+	FILE *f = fopen(path, "r");
+	size_t i, kl;
+	int any = 0;
+
+	if (!f) { logf_("stats run-%03d: none (olpc-run wrote no statistics)", no); return; }
+	for (i = 0; i < 8; i++) strcpy(val[i], "?");
+	while (fgets(line, sizeof line, f)) {
+		char *nl = strchr(line, '\n');
+		if (nl) *nl = 0;
+		for (i = 0; i < 8; i++) {
+			kl = strlen(keys[i]);
+			if (!strncmp(line, keys[i], kl) && line[kl] == '=') { snprintf(val[i], sizeof val[i], "%s", line + kl + 1); any = 1; }
+		}
+	}
+	fclose(f);
+	if (!any) { logf_("stats run-%03d: unreadable", no); return; }
+	logf_("stats run-%03d: status=%s frames=%s fps=%s underruns=%s frame_ms_max=%s overlay_redraws=%s redraw_us_total=%s redraw_us_max=%s",
+	      no, val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7]);
+}
+
 static void launch(void)
 {
 	struct rom *r = cur_rom();
 	char loading[600];
 	pid_t pid;
-	int st = 0, rc;
+	int st = 0, rc, run_no = next_run_no();
+	char stats_path[400], log_path[400];
 	int bx = (FBW - 800) / 2, by = (FBH - 160) / 2;
 
 	save_state(1);
@@ -1190,7 +1322,9 @@ static void launch(void)
 		text(FBW / 2 - text_w(l1, 2) / 2, by + 90, 2, C_DIM, l1);
 	}
 	flush();
-	logf_("launch %s %s", SYS_DIR[cur_sys], r->path);
+	snprintf(stats_path, sizeof stats_path, "%s/run-%03d.stats", p_logdir, run_no);
+	snprintf(log_path, sizeof log_path, "%s/run-%03d.log", p_logdir, run_no);
+	logf_("launch %s %s (stats %s)", SYS_DIR[cur_sys], r->path, stats_path);
 	pid = fork();
 	if (pid == 0) {
 		sigset_t none;
@@ -1199,8 +1333,8 @@ static void launch(void)
 		sigprocmask(SIG_SETMASK, &none, NULL);
 		if (z >= 0) dup2(z, 0);
 		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
-		if (g_overlay) execl(e_run, e_run, SYS_DIR[cur_sys], r->path, (char *)NULL);
-			else execl(e_run, e_run, "--no-overlay", SYS_DIR[cur_sys], r->path, (char *)NULL);
+		if (g_overlay) execl(e_run, e_run, "--stats", stats_path, SYS_DIR[cur_sys], r->path, (char *)NULL);
+		else execl(e_run, e_run, "--stats", stats_path, "--no-overlay", SYS_DIR[cur_sys], r->path, (char *)NULL);
 		fprintf(stderr, "cannot run %s: %s\n", e_run, strerror(errno));
 		_exit(127);
 	}
@@ -1214,6 +1348,9 @@ static void launch(void)
 	rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 after:
 	logf_("olpc-run exited with %d", rc);
+	copy_file(p_runerr, log_path);
+	log_stats(stats_path, run_no);
+	prune_runs(run_no);
 	/* take the screen back explicitly: the child may have changed the VT mode */
 	if (g_tty >= 0 && !g_fake) {
 		int m = -1;
@@ -1363,7 +1500,9 @@ static void handle_inotify(int fd, int is_dev)
 			if (!is_dev && !strcmp(e->name, "wifi.status")) {
 				read_wifi();
 				if (screen == SC_OPTIONS) draw_options();
+				if (screen == SC_NET) netui_notify("wifi.status");
 			}
+			if (!is_dev && !strcmp(e->name, "wifi.scan") && screen == SC_NET) netui_notify("wifi.scan");
 		}
 		o += (ssize_t)sizeof *e + e->len;
 	}
@@ -1414,6 +1553,7 @@ int main(int argc, char **argv)
 	snprintf(runerr, sizeof runerr, "%s/chord", e_rundir);
 	e_chord = envd("OLPC_MENU_CHORD", runerr);
 	mkdir(e_rundir, 0755);
+	logdir_init();
 
 	if (script && script_load(script) < 0) return 2;
 	use_script = script != NULL;
@@ -1444,8 +1584,12 @@ int main(int argc, char **argv)
 	sigaddset(&blockset, SIGCHLD); sigaddset(&blockset, SIGINT); sigaddset(&blockset, SIGTERM); sigaddset(&blockset, SIGHUP);
 	sigprocmask(SIG_BLOCK, &blockset, &oldset);
 
+	net_host.g = &G; net_host.dirty = dirty_add; net_host.title = net_title; net_host.hint = draw_hint;
+	net_host.wifi = &g_wifi; net_host.wifi_bin = e_wifi; net_host.rundir = e_rundir;
+	netui_init(&net_host);
 	t_start = now_ms();
 	draw_main(t_start);
+	netui_autostart();            /* connect to a saved network in the background (olpc-wifi decides) */
 
 	while (!g_quit) {
 		uint64_t now = now_ms();
@@ -1468,6 +1612,7 @@ int main(int argc, char **argv)
 		if (g_wifi.state == WS_CONNECTED && now >= sig_due) read_signal(now);
 		if (now >= sysfs_due) read_sysfs_bri(now);
 		if (screen != SC_ERROR) ind_update(0);
+		if (screen == SC_NET) netui_tick(now);
 		if (screen == SC_LIST && total_roms && cov_state == CV_PENDING && now >= cov_due) cover_resolve();
 		if (sd_due && now >= sd_due) {
 			if (!jobs[JOB_SD].pid && file_exec(e_sd)) { jobs[JOB_SD].pid = spawn(NULL, e_sd, NULL); sd_due = 0; }
@@ -1495,6 +1640,7 @@ int main(int argc, char **argv)
 		if (screen == SC_LIST && total_roms && cov_state == CV_PENDING) { t = cov_due > now ? (int)(cov_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (sd_due) { t = sd_due > now ? (int)(sd_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (in.rescan > 0 && (timeout < 0 || timeout > 100)) timeout = 100;
+		if (screen == SC_NET) { t = netui_timeout(now); if (t >= 0 && (timeout < 0 || t < timeout)) timeout = t; }
 		{       /* clock: next minute boundary; WiFi signal: only while connected */
 			time_t wt;
 			int wms;

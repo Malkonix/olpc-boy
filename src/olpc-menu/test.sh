@@ -13,7 +13,7 @@ ok()  { echo "  ok: $*"; }
 
 HCF="-O2 -Wall -Wextra"
 $CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/menulib.c" "$here/../common/status.c" || exit 1
-$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/../common/status.c" "$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
+$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/netui.c" "$here/osk.c" "$here/../common/status.c" "$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
 	|| { cat "$tmp/cc.log"; exit 1; }
 grep -E "olpc-menu\.c|menulib\.c|status\.c|gfx\.c" "$tmp/cc.log" | grep -i warning && bad "compiler warnings in olpc-menu"
 
@@ -22,7 +22,7 @@ grep -E "olpc-menu\.c|menulib\.c|status\.c|gfx\.c" "$tmp/cc.log" | grep -i warni
 # ---- fixture tree ----------------------------------------------------------------------------
 T=$tmp/fs
 R=$T/mnt/stick/roms
-mkdir -p "$R/GB" "$R/GBC" "$R/nes" "$R/GBA" "$T/mnt/stick/covers/gb" "$T/mnt/stick/covers/gbc" "$T/run" "$tmp/noinput" "$tmp/nodev"
+mkdir -p "$R/GB" "$R/GBC" "$R/nes" "$R/GBA" "$T/mnt/stick/covers/gb" "$T/mnt/stick/covers/gbc" "$T/run" "$tmp/log" "$tmp/noinput" "$tmp/nodev"
 for n in "Super Mario Land (World) (Rev A)" "Kirby's Dream Land (USA, Europe)" "Tetris (World) (Rev 1)" \
 	 "Pok\303\251mon - Edici\303\263n Roja (Spain)" "Alleyway (World)" "Balloon Kid (World)" "Metroid II - Return of Samus (World)" \
 	 "Mega Man V (USA)" "Wario Land - Super Mario Land 3 (World)" "Final Fantasy Legend, The (USA)" "Dr. Mario (World) (Rev 1)" \
@@ -40,14 +40,34 @@ printf 'x' >"$R/GBA/ignored.gba"
 "$tmp/selftest" --mkcover "$T/mnt/stick/covers/gb/Alleyway (World).obc" 320 288
 "$tmp/selftest" --mkcover "$T/mnt/stick/covers/gbc/Hamtaro - Ham-Hams Unite! (Europe) (En,Fr,De,Es,It).obc" 480 480
 
+# The stubs take "--stats FILE" out of the argument list (run.args keeps the rest, so the checks
+# on the other options stay as they were) and leave the path in run.stats-arg.  run-ok writes a
+# statistics file there, in olpc-run's key=value format, unless STUB_NOSTATS is set.
 cat >"$tmp/run-ok" <<EOS
 #!/bin/sh
-echo "\$@" >"$T/run.args"
+a=; st=
+while [ \$# -gt 0 ]; do case "\$1" in --stats) st=\$2; shift 2;; *) a="\$a \$1"; shift;; esac; done
+echo "\${a# }" >"$T/run.args"
+echo "\$st" >"$T/run.stats-arg"
+echo "olpc-run: stub stderr line" >&2
+[ -n "\$STUB_NOSTATS" ] || [ -z "\$st" ] || cat >"\$st" <<EOF
+core=stub
+status=\${STUB_STATUS:-exit}
+frames_run=1234
+frames_drawn=1200
+fps_effective=59.71
+underruns=2
+frame_ms_max=21.500
+overlay_redraws=17
+overlay_redraw_us_total=3400.5
+overlay_redraw_us_max=480.2
+EOF
 exit 0
 EOS
 cat >"$tmp/run-fail" <<EOS
 #!/bin/sh
-echo "\$@" >>"$T/run.args"
+a=; while [ \$# -gt 0 ]; do case "\$1" in --stats) shift 2;; *) a="\$a \$1"; shift;; esac; done
+echo "\${a# }" >>"$T/run.args"
 echo "olpc-run: core: cannot load libretro core gambatte_libretro.so: No such file" >&2
 echo "olpc-run: this is a long second line, long enough to need wrapping across the screen width: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >&2
 echo "olpc-run: last line, rc 3" >&2
@@ -60,7 +80,7 @@ run_menu() {
 	sc=$1; shift
 	env OLPC_MENU_FAKEFB="$tmp/fb.raw" OLPC_MENU_SCAN="$T/mnt" OLPC_MENU_RUNDIR="$T/run" OLPC_MENU_INPUTDIR="$tmp/noinput" \
 		OLPC_MENU_DEVDIR="$tmp/nodev" OLPC_MENU_RUN="$tmp/run-ok" OLPC_MENU_COVERS_BIN="$tmp/none" OLPC_MENU_WIFI_BIN="$tmp/wifi-stub" \
-		OLPC_MENU_POWEROFF="$tmp/poweroff-stub" OLPC_MENU_REBOOT="$tmp/poweroff-stub" "$@" \
+		OLPC_MENU_POWEROFF="$tmp/poweroff-stub" OLPC_MENU_REBOOT="$tmp/poweroff-stub" OLPC_MENU_LOGDIR="$tmp/log" "$@" \
 		"$tmp/olpc-menu" --script "$sc" 2>"$tmp/menu.err"
 }
 cat >"$tmp/wifi-stub" <<'EOS'
@@ -221,6 +241,54 @@ cmp -s "$D/13-error.raw" "$D/14-dismissed.raw" && bad "error screen not dismisse
 grep -q "rc 3" "$T/run/menu-run.err" && ok "stderr of olpc-run captured in menu-run.err"
 keep
 
+echo "== per-game statistics: --stats, run-NNN.stats/.log, summary line, pruning"
+L=$tmp/stlog; rm -rf "$L"; mkdir -p "$L"
+cat >"$tmp/s-st" <<EOS
+200 key A tap
+700 end
+EOS
+rm -f "$T/run.args" "$T/run.stats-arg" "$T/run/menu.state"
+run_menu "$tmp/s-st" OLPC_MENU_LOGDIR="$L"
+[ "$(cat "$T/run.stats-arg" 2>/dev/null)" = "$L/run-001.stats" ] && ok "first game of the boot gets --stats $L/run-001.stats" || bad "stats argument: $(cat "$T/run.stats-arg" 2>/dev/null)"
+[ -s "$L/run-001.stats" ] && ok "stub statistics file written" || bad "no run-001.stats"
+grep -q 'stub stderr line' "$L/run-001.log" && ok "olpc-run output copied to run-001.log" || bad "no run-001.log"
+grep -q 'stub stderr line' "$T/run/menu-run.err" && ok "menu-run.err capture (error screen source) intact" || bad "menu-run.err lost"
+grep -q 'olpc-menu: stats run-001: status=exit frames=1234 fps=59.71 underruns=2 frame_ms_max=21.500 overlay_redraws=17 redraw_us_total=3400.5 redraw_us_max=480.2$' "$tmp/menu.err" \
+	&& ok "summary line in the menu log" || { bad "summary line missing"; grep stats "$tmp/menu.err"; }
+rm -f "$T/run/menu.state"
+run_menu "$tmp/s-st" OLPC_MENU_LOGDIR="$L"
+[ "$(cat "$T/run.stats-arg")" = "$L/run-002.stats" ] && ok "second game (new menu process, same boot) continues at 002" || bad "counter: $(cat "$T/run.stats-arg")"
+# no statistics written by the run (killed): one line says so, no crash
+rm -f "$T/run/menu.state"
+run_menu "$tmp/s-st" OLPC_MENU_LOGDIR="$L" STUB_NOSTATS=1; rc=$?
+[ $rc = 0 ] && grep -q 'stats run-003: none' "$tmp/menu.err" && ok "missing statistics file: logged, rc 0" || bad "missing stats handling (rc=$rc)"
+# failed run keeps the error screen capture and still logs
+rm -f "$T/run/menu.state"
+cat >"$tmp/s-st2" <<EOS
+100 key A tap
+800 end
+EOS
+run_menu "$tmp/s-st2" OLPC_MENU_LOGDIR="$L" OLPC_MENU_RUN="$tmp/run-fail"
+grep -q "rc 3" "$T/run/menu-run.err" && grep -q "rc 3" "$L/run-004.log" && ok "failing run: stderr in menu-run.err and run-004.log" || bad "failing run capture"
+grep -q 'stats run-004: none' "$tmp/menu.err" && ok "failing run without statistics logged" || bad "no line for the failing run"
+# keep only the newest 30 games of the boot
+L2=$tmp/stlog2; rm -rf "$L2"; mkdir -p "$L2"
+i=1; while [ $i -le 40 ]; do n=$(printf %03d $i); echo x >"$L2/run-$n.stats"; echo x >"$L2/run-$n.log"; i=$((i+1)); done
+echo keep >"$L2/menu.log"; echo keep >"$L2/run-gb.stats"
+rm -f "$T/run/menu.state"
+run_menu "$tmp/s-st" OLPC_MENU_LOGDIR="$L2"
+[ "$(cat "$T/run.stats-arg")" = "$L2/run-041.stats" ] || bad "numbering above existing files: $(cat "$T/run.stats-arg")"
+n=$(ls "$L2" | grep -c '^run-[0-9][0-9]*\.stats$')
+[ "$n" = 30 ] && [ -e "$L2/run-012.stats" ] && [ ! -e "$L2/run-011.stats" ] && [ ! -e "$L2/run-011.log" ] && [ -e "$L2/run-041.log" ] \
+	&& ok "newest 30 kept (012..041), older removed" || bad "pruning: $n stats files, $(ls "$L2" | head -3 | tr '\n' ' ')"
+[ -e "$L2/menu.log" ] && [ -e "$L2/run-gb.stats" ] && ok "other files in the log dir untouched" || bad "pruning removed foreign files"
+# no usable log dir: the run directory is used
+rm -f "$T/run/menu.state" "$T"/run/run-*
+run_menu "$tmp/s-st" OLPC_MENU_LOGDIR="$tmp/not-a-dir"
+[ "$(cat "$T/run.stats-arg")" = "$T/run/run-001.stats" ] && ok "falls back to the run directory" || bad "fallback: $(cat "$T/run.stats-arg")"
+rm -f "$T/run/menu.state" "$T"/run/run-*
+keep
+
 echo "== options: power off needs a second A"
 rm -f "$T/power.log"
 cat >"$tmp/s8" <<EOS
@@ -379,8 +447,8 @@ mkdir -p "$I" "$BL/panel" "$CFGD"
 echo 15 >"$BL/panel/max_brightness"; echo 7 >"$BL/panel/brightness"; echo AST4 >"$TZF"
 # 2026-11-19 15:07:00 in AST4 (UTC-4)
 T_PM=$(date -u -d '2026-11-19 19:07:00' +%s); T_AM=$(date -u -d '2026-11-19 09:05:00' +%s)
-# geometry (1200 px wide): slots wifi 676+44, volume 748+88, brightness 864+92, clock 984+192; bar is 72 high
-X_WIFI=676; X_VOL=748; X_BRI=864; X_CLK=984; Y1=4; Y2=68
+# geometry (1200 px wide): slots wifi 584+44, volume 648+88, brightness 756+92, battery 868+96, clock 984+192; bar is 72 high
+X_WIFI=584; X_VOL=648; X_BRI=756; X_BAT=868; X_CLK=984; Y1=4; Y2=68
 wl_fix() { printf 'Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n wlan0: 0000   70.  %s.  -256        0      0      0      0      0        0\n' "$1" >"$WLS"; }
 wl_fix -50
 # ind_run NAME [keys-script-line] [env...]: one frame after start (ST/WF/NOW/TZC set by the caller)
@@ -417,6 +485,7 @@ TZC=; NOW=1000000000; ind_run clock-unset
 NOW=$T_PM; WF="state=connected ssid=x ip=10.0.0.1"; ST="vol=31 volmax=31 mute=0 bri=15 brimax=15 mono=0"; TZC=; NOW=$T_PM
 ind_run long-name-gbc RIGHT
 WF="state=connecting"; ST="vol=15 volmax=31 mute=1 bri=0 brimax=15 mono=0"; NOW=$T_AM; ind_run long-name-gbc-b RIGHT
+WF="state=connected ssid=x ip=10.0.0.1"; ST="vol=31 volmax=31 mute=0 bri=15 brimax=15 mono=0 bat=100 ac=1 chg=1"; NOW=$T_PM; ind_run long-name-gbc-bat RIGHT
 ST=$VOK; WF=
 # the four values on screen are compared by pixel: they must differ where the states differ
 dif() { cmp -s "$D/ind-$1.raw" "$D/ind-$2.raw" && return 1; return 0; }
@@ -528,6 +597,59 @@ cmp -s "$D/min-1.raw" "$D/min-2.raw" && bad "time step (NTP) not shown" || ok "t
 cmp -s "$D/min-2.raw" "$D/min-3.raw" && bad "year before 2024 not shown as --:--" || ok "time stepped back to 2001: --:--"
 echo "  dirty rectangles after the first mark: $r"
 keep
+
+# ---- battery slot and the low-battery hint ----------------------------------------------------------
+echo "== battery indicator: states, own slot only, low-battery hint"
+VB="vol=15 volmax=31 mute=0 bri=7 brimax=15 mono=0"
+NOW=$T_PM; TZC=; WF=
+for b in "100 0 0" "50 0 0" "15 0 0" "5 0 0" "50 0 1" "100 1 0" "-1 -1 0"; do
+	set -- $b; ST="$VB bat=$1 ac=$2 chg=$3"; ind_run "bat$1-$2$3"
+done
+ST="$VB"; ind_run bat-oldformat
+dif bat100-00 bat50-00 && dif bat50-00 bat15-00 && dif bat15-00 bat5-00 && dif bat50-00 bat50-01 && dif bat100-00 bat100-10 && dif bat50-00 bat-1--10 \
+	&& ok "battery 100 / 50 / 15 / 5 / charging / on AC / unknown render differently" || bad "battery states not distinguishable"
+cmp -s "$D/ind-bat-1--10.raw" "$D/ind-bat-oldformat.raw" && ok "bat=-1 and a status line without battery fields render the same (empty slot)" || bad "unknown battery renders differently from absent"
+for p in "bat100-00 bat50-00" "bat50-00 bat15-00" "bat50-00 bat50-01" "bat100-00 bat100-10"; do
+	set -- $p
+	[ "$(outside "$D/ind-$1.raw" "$D/ind-$2.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" = 0 ] && ok "$1 -> $2 touches only the battery slot" || bad "$1 -> $2 leaked outside the battery slot"
+done
+# the hint bar: warning only when discharging and <= 5 %
+[ "$(outside "$D/ind-bat5-00.raw" "$D/ind-bat15-00.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" != 0 ] && ok "5 % discharging: the hint bar differs (warning shown)" || bad "no warning at 5 % discharging"
+[ "$(outside "$D/ind-bat15-00.raw" "$D/ind-bat50-00.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" = 0 ] && ok "15 % / 50 %: same hint bar (no warning)" || bad "warning shown above 5 %"
+ST="$VB bat=5 ac=1 chg=0"; ind_run bat5-ac
+ST="$VB bat=3 ac=0 chg=1"; ind_run bat3-chg
+[ "$(outside "$D/ind-bat5-ac.raw" "$D/ind-bat50-00.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" = 0 ] && ok "5 % on AC: no warning" || bad "warning shown while on AC"
+[ "$(outside "$D/ind-bat3-chg.raw" "$D/ind-bat50-00.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" = 0 ] && ok "3 % charging: no warning" || bad "warning shown while charging"
+# live: a rewrite of the status file in place repaints only the battery slot (and the hint bar when crossing 5 %)
+rm -rf "$I"/*; printf '%s bat=50 ac=0 chg=0\n' "$VB" >"$I/status"; printf 'state=off\n' >"$I/wifi.status"
+cat >"$tmp/c-bat" <<EOS
+#!/bin/sh
+printf '%s bat=49 ac=0 chg=0\n' "$VB" | dd of="$I/status" conv=notrunc 2>/dev/null
+EOS
+cat >"$tmp/c-bat5" <<EOS
+#!/bin/sh
+printf '%s bat=5 ac=0 chg=0\n' "$VB" | dd of="$I/status" conv=notrunc 2>/dev/null
+EOS
+chmod +x "$tmp/c-bat" "$tmp/c-bat5"
+cat >"$tmp/s-bat" <<EOS
+300 dump $D/bat-0.raw
+350 mark
+400 sh $tmp/c-bat
+700 dump $D/bat-1.raw
+750 mark
+800 sh $tmp/c-bat5
+1100 dump $D/bat-2.raw
+EOS
+run_menu "$tmp/s-bat" OLPC_MENU_RUNDIR="$I" OLPC_MENU_BACKLIGHT="$BL/*" OLPC_MENU_WIRELESS="$WLS" OLPC_MENU_CFGDIR="$CFGD" OLPC_MENU_TZFILE="$TZF" \
+	OLPC_MENU_FAKETIME="$T_PM" OLPC_MENU_DIRTYLOG="$tmp/dirty.log" || bad "battery live run failed"
+set -- $(rects 1)
+if [ "$1" -ge 1 ] && [ "$2" -ge $X_BAT ] && [ "$4" -le $((X_BAT + 96)) ] && [ "$3" -ge $Y1 ] && [ "$5" -le $Y2 ] && [ "$(outside "$D/bat-0.raw" "$D/bat-1.raw" $X_BAT $((X_BAT + 96)) $Y1 $Y2)" = 0 ]; then
+	ok "50 -> 49 % live: dirty rect $2,$3..$4,$5 inside the battery slot, frame untouched elsewhere"
+else bad "battery live change: rects '$*'"; fi
+cmp -s "$D/bat-1.raw" "$D/bat-2.raw" && bad "dropping to 5 % changed nothing" || ok "49 -> 5 % live: screen changes (icon and hint bar)"
+keep
+
+sh "$here/test-net.sh" || fail=1
 
 if [ $fail = 0 ]; then echo "olpc-menu tests: ALL OK"; else echo "olpc-menu tests: FAILED"; fi
 exit $fail

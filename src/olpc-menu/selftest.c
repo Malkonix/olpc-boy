@@ -235,6 +235,18 @@ static void test_indicators(void)
 	CHECK(status_parse("garbage\x01\xff=== vol=abc volmax=,, \n", &s) == 0 && s.vol == -1);
 	CHECK(status_parse("vol=5x volmax=31\n", &s) == 1 && s.vol == -1);
 	CHECK(status_parse("\n\n", &s) == 0);
+	/* battery fields (olpc-chordd >= the battery build); older lines simply lack them */
+	CHECK(status_parse("vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=1 bat=93 ac=1 chg=0\n", &s) == 9 && s.bat == 93 && s.ac == 1 && s.chg == 0 && s.vol == 27);
+	CHECK(status_parse("vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=1\n", &s) == 6 && s.bat == -1 && s.ac == -1 && s.chg == -1);   /* old format */
+	CHECK(status_parse("vol=-1 volmax=-1 mute=0 bri=-1 brimax=-1 mono=-1 bat=-1 ac=-1 chg=0\n", &s) == 2 && s.bat == -1 && s.ac == -1 && s.chg == 0);
+	CHECK(status_parse("bat=100 ac=0 chg=1\n", &s) == 3 && s.bat == 100 && s.ac == 0 && s.chg == 1);
+	CHECK(status_parse("bat=0 ac=0 chg=0\n", &s) == 3 && s.bat == 0);
+	CHECK(status_parse("bat=101 ac=2 chg=5\n", &s) == 0 && s.bat == -1 && s.ac == -1 && s.chg == -1);          /* out of range */
+	CHECK(status_parse("bat=9x ac=1 chg=0\n", &s) == 2 && s.bat == -1 && s.ac == 1);
+	CHECK(status_parse("vol=5 volmax=31 mute=0 bri=7 brimax=15 mono=0 bat=93 ac=1 ch", &s) == 8 && s.bat == 93 && s.chg == -1);   /* truncated: last token dropped */
+	CHECK(status_parse("vol=5 volmax=31 mute=0 bri=7 brimax=15 mono=0 bat=9", &s) == 6 && s.bat == -1);
+	CHECK(bat_level(-1) == BAT_NONE && bat_level(0) == BAT_CRIT && bat_level(5) == BAT_CRIT && bat_level(6) == BAT_LOW &&
+	      bat_level(15) == BAT_LOW && bat_level(16) == BAT_NORMAL && bat_level(100) == BAT_NORMAL);
 
 	/* wifi status */
 	CHECK(wifi_status_parse("state=off\n", &w) == WS_OFF);

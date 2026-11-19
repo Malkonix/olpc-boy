@@ -15,7 +15,8 @@
 static const struct ind_pal PAL = { 0, RGB(132, 138, 132), RGB(90, 94, 90), RGB(46, 48, 46), RGB(132, 138, 132) };
 
 /* slot top (inside the strip) and left offset of each slot, in strip coordinates */
-static const int SLOT_Y[OS_N] = { 0, 84, 168, 252, 336 };
+_Static_assert(IND_W_BAT <= OVL_W && IND_W_VOL <= OVL_W, "icon wider than the strip");
+static const int SLOT_Y[OS_N] = { 0, 84, 168, 252, 336, 420 };
 
 static uint64_t now_ns(void)
 {
@@ -176,6 +177,9 @@ static void draw_slot(struct overlay *o, int slot)
 	case OS_BRI:
 		ind_bri(&g, (OVL_W - IND_W_BRI) / 2, sy, &PAL, pct_of_max(o->st.bri, o->st.brimax));
 		break;
+	case OS_BAT:
+		ind_bat(&g, (OVL_W - IND_W_BAT) / 2, sy, &PAL, o->st.bat, o->st.ac, o->st.chg);
+		break;
 	default: {
 		const char *s = o->st.mono == 1 ? "MONO" : o->st.mono == 0 ? "COLOR" : "--";
 
@@ -192,14 +196,16 @@ static void update_slots(struct overlay *o, const char *clk, int force, uint8_t 
 {
 	int want_wifi = o->wifi.state * 16 + (o->wifi.state == WS_CONNECTED ? o->bars : 0);
 	int vol = pct_of_max(o->st.vol, o->st.volmax), mute = o->st.mute == 1, bri = pct_of_max(o->st.bri, o->st.brimax);
+	int bat = o->st.bat < 0 ? -1 : o->st.bat | (o->st.ac == 1 || o->st.chg == 1) << 8;   /* the icon only shows "on a charger" */
 	int s;
 
 	o->dirty[OS_WIFI] = force || want_wifi != o->sh_wifi;
 	o->dirty[OS_VOL] = force || vol != o->sh_vol || mute != o->sh_mute;
 	o->dirty[OS_BRI] = force || bri != o->sh_bri;
+	o->dirty[OS_BAT] = force || bat != o->sh_bat;
 	o->dirty[OS_MODE] = force || o->st.mono != o->sh_mono;
 	o->dirty[OS_CLOCK] = force || strcmp(clk, o->sh_clk) != 0;
-	o->sh_wifi = want_wifi; o->sh_vol = vol; o->sh_mute = mute; o->sh_bri = bri; o->sh_mono = o->st.mono;
+	o->sh_wifi = want_wifi; o->sh_vol = vol; o->sh_mute = mute; o->sh_bri = bri; o->sh_mono = o->st.mono; o->sh_bat = bat;
 	snprintf(o->sh_clk, sizeof o->sh_clk, "%s", clk);
 	for (s = 0; s < OS_N; s++) {
 		uint64_t t0;

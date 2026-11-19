@@ -18,11 +18,11 @@
 #define OVL_W 96                 /* strip width */
 #define OVL_MARGIN 4             /* minimum free pixels between the strip and the screen edge / game */
 #define OVL_Y 16                 /* top of the strip */
-#define OVL_H 368                /* strip height: clock, WiFi, volume, brightness, mode */
+#define OVL_H 452                /* strip height: clock, WiFi, volume, brightness, battery, mode */
 #define OVL_PERIOD 60            /* frames between polls (about 1 s) */
 #define OVL_SIG_MS 30000         /* /proc/net/wireless: at most this often, only while connected */
 
-enum { OS_CLOCK, OS_WIFI, OS_VOL, OS_BRI, OS_MODE, OS_N };
+enum { OS_CLOCK, OS_WIFI, OS_VOL, OS_BRI, OS_BAT, OS_MODE, OS_N };
 
 /* A file kept open and read with one pread; reopened when it disappears or is replaced (olpc-wifi
  * replaces its status file atomically; olpc-chordd rewrites its in place). */
@@ -46,7 +46,7 @@ struct overlay {
 	uint64_t sig_due;            /* monotonic ns */
 	int countdown;
 	/* what each slot shows now (-2 = never drawn) */
-	int sh_wifi, sh_vol, sh_mute, sh_bri, sh_mono;
+	int sh_wifi, sh_vol, sh_mute, sh_bri, sh_mono, sh_bat;
 	char sh_clk[16];
 	int dirty[OS_N];
 	/* strip pixels */

@@ -4,11 +4,16 @@
 #define OLPC_STATUS_H
 #include <stddef.h>
 
-/* /run/olpcboy/status from olpc-chordd: first line "vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=0".
+/* /run/olpcboy/status from olpc-chordd: first line "vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=0 bat=93 ac=1 chg=0"
+ * (bat/ac/chg: battery percent, AC adapter online, battery Charging; lines from an older chordd lack them).
  * Every field is -1 when absent, malformed or out of range (a negative value in the file means
  * "unknown" too).  A buffer that does not end in a newline is truncated: its last token is dropped.
  * Returns the number of valid fields. */
-struct sysstat { int vol, volmax, mute, bri, brimax, mono; };
+struct sysstat { int vol, volmax, mute, bri, brimax, mono, bat, ac, chg; };
+#define SYSSTAT_UNKNOWN { -1, -1, -1, -1, -1, -1, -1, -1, -1 }
+/* Battery state of the indicators */
+enum { BAT_NONE, BAT_NORMAL, BAT_LOW, BAT_CRIT };   /* NONE = unknown; LOW <= 15 %, CRIT <= 5 % */
+int  bat_level(int pct);
 int  status_parse(const char *buf, struct sysstat *s);
 /* percent of v within 0..max, rounded; -1 when either is unknown */
 int  pct_of_max(int v, int max);

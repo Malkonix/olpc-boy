@@ -13,6 +13,11 @@
  *   SELECT + R1 = brightness up  SELECT + R2 = brightness down
  * L2/R2 count as pressed when their key (BTN_TL2/BTN_TR2) is down or their
  * analog axis (ABS_Z/ABS_RZ) is above 1/3 of its range (released below 1/5).
+ *   SELECT + L2 + R2 = toggle DCON monochrome/colour (once per chord)
+ * When a pad has both L2 and R2, a lone L2/R2 waits COMBO_GRACE_MS for the other
+ * one before it steps volume/brightness (a tap steps once, on release); the
+ * second trigger inside the window, or later, toggles mono instead.  Pads that
+ * lack one of the two have no such chord and step at once.
  * Pad chords never touch the chord flag file (no D-pad is involved).
  *
  * Observes every /dev/input/event* that offers those keys (never EVIOCGRAB),
@@ -25,6 +30,12 @@
  * relative to the mixer minimum), in $CHORDD_STATUS (default: "status" next to
  * the chord file).  It is rewritten in place with a single write at start and
  * after every change chordd makes, so a reader can watch it with inotify.
+ * It ends with "bat=93 ac=1 chg=0": battery percent (-1 = none or unreadable), AC adapter online
+ * (-1 = no adapter node) and 1 while the battery status is Charging.  The battery (type=Battery)
+ * and the adapter (type=Mains) are found by scanning $CHORDD_POWER_DIR (default
+ * /sys/class/power_supply) and are read once at start and then every 60 s (each read of the
+ * olpc_battery attributes makes the kernel talk to the embedded controller, so no one else reads
+ * them); the line is rewritten only when it changed.
  *
  * Test mode (no devices, no root): see usage().  Paths are overridable by
  * environment variables, see the table below.
@@ -32,6 +43,7 @@
  * Single file, libc only, no SSE: build with -Os -march=geode -mtune=geode.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -68,6 +80,7 @@
 
 #define REPEAT_FIRST_MS 300	/* delay before the first auto-repeat step */
 #define REPEAT_MS       150	/* auto-repeat period */
+#define COMBO_GRACE_MS  150	/* how long a lone L2/R2 waits for its partner (SELECT+L2+R2) */
 #define MAXDEV 16
 
 /* held-key bitmask */
@@ -227,6 +240,18 @@ static void do_mono(int mono)
 	read_int(p_mono, &back);
 	logf_("%s mode, read back %ld", mono ? "mono" : "color", back);
 	publish_status();
+}
+
+static void do_mono_toggle(void)
+{
+	long cur;
+
+	errno = 0;
+	if (read_int(p_mono, &cur) < 0) {
+		logf_("mono toggle: %s: %s", p_mono, errno ? strerror(errno) : "unreadable");
+		return;
+	}
+	do_mono(!cur);
 }
 
 /* ---- mixer backend ------------------------------------------------------------
@@ -472,6 +497,71 @@ static void do_mute(int mute)
 	publish_status();
 }
 
+/* ---- battery / AC ------------------------------------------------------------------ */
+/* Every read of an olpc_battery attribute makes the kernel talk to the embedded controller, so this is
+ * the only reader on the system: once at start and then every BAT_MS from the poll() timeout.  The
+ * status line carries the cached values; a chord never triggers a read. */
+#define BAT_MS 60000L
+static const char *p_power;			/* power_supply class dir */
+static int bat_cap = -1, bat_ac = -1, bat_chg;	/* -1 = unknown */
+static long bat_due;				/* ms timestamp of the next read */
+static char bat_dir[300], ac_dir[300];		/* found by type, "" = not found yet */
+
+static int read_str(const char *path, char *b, size_t cap)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC), n;
+
+	if (fd < 0) return -1;
+	n = read(fd, b, cap - 1);
+	close(fd);
+	if (n <= 0) return -1;
+	b[n] = 0;
+	b[strcspn(b, "\n")] = 0;
+	return 0;
+}
+
+/* find the first supply of the given type ("Battery", "Mains") under p_power */
+static void find_supply(const char *type, char *out, size_t cap)
+{
+	DIR *d = opendir(p_power);
+	struct dirent *e;
+	char p[400], b[32];
+
+	out[0] = 0;
+	if (!d) return;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		snprintf(p, sizeof p, "%s/%s/type", p_power, e->d_name);
+		if (read_str(p, b, sizeof b) == 0 && !strcmp(b, type)) {
+			snprintf(out, cap, "%s/%s", p_power, e->d_name);
+			break;
+		}
+	}
+	closedir(d);
+}
+
+static void read_power(void)
+{
+	char p[400], b[32];
+	long v;
+
+	if (!bat_dir[0]) find_supply("Battery", bat_dir, sizeof bat_dir);
+	if (!ac_dir[0]) find_supply("Mains", ac_dir, sizeof ac_dir);
+	bat_cap = -1; bat_chg = 0; bat_ac = -1;
+	if (bat_dir[0]) {
+		snprintf(p, sizeof p, "%s/capacity", bat_dir);
+		if (read_int(p, &v) == 0 && v >= 0 && v <= 100) bat_cap = (int)v;
+		else bat_dir[0] = 0;			/* gone or unreadable: look again next time */
+		snprintf(p, sizeof p, "%s/status", bat_dir);
+		if (bat_dir[0] && read_str(p, b, sizeof b) == 0 && !strcmp(b, "Charging")) bat_chg = 1;
+	}
+	if (ac_dir[0]) {
+		snprintf(p, sizeof p, "%s/online", ac_dir);
+		if (read_int(p, &v) == 0) bat_ac = v ? 1 : 0;
+		else ac_dir[0] = 0;
+	}
+}
+
 /* ---- status file ------------------------------------------------------------------ */
 static int status_fd = -1;
 static char status_last[128];
@@ -500,8 +590,8 @@ static void publish_status(void)
 		snprintf(n, sizeof n, "%s Playback Switch", base);
 		if (mx->get(n, &e) == 0) mute = e.v[0] ? 0 : 1;
 	}
-	len = snprintf(line, sizeof line, "vol=%02ld volmax=%02ld mute=%ld bri=%02ld brimax=%02ld mono=%ld\n",
-		       vol, volmax, mute, bri, brimax, mono);
+	len = snprintf(line, sizeof line, "vol=%02ld volmax=%02ld mute=%ld bri=%02ld brimax=%02ld mono=%ld bat=%d ac=%d chg=%d\n",
+		       vol, volmax, mute, bri, brimax, mono, bat_cap, bat_ac, bat_chg);
 	if (!strcmp(line, status_last)) return;
 	if (pwrite(status_fd, line, len, 0) != len) {
 		fprintf(stderr, "olpc-chordd: status write: %s\n", strerror(errno));
@@ -581,8 +671,43 @@ static void on_change(int before, long now)
 	export_state();
 }
 
+/* ---- devices -------------------------------------------------------------------- */
+static struct dev {
+	int fd; int held; char path[64];
+	/* gamepad part (pad != 0): held buttons by key / by analog axis */
+	int pad; unsigned id; int pkey, paxis; int abs_ok;	/* abs_ok: bit0 ABS_Z, bit1 ABS_RZ usable */
+	long a_on[2], a_off[2];	/* press / release thresholds for ABS_Z, ABS_RZ */
+	int has2;		/* pad has both L2 and R2 (key or axis): the mono chord exists */
+	int armed;		/* P_L2/P_R2 pressed while SELECT was held */
+	int pend;		/* trigger (P_L2/P_R2) waiting out COMBO_GRACE_MS, else 0 */
+	long pend_due;
+	int combo;		/* mono already toggled: wait until both triggers are up */
+	char tag[96];
+} devs[MAXDEV];
+static int ndev;
+static unsigned next_id = 1;
+
+static void pad_act(struct dev *d, int bit, long now, int repeat);
+
 static void tick(long now)
 {
+	int i;
+
+	if (now >= bat_due) {
+		read_power();
+		publish_status();
+		bat_due = now + BAT_MS;
+	}
+
+	for (i = 0; i < ndev; i++) {
+		struct dev *d = &devs[i];
+		int bit = d->pend;
+
+		if (bit && now >= d->pend_due) {
+			d->pend = 0;
+			pad_act(d, bit, now, 1);
+		}
+	}
 	if (rep_dir && now >= rep_due) {
 		log_src = rep_pad ? rep_tag : NULL;
 		if (rep_kind == B_VOL) { if (do_volume(rep_dir, 0) < 0) { rep_dir = 0; log_src = NULL; return; } }
@@ -592,17 +717,6 @@ static void tick(long now)
 		if (rep_due <= now) rep_due = now + REPEAT_MS;	/* we were late: no burst */
 	}
 }
-
-/* ---- devices -------------------------------------------------------------------- */
-static struct dev {
-	int fd; int held; char path[64];
-	/* gamepad part (pad != 0): held buttons by key / by analog axis */
-	int pad; unsigned id; int pkey, paxis; int abs_ok;	/* abs_ok: bit0 ABS_Z, bit1 ABS_RZ usable */
-	long a_on[2], a_off[2];	/* press / release thresholds for ABS_Z, ABS_RZ */
-	char tag[96];
-} devs[MAXDEV];
-static int ndev;
-static unsigned next_id = 1;
 
 static long mono_ms(void)
 {
@@ -630,6 +744,19 @@ static void dev_key(int i, int code, int value, long now)
 	if (value) devs[i].held |= b; else devs[i].held &= ~b;
 	held = all_held();
 	on_change(before, now);
+}
+
+/* ms timestamp of the earliest pending timer (repeat, combo window or battery read) */
+static long next_due(void)
+{
+	long t = bat_due;
+	int i;
+
+	if (rep_dir && rep_due < t) t = rep_due;
+
+	for (i = 0; i < ndev; i++)
+		if (devs[i].pend && (t < 0 || devs[i].pend_due < t)) t = devs[i].pend_due;
+	return t;
 }
 
 /* ---- gamepad chords ---------------------------------------------------------- */
@@ -663,27 +790,59 @@ static void pad_start_rep(struct dev *d, int dir, int kind, int bit, long now)
 	rep_due = now + REPEAT_FIRST_MS;
 }
 
+/* One volume/brightness step for pad button `bit`, with auto-repeat when asked. */
+static void pad_act(struct dev *d, int bit, long now, int repeat)
+{
+	int dir = (bit & (P_L1 | P_R1)) ? +1 : -1, kind = (bit & P_VOL) ? B_VOL : B_BRIGHT;
+
+	log_src = d->tag;
+	if (kind == B_VOL) {
+		if (do_volume(dir, 1) == 0 && repeat) pad_start_rep(d, dir, kind, bit, now);
+	} else {
+		do_brightness(dir, 1);
+		if (repeat) pad_start_rep(d, dir, kind, bit, now);
+	}
+	log_src = NULL;
+}
+
 static void pad_update(struct dev *d, int before, long now)
 {
-	int cur = d->pkey | d->paxis, pressed = cur & ~before, bit;
+	int cur = d->pkey | d->paxis, pressed = cur & ~before, released = before & ~cur, bit;
 	int both = (cur & P_VOL) && (cur & P_BRIGHT);
 
+	if (!(cur & P_SEL)) { d->armed = 0; d->pend = 0; d->combo = 0; }
+	else d->armed = (d->armed | (pressed & (P_L2 | P_R2))) & cur;
+	if (!(cur & (P_L2 | P_R2))) d->combo = 0;
+
+	/* a lone trigger released inside the window: a tap is exactly one step */
+	if (d->pend && (released & d->pend)) {
+		bit = d->pend;
+		d->pend = 0;
+		if (cur & P_SEL) pad_act(d, bit, now, 0);
+	}
 	/* the repeat dies with its button, with SELECT, or when both groups are held */
 	if (rep_dir && rep_pad == d->id && (!(cur & rep_bit) || !(cur & P_SEL) || both))
 		rep_dir = 0;
+
+	/* SELECT + L2 + R2 (both pressed after SELECT): toggle mono once per chord */
+	if (d->has2 && (pressed & (P_L2 | P_R2)) && !d->combo &&
+	    (d->armed & P_L2) && (d->armed & P_R2)) {
+		d->pend = 0;
+		d->combo = 1;
+		log_src = d->tag;
+		do_mono_toggle();
+		log_src = NULL;
+		return;
+	}
+	if (both) d->pend = 0;
 	if (!(cur & P_SEL) || both) return;
 	for (bit = P_L1; bit <= P_R2; bit <<= 1) {
-		int dir = (bit & (P_L1 | P_R1)) ? +1 : -1, kind = (bit & P_VOL) ? B_VOL : B_BRIGHT;
-
 		if (!(pressed & bit)) continue;
-		log_src = d->tag;
-		if (kind == B_VOL) {
-			if (do_volume(dir, 1) == 0) pad_start_rep(d, dir, kind, bit, now);
-		} else {
-			do_brightness(dir, 1);
-			pad_start_rep(d, dir, kind, bit, now);
-		}
-		log_src = NULL;
+		if (d->has2 && (bit & (P_L2 | P_R2))) {
+			d->pend = bit;
+			d->pend_due = now + COMBO_GRACE_MS;
+		} else
+			pad_act(d, bit, now, 1);
 	}
 }
 
@@ -753,6 +912,8 @@ static void scan(long now)
 			     testbit(keys, BTN_L2) || testbit(keys, BTN_R2) || d->abs_ok;
 			if (!testbit(keys, BTN_SEL) || !tr) { close(fd); continue; }
 			d->pad = 1;
+			d->has2 = (testbit(keys, BTN_L2) || (d->abs_ok & 1)) &&
+				  (testbit(keys, BTN_R2) || (d->abs_ok & 2));
 			d->id = next_id++;
 			/* start from the real state: anything already held is not a new press */
 			memset(keys, 0, sizeof keys);
@@ -826,7 +987,8 @@ static int name_to_code(const char *s)
 static int replay(FILE *in, int text)
 {
 	long now = 0, end = 0;
-	char line[128], nm[32];
+	char line[128], nm[32], pf[64], pv[32], pp[400];
+	FILE *fp;
 	long amin = 0, amax = 255;
 	int ax;
 
@@ -835,6 +997,7 @@ static int replay(FILE *in, int text)
 	devs[0].fd = devs[1].fd = -1;
 	devs[1].pad = 1;
 	devs[1].id = next_id++;
+	devs[1].has2 = 1;
 	snprintf(devs[1].tag, sizeof devs[1].tag, "pad: Test Pad");
 	for (ax = 0; ax < 2; ax++) pad_set_axis(&devs[1], ax, amin, amax);
 
@@ -846,8 +1009,17 @@ static int replay(FILE *in, int text)
 			int v;
 			if (!fgets(line, sizeof line, in)) break;
 			if (line[0] == '#' || line[0] == '\n') continue;
+			if (!strncmp(line, "NOR2", 4)) { devs[1].has2 = 0; continue; }
 			if (sscanf(line, "PAD %ld %ld", &amin, &amax) == 2) {
 				for (ax = 0; ax < 2; ax++) pad_set_axis(&devs[1], ax, amin, amax);
+				continue;
+			}
+			if (sscanf(line, "%ld PSET %63s %31s", &t, pf, pv) == 3) {
+				while ((now = next_due()) >= 0 && now <= t) tick(now);
+				now = t;
+				snprintf(pp, sizeof pp, "%s/%s", p_power, pf);
+				fp = fopen(pp, "w");
+				if (fp) { fprintf(fp, "%s\n", pv); fclose(fp); }
 				continue;
 			}
 			if (sscanf(line, "%ld %31s %d", &t, nm, &v) != 3) {
@@ -870,7 +1042,7 @@ static int replay(FILE *in, int text)
 			t = (long)e.sec * 1000 + e.usec / 1000;
 			type = e.type; code = e.code; val = e.value;
 		}
-		while (rep_dir && rep_due <= t) { now = rep_due; tick(now); }
+		while ((now = next_due()) >= 0 && now <= t) tick(now);
 		now = t;
 		if (unplug) {
 			fprintf(stderr, "[%6ld ms] pad unplugged\n", t);
@@ -884,7 +1056,7 @@ static int replay(FILE *in, int text)
 			dev_event(0, type, code, val, now);
 	}
 	end = now + atol(envp("CHORDD_TAIL_MS", "0"));
-	while (rep_dir && rep_due <= end) { now = rep_due; tick(now); }
+	while ((now = next_due()) >= 0 && now <= end) tick(now);
 	return 0;
 }
 
@@ -895,11 +1067,12 @@ static void usage(void)
 	      "       olpc-chordd --test        replay text events from stdin\n"
 	      "                                 (\"<ms> <UP|DOWN|LEFT|RIGHT|CIRCLE|CHECK|...> <0|1|2>\";\n"
 	      "                                 pad: SELECT START L1 R1 L2 R2, \"<ms> ABS_Z|ABS_RZ <value>\",\n"
-	      "                                 \"PAD <min> <max>\" sets the trigger range, \"<ms> UNPLUG 1\")\n"
+	      "                                 \"PAD <min> <max>\" sets the trigger range, \"NOR2\" = pad without R2,\n"
+	      "                                 \"<ms> UNPLUG 1\", \"<ms> PSET <file under CHORDD_POWER_DIR> <value>\")\n"
 	      "       olpc-chordd --replay      replay raw 16-byte input_event records from stdin\n"
 	      "environment: CHORDD_INPUT_DIR (/dev/input), CHORDD_BACKLIGHT_GLOB (/sys/class/backlight/*),\n"
 	      "  CHORDD_MONO (/sys/devices/platform/dcon/monochrome), CHORDD_STATE (/run/olpcboy/chord),\n"
-	      "  CHORDD_STATUS (status next to CHORDD_STATE),\n"
+	      "  CHORDD_STATUS (status next to CHORDD_STATE), CHORDD_POWER_DIR (/sys/class/power_supply),\n"
 	      "  CHORDD_TIMELINE (/var/log/olpc-current/timeline.log; unset in test mode = not written),\n"
 	      "  CHORDD_TAIL_MS (test: keep the clock running after the last event),\n"
 	      "  CHORDD_SND_CTL (/dev/snd/controlC0), CHORDD_FAKE_MIXER (test: file-backed fake mixer)\n", stderr);
@@ -935,6 +1108,7 @@ int main(int argc, char **argv)
 	p_state    = envp("CHORDD_STATE", "/run/olpcboy/chord");
 	p_snd      = envp("CHORDD_SND_CTL", "/dev/snd/controlC0");
 	p_fake     = getenv("CHORDD_FAKE_MIXER");
+	p_power    = envp("CHORDD_POWER_DIR", "/sys/class/power_supply");
 	p_timeline = envp("CHORDD_TIMELINE", "/var/log/olpc-current/timeline.log");
 
 	if (argc > 2 || (argc == 2 && strcmp(argv[1], "--test") && strcmp(argv[1], "--replay"))) {
@@ -945,6 +1119,8 @@ int main(int argc, char **argv)
 	if (p_fake && *p_fake) mx = &fake_ops;
 	else if (test_mode && !getenv("CHORDD_SND_CTL"))
 		p_snd = "/nonexistent/controlC0";	/* tests must never touch the host card */
+	if (test_mode && !getenv("CHORDD_POWER_DIR"))
+		p_power = "/nonexistent/power_supply";	/* ... nor the host battery */
 
 	{
 		char dir[200], *s;
@@ -971,6 +1147,8 @@ int main(int argc, char **argv)
 	export_state();
 
 	mixer_ready();		/* card may be absent (QEMU): logged once, retried on use */
+	read_power();
+	bat_due = (test_mode ? 0 : mono_ms()) + BAT_MS;	/* test mode runs on the replay clock */
 	publish_status();
 	if (test_mode)
 		return replay(stdin, !strcmp(argv[1], "--test"));
@@ -988,8 +1166,8 @@ int main(int argc, char **argv)
 		long now = mono_ms(), to = -1;
 		int n, nd;
 
-		if (rep_dir) {
-			to = rep_due - now;
+		if ((to = next_due()) >= 0) {
+			to -= now;
 			if (to < 0) to = 0;
 		}
 		nd = ndev;

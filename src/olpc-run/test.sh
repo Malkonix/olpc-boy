@@ -41,9 +41,9 @@ run_core() {
 	[ "$(stat_get "$tmp/s.txt" frames_run)" = 600 ] || bad "frames_run != 600"
 	printf '  null sinks:  rc=%s frames=%s core_ms_avg=%s (host speed)\n' $rc "$(stat_get "$tmp/s.txt" frames_run)" "$(stat_get "$tmp/s.txt" core_ms_avg)"
 	# b) fake framebuffer: the whole video path.  The in-game strip (right border) is on by default; its
-	# rectangle is computed here, independently of the frontend: 96x368 at y=16, centred in the border.
+	# rectangle is computed here, independently of the frontend: 96x452 at y=16, centred in the border.
 	border=$((1200 - x0 - w)); sarg=""; sx=0
-	if [ $border -ge 104 ]; then sx=$((x0 + w + (border - 96) / 2)); sarg="$sx 16 96 368"; fi
+	if [ $border -ge 104 ]; then sx=$((x0 + w + (border - 96) / 2)); sarg="$sx 16 96 452"; fi
 	rm -f "$tmp/fb.raw"
 	OLPC_RUN_FAKEFB="$tmp/fb.raw" "$tmp/olpc-run" --libdir "$cores" --core "$core" --max-scale "$cap" --no-audio --frames 600 \
 		--status-file "$tmp/ovl/status" --wifi-file "$tmp/ovl/wifi.status" --wireless-file "$tmp/ovl/none" \
@@ -113,7 +113,7 @@ if [ $found = 1 ]; then
 		mkdir -p "$tmp/cfg24" "$tmp/cfg12"; echo "AST4 24" >"$tmp/cfg24/TZ.CFG"
 		printf 'wlan0: 0000   70.  -50.  -256 0 0 0 0 0 0\n' >"$tmp/ovl/w4"
 		printf 'wlan0: 0000   30.  -80.  -256 0 0 0 0 0 0\n' >"$tmp/ovl/w1"
-		SR="1092 16 96 368"; GR="120 18 960 864"
+		SR="1092 16 96 452"; GR="120 18 960 864"
 		# ovl_shot <name> <status> <wifi> <wireless file> <cfgdir> : one run, fake clock 15:07:10 AST
 		ovl_shot() {
 			printf '%s\n' "$2" >"$tmp/ovl/status"; printf '%s\n' "$3" >"$tmp/ovl/wifi.status"
@@ -130,7 +130,7 @@ if [ $found = 1 ]; then
 		}
 		ST="vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=0"; WF="state=connected ssid=Casa ip=10.0.0.2"
 		ovl_shot base "$ST" "$WF" "$tmp/ovl/w4" "$tmp/cfg24"
-		grep -q 'overlay: strip 96x368 at 1092,16' "$tmp/ovl-base.log" || bad "no strip placement in the log"
+		grep -q 'overlay: strip 96x452 at 1092,16' "$tmp/ovl-base.log" || bad "no strip placement in the log"
 		grep -q 'overlay: time zone AST4, 24-hour clock' "$tmp/ovl-base.log" || bad "TZ.CFG not applied to the clock"
 		ovl_shot h12 "$ST" "$WF" "$tmp/ovl/w4" "$tmp/cfg12";                                                  ovl_vs h12 base
 		ovl_shot wifi1 "$ST" "$WF" "$tmp/ovl/w1" "$tmp/cfg24";                                                ovl_vs wifi1 base
@@ -141,12 +141,19 @@ if [ $found = 1 ]; then
 		ovl_shot bri3 "vol=27 volmax=31 mute=0 bri=3 brimax=15 mono=0" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";    ovl_vs bri3 base
 		ovl_shot mono "vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=1" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";   ovl_vs mono base
 		ovl_shot none "" "" "$tmp/ovl/w4" "$tmp/cfg24";                                                       ovl_vs none base
-		grep -q '^overlay=1' "$tmp/ovl-base.txt" && grep -q '^overlay_rect=96x368+1092+16' "$tmp/ovl-base.txt" || bad "overlay statistics missing"
+		for b in "100 0 0" "50 0 0" "15 0 0" "5 0 0" "50 0 1" "100 1 0"; do
+			set -- $b
+			ovl_shot "bat$1-$2$3" "$ST bat=$1 ac=$2 chg=$3" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";           ovl_vs "bat$1-$2$3" base
+		done
+		ovl_shot batnone "$ST bat=-1 ac=-1 chg=0" "$WF" "$tmp/ovl/w4" "$tmp/cfg24"
+		d=$("$tmp/fbcheck" --diff "$tmp/ovl-base.raw" "$tmp/ovl-batnone.raw" $GR $SR)
+		[ "$d" = "rect=0 other=0 strip=0" ] && echo "  battery unknown looks like no battery field at all" || bad "bat=-1 differs from a status line without battery: $d"
+		grep -q '^overlay=1' "$tmp/ovl-base.txt" && grep -q '^overlay_rect=96x452+1092+16' "$tmp/ovl-base.txt" || bad "overlay statistics missing"
 		for k in overlay_full_paints overlay_redraws overlay_redraw_us_total overlay_redraw_us_max overlay_ticks overlay_tick_us_total overlay_tick_us_max overlay_period; do
 			grep -q "^$k=" "$tmp/ovl-base.txt" || bad "stats lack $k"
 		done
 		echo "  base run: redraws=$(stat_get "$tmp/ovl-base.txt" overlay_redraws) total_us=$(stat_get "$tmp/ovl-base.txt" overlay_redraw_us_total) max_us=$(stat_get "$tmp/ovl-base.txt" overlay_redraw_us_max) ticks=$(stat_get "$tmp/ovl-base.txt" overlay_ticks) (host speed)"
-		[ "$(stat_get "$tmp/ovl-base.txt" overlay_redraws)" = 5 ] || bad "a run with constant values must redraw each of the 5 slots once (got $(stat_get "$tmp/ovl-base.txt" overlay_redraws))"
+		[ "$(stat_get "$tmp/ovl-base.txt" overlay_redraws)" = 6 ] || bad "a run with constant values must redraw each of the 6 slots once (got $(stat_get "$tmp/ovl-base.txt" overlay_redraws))"
 
 		# values change while playing: only the strip is repainted, the result equals a run that had the final values all along
 		printf '%s\n' "$ST" >"$tmp/ovl/status"; printf '%s\n' "$WF" >"$tmp/ovl/wifi.status"
@@ -167,8 +174,8 @@ if [ $found = 1 ]; then
 			--savedir "$tmp/saves" --input-dir "$tmp/noinput" gb "$gb" >"$tmp/ovl-ref.log" 2>&1 || bad "reference run failed"
 		rd=$(stat_get "$tmp/ovl-live.txt" overlay_redraws)
 		d=$("$tmp/fbcheck" --diff "$tmp/ovl-live.raw" "$tmp/ovl-ref.raw" $GR $SR)
-		echo "  live changes: redraws=$rd (5 initial + 3 changed slots), final screen vs a run that had the final values all along: $d"
-		[ "$rd" = 8 ] || bad "expected 8 slot redraws, got $rd"
+		echo "  live changes: redraws=$rd (6 initial + 3 changed slots), final screen vs a run that had the final values all along: $d"
+		[ "$rd" = 9 ] || bad "expected 9 slot redraws, got $rd"
 		[ "$d" = "rect=0 other=0 strip=0" ] || bad "the strip after the change differs from the reference: $d"
 		grep -q '^overlay_ticks=[1-9]' "$tmp/ovl-live.txt" || bad "no polls recorded"
 		echo "  1 s polling default: overlay_period=$(stat_get "$tmp/ovl-base.txt" overlay_period)"

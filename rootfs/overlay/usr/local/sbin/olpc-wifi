@@ -8,6 +8,28 @@
 #   olpc-wifi run      skip-checks, then up + check (what the service runs)
 #   olpc-wifi status   connected or not, SSID, IP, signal
 #   olpc-wifi down     stop wpa_supplicant/udhcpc, interface down
+#   olpc-wifi scan     visible networks, one per line:
+#                        SSID<TAB>signal_dBm<TAB>OPEN|WEP|WPA|WPA2<TAB>saved<TAB>connected
+#                      strongest first, same SSID merged, hidden dropped; also written
+#                      atomically to /run/olpcboy/wifi.scan.  Works with WiFi up or down.
+#   olpc-wifi list     saved networks (SSID<TAB>TYPE, priority order, never the key)
+#   olpc-wifi add SSID TYPE      key on stdin (one line); inserted at the top of WIFI.CFG
+#   olpc-wifi forget SSID        remove it from WIFI.CFG
+#   olpc-wifi connect SSID       move it to the top, (re)connect, report why on failure
+#   olpc-wifi autoconnect on|off|status   WIFIAUTO.CFG next to WIFI.CFG (default on)
+#   olpc-wifi autostart          boot hook: `up` when autoconnect is on (once per boot)
+#
+# up/down/add/forget/connect/autoconnect on|off end with exactly one line
+#   RESULT <code> <text>     (scan prints it on stderr, only on failure)
+# code = ok wrongkey notfound rejected timeout dhcp nostore busy notsaved badkey badssid
+# badtype nodev nocfg failed; the exit status is 0 only for ok.  The SSID arguments and the
+# scan/list output use a safe text form: valid UTF-8 as is, control characters, backslash and
+# invalid bytes as \xNN (which the arguments decode again).
+#
+# Link monitor: after an association a `wpa_cli -a` helper (event driven, no polling) runs this
+# script as `olpc-wifi <if> CONNECTED|DISCONNECTED`; a drop publishes state=connecting, the
+# return re-runs DHCP and publishes state=connected again.  Events are ignored while another
+# olpc-wifi operation holds the lock.
 #
 # WIFI.CFG (root of the FAT partition, any case; edit it from any PC):
 #   one network per line, TAB separated:   SSID <TAB> key <TAB> TYPE
@@ -31,6 +53,8 @@ CONF=$WDIR/wpa.conf
 WPALOG=$WDIR/wpa.log
 WPAPID=$WDIR/wpa_supplicant.pid
 DHCPID=$WDIR/udhcpc.pid
+WCLIPID=$WDIR/wpa_cli.pid
+SELF=${OLPC_WIFI_SELF:-/usr/local/sbin/olpc-wifi}
 CTRL=/run/wpa_supplicant
 LOGMNT=${OLPC_WIFI_LOGMNT:-/mnt/olpclog}
 # one real cover of the Game Boy set (the exact name must exist on the server)
@@ -43,6 +67,10 @@ LOCKBASE=${OLPC_WIFI_LOCKDIR:-/run/olpcboy}
 LOCK=$LOCKBASE/wifi.lock
 RESULT=$LOCKBASE/wifi.result
 WSTATUS=$LOCKBASE/wifi.status
+SCANFILE=$LOCKBASE/wifi.scan
+AUTOMARK=$LOCKBASE/wifi.autostarted
+SCANWAIT=${OLPC_WIFI_SCANWAIT:-4}
+UPREASON=""
 LOCKHELD=0
 THUMBS=http://thumbnails.libretro.com
 NTP_HOST=pool.ntp.org
@@ -211,21 +239,35 @@ link_info() {
 
 # why_failed: best guess from wpa_supplicant's normal log
 why_failed() {
-	[ -r "$WPALOG" ] || { echo "no wpa_supplicant log"; return; }
-	if grep -q 'pre-shared key may be incorrect\|WRONG_KEY' "$WPALOG"; then
+	_wf=${1:-$WPALOG}
+	[ -r "$_wf" ] || { echo "no wpa_supplicant log"; return; }
+	if grep -q 'pre-shared key may be incorrect\|WRONG_KEY' "$_wf"; then
 		echo "wrong key (4-way handshake failed, PSK may be incorrect)"
-	elif grep -q '4-Way Handshake failed\|reason=15\|reason=16' "$WPALOG"; then
+	elif grep -q '4-Way Handshake failed\|reason=15\|reason=16' "$_wf"; then
 		echo "4-way handshake timeout"
-	elif grep -q 'ASSOC-REJECT\|status_code=' "$WPALOG"; then
+	elif grep -q 'ASSOC-REJECT\|status_code=' "$_wf"; then
 		echo "association rejected by AP"
-	elif grep -q 'auth.*timed out\|authentication.*timed out\|Authentication with .* timed out' "$WPALOG"; then
+	elif grep -q 'auth.*timed out\|authentication.*timed out\|Authentication with .* timed out' "$_wf"; then
 		echo "authentication timed out"
-	elif grep -q 'NETWORK-NOT-FOUND' "$WPALOG"; then
+	elif grep -q 'NETWORK-NOT-FOUND' "$_wf"; then
 		echo "no AP found (configured SSIDs not seen in scan)"
-	elif ! grep -q 'Trying to associate\|Trying to authenticate\|SME:\|Associated with' "$WPALOG"; then
+	elif ! grep -q 'Trying to associate\|Trying to authenticate\|SME:\|Associated with' "$_wf"; then
 		echo "no AP found (never tried to authenticate)"
 	else
 		echo "association did not complete"
+	fi
+}
+
+# why_code [FILE]: the same guess as a reason code for the UI
+why_code() {
+	_wf=${1:-$WPALOG}
+	[ -r "$_wf" ] || { echo failed; return; }
+	if grep -q 'pre-shared key may be incorrect\|WRONG_KEY' "$_wf"; then echo wrongkey
+	elif grep -q '4-Way Handshake failed\|reason=15\|reason=16' "$_wf"; then echo wrongkey
+	elif grep -q 'ASSOC-REJECT\|status_code=' "$_wf"; then echo rejected
+	elif grep -q 'NETWORK-NOT-FOUND' "$_wf"; then echo notfound
+	elif ! grep -q 'Trying to associate\|Trying to authenticate\|SME:\|Associated with' "$_wf"; then echo notfound
+	else echo timeout
 	fi
 }
 
@@ -239,7 +281,7 @@ dump_wpalog() {
 }
 
 stop_procs() {
-	for _pf in "$WPAPID" "$DHCPID"; do
+	for _pf in "$WCLIPID" "$WPAPID" "$DHCPID"; do
 		[ -r "$_pf" ] || continue
 		_p=$(cat "$_pf" 2>/dev/null)
 		[ -n "$_p" ] && kill "$_p" 2>/dev/null
@@ -293,10 +335,13 @@ wait_assoc() {
 
 do_up_real() {
 	wstatus connecting
-	CFG=$(find_cfg) || { step "no WIFI.CFG found on $LOGMNT, nothing to do"; return 2; }
+	UPREASON=failed
+	if [ -n "$UPCFG" ]; then CFG=$UPCFG
+	else CFG=$(find_cfg) || { UPREASON=nocfg; step "no WIFI.CFG found on $LOGMNT, nothing to do"; return 2; }
+	fi
 	wl "using $CFG"
 	genconf "$CFG" "$CONF"
-	if [ "$NNET" -eq 0 ]; then step "WIFI.CFG has no usable network"; rm -f "$CONF"; return 2; fi
+	if [ "$NNET" -eq 0 ]; then UPREASON=nocfg; step "WIFI.CFG has no usable network"; rm -f "$CONF"; return 2; fi
 	step "config: $NNET network(s)"
 
 	stop_procs
@@ -311,7 +356,7 @@ do_up_real() {
 			olpc_sleep 1
 		done
 	fi
-	if [ ! -d "/sys/class/net/$IF" ]; then step "FAIL: $IF did not appear in 15 s"; return 1; fi
+	if [ ! -d "/sys/class/net/$IF" ]; then UPREASON=nodev; step "FAIL: $IF did not appear in 15 s"; return 1; fi
 	step "$IF present"
 	ip link set "$IF" up >>"$BOOTDIR/wifi.log" 2>&1
 	rm -f "$WDIR/connected"
@@ -328,7 +373,7 @@ do_up_real() {
 			ASSOC_DRV=$_drv
 			break
 		fi
-		_why=$(why_failed)
+		_why=$(why_failed); UPREASON=$(why_code)
 		step "no association with -D $_drv: $_why"
 		dump_wpalog "$_drv"
 		stop_procs
@@ -342,10 +387,12 @@ do_up_real() {
 	bounded 30 udhcpc -i "$IF" -n -q -t 4 -T 3 >>"$BOOTDIR/wifi.log" 2>&1
 	_rc=$?
 	_ip=$(if_ip)
-	if [ -z "$_ip" ]; then step "FAIL: DHCP gave no address (rc=$_rc)"; return 1; fi
+	if [ -z "$_ip" ]; then UPREASON=dhcp; step "FAIL: DHCP gave no address (rc=$_rc)"; return 1; fi
 	step "dhcp: ip=$_ip gw=$(if_gw) dns=$(dns_list)"
 	echo "$_ssid" >"$WDIR/connected"
 	wstatus connected "$_ssid" "$_ip"
+	UPREASON=""
+	start_watch
 
 	# the XO-1 RTC may be far off: one-shot NTP, failure is not an error
 	_cs; _t0=$CS
@@ -432,10 +479,11 @@ do_up() {
 	fi
 	if ! lock_wait 240 up; then step "FAIL: up: lock still busy after 240 s"; return 1; fi
 	if [ -n "$WAITED_FOR" ]; then
-		_rop=""; _rpid=""; _rrc=""
-		[ -r "$RESULT" ] && read -r _rop _rpid _rrc <"$RESULT"
+		_rop=""; _rpid=""; _rrc=""; _rwhy=""
+		[ -r "$RESULT" ] && read -r _rop _rpid _rrc _rwhy <"$RESULT"
 		if [ "$_rop" = up ] && [ "$_rpid" = "$WAITED_FOR" ]; then
 			lock_release
+			UPREASON=$_rwhy
 			step "up: took the result of the concurrent up (pid $_rpid): rc=$_rrc"
 			return "${_rrc:-1}"
 		fi
@@ -447,7 +495,7 @@ do_up() {
 	do_up_real
 	_rc=$?
 	[ "$_rc" -eq 0 ] || wstatus off
-	echo "up $$ $_rc" >"$RESULT"
+	echo "up $$ $_rc $UPREASON" >"$RESULT"
 	lock_release
 	return $_rc
 }
@@ -558,13 +606,563 @@ do_run() {
 	do_up && do_check
 }
 
+# ================================================================ network manager
+# SSID text.  Safe form: valid UTF-8 as is; control characters, backslash and invalid UTF-8 bytes
+# as \xNN.  AWKLIB (run with LC_ALL=C, so strings are bytes) has dec() (decode the escapes of
+# iw / wpa_cli / our own safe form into BY[1..n]), raw() (bytes of a plain string, no decoding),
+# enc() (BY -> safe form) and rawstr() (BY -> bytes).  Values reach awk through ENVIRON only
+# (-v would process backslash escapes).
+AWKLIB='
+BEGIN { for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i }
+function hexv(s) { return (index("0123456789abcdef", tolower(substr(s, 1, 1))) - 1) * 16 + index("0123456789abcdef", tolower(substr(s, 2, 1))) - 1 }
+function dec(s,   i, n, L, c, d) {
+	n = 0; i = 1; L = length(s)
+	while (i <= L) {
+		c = substr(s, i, 1)
+		if (c == "\\" && i < L) {
+			d = substr(s, i + 1, 1)
+			if (d == "x" && substr(s, i + 2, 2) ~ /^[0-9a-fA-F][0-9a-fA-F]$/) { BY[++n] = hexv(substr(s, i + 2, 2)); i += 4; continue }
+			if (d == "\\") { BY[++n] = 92; i += 2; continue }
+			if (d == "\"") { BY[++n] = 34; i += 2; continue }
+			if (d == "n") { BY[++n] = 10; i += 2; continue }
+			if (d == "r") { BY[++n] = 13; i += 2; continue }
+			if (d == "t") { BY[++n] = 9; i += 2; continue }
+			if (d == "e") { BY[++n] = 27; i += 2; continue }
+		}
+		BY[++n] = ORD[c]; i++
+	}
+	return n
+}
+function raw(s,   i, n) { n = length(s); for (i = 1; i <= n; i++) BY[i] = ORD[substr(s, i, 1)]; return n }
+function cont(i, lo, hi) { return BY[i] >= lo && BY[i] <= hi }
+function enc(n,   i, o, b, len, ok, j) {
+	o = ""; i = 1
+	while (i <= n) {
+		b = BY[i]
+		if (b >= 32 && b < 127 && b != 92) { o = o sprintf("%c", b); i++; continue }
+		len = 0
+		if (b >= 194 && b <= 223) len = 2; else if (b >= 224 && b <= 239) len = 3; else if (b >= 240 && b <= 244) len = 4
+		if (len && i + len - 1 <= n) {
+			ok = 1
+			for (j = 1; j < len; j++) if (!cont(i + j, 128, 191)) ok = 0
+			if (ok && b == 224 && BY[i + 1] < 160) ok = 0
+			if (ok && b == 237 && BY[i + 1] > 159) ok = 0
+			if (ok && b == 240 && BY[i + 1] < 144) ok = 0
+			if (ok && b == 244 && BY[i + 1] > 143) ok = 0
+			if (ok) { for (j = 0; j < len; j++) o = o sprintf("%c", BY[i + j]); i += len; continue }
+		}
+		o = o sprintf("\\x%02x", b); i++
+	}
+	return o
+}
+function rawstr(n,   i, o) { o = ""; for (i = 1; i <= n; i++) if (BY[i] > 0) o = o sprintf("%c", BY[i]); return o }
+function hidden(n,   i) { for (i = 1; i <= n; i++) if (BY[i] != 0) return 0; return 1 }
+'
+
+# list program: WIFI.CFG on stdin-file -> "safe-SSID<TAB>TYPE" (parseable types only)
+LISTAWK='
+{
+	l = $0; sub(/\r$/, "", l)
+	if (l == "" || l ~ /^#/ || l ~ /^[ \t]*$/) next
+	n = split(l, f, "\t")
+	ssid = f[1]; key = (n >= 2) ? f[2] : ""; type = (n >= 3) ? f[3] : ""
+	gsub(/[ \t]/, "", type); type = toupper(type)
+	if (type == "") type = (key == "") ? "OPEN" : "WPA2"
+	if (type !~ /^(WPA2|WPA|WEP|OPEN)$/ || ssid == "" || length(ssid) > 32) next
+	print enc(raw(ssid)) "\t" type
+}
+'
+
+# scan program: FMT=wpa|iw, SAVEDF=file of safe SSIDs, CONN=connected SSID (escaped text)
+SCANAWK='
+function sec(   s) {
+	if (ibss) return ""
+	if (psk2) return "WPA2"
+	if (psk1) return "WPA"
+	if (eap || sae || haswpa) return ""
+	if (priv) return "WEP"
+	return "OPEN"
+}
+function addnet(text, dbm, s,   n, k) {
+	if (s == "") return
+	n = dec(text)
+	if (n == 0 || hidden(n)) return
+	k = enc(n)
+	if (!(k in BEST)) { ORDER[++NK] = k; BEST[k] = dbm - 1000 }
+	if (!(k in DBM) || dbm > DBM[k]) { DBM[k] = dbm; SEC[k] = s }
+}
+function q2dbm(v) { if (v > 0) return int(v / 2) - 100; return int(v - 0.5) }
+function reset() { ssid = ""; sig = -100; psk1 = psk2 = eap = sae = priv = ibss = haswpa = 0; sect = ""; have = 0 }
+function flush() { if (have) addnet(ssid, sig, sec()) }
+function tokens(fl,   n, p, i, t) {
+	n = split(fl, p, "]")
+	for (i = 1; i <= n; i++) {
+		t = p[i]; sub(/^\[/, "", t)
+		if (t ~ /^(WPA2|RSN)-/) { haswpa = 1; if (t ~ /PSK/) psk2 = 1; if (t ~ /EAP/) eap = 1; if (t ~ /SAE/) sae = 1 }
+		else if (t ~ /^WPA-/) { haswpa = 1; if (t ~ /PSK/) psk1 = 1; if (t ~ /EAP/) eap = 1 }
+		else if (t == "WEP") priv = 1
+		else if (t == "IBSS") ibss = 1
+	}
+}
+BEGIN {
+	FS = "\t"; fmt = ENVIRON["FMT"]; reset()
+	while ((getline sl < ENVIRON["SAVEDF"]) > 0) { split(sl, sf, "\t"); SAVED[sf[1]] = 1 }
+	cn = dec(ENVIRON["CONN"]); conn = (cn > 0) ? enc(cn) : ""
+}
+fmt == "wpa" {
+	if ($1 !~ /^[0-9a-fA-F][0-9a-fA-F]:/) next
+	reset(); have = 1; ssid = $5; sig = q2dbm($3 + 0); tokens($4); addnet(ssid, sig, sec()); next
+}
+fmt == "iw" {
+	if ($0 ~ /^BSS /) { flush(); reset(); have = 1; next }
+	t = $0; match(t, /^\t*/); depth = RLENGTH; t = substr(t, depth + 1)
+	if (depth == 1) {
+		key = t; sub(/:.*/, "", key)
+		sect = (key == "RSN" || key == "WPA") ? key : ""
+		if (sect != "") haswpa = 1
+		if (key == "SSID") ssid = (t ~ /^SSID: /) ? substr(t, 7) : ""
+		else if (key == "signal") { v = t; sub(/^signal:[ \t]*/, "", v); if (v ~ /\/100/) sig = int(int(v) / 2) - 100; else sig = int(v - 0.5) }
+		else if (key == "capability") { if (t ~ / Privacy/) priv = 1; if (t ~ / IBSS/) ibss = 1 }
+	}
+	if (sect != "" && t ~ /Authentication suites:/) {
+		v = t; sub(/.*Authentication suites:/, "", v)
+		if (v ~ /PSK/) { if (sect == "RSN") psk2 = 1; else psk1 = 1 }
+		if (v ~ /802\.1X|EAP/) eap = 1
+		if (v ~ /SAE/) sae = 1
+	}
+	next
+}
+END {
+	if (fmt == "iw") flush()
+	for (i = 1; i <= NK; i++) IDX[i] = ORDER[i]
+	for (i = 2; i <= NK; i++) { k = IDX[i]; for (j = i - 1; j >= 1 && DBM[IDX[j]] < DBM[k]; j--) IDX[j + 1] = IDX[j]; IDX[j + 1] = k }
+	for (i = 1; i <= NK; i++) { k = IDX[i]; printf "%s\t%d\t%s\t%d\t%d\n", k, DBM[k], SEC[k], (k in SAVED) ? 1 : 0, (k == conn && conn != "") ? 1 : 0 }
+}
+'
+
+result() { printf 'RESULT %s %s\n' "$1" "$2"; [ "$1" = ok ]; }
+
+reason_text() {
+	case "$1" in
+	wrongkey) echo "Wrong password (or very weak signal)" ;;
+	notfound) echo "Network not found (out of range?)" ;;
+	rejected) echo "The access point refused the connection" ;;
+	timeout) echo "Timed out" ;;
+	dhcp) echo "Connected, but no IP address (DHCP failed)" ;;
+	nostore) echo "Cannot save: WIFI.CFG storage is read-only or missing" ;;
+	busy) echo "WiFi is busy, try again" ;;
+	notsaved) echo "Network is not saved" ;;
+	badkey) echo "Invalid key for this security type" ;;
+	badssid) echo "Invalid network name" ;;
+	badtype) echo "Unknown security type" ;;
+	nodev) echo "No WiFi adapter found" ;;
+	nocfg) echo "No saved network" ;;
+	*) echo "Failed" ;;
+	esac
+}
+fail_res() { result "$1" "${2:-$(reason_text "$1")}"; }
+
+# ssid_arg TEXT: decode the safe form into ARGSSID (raw bytes).  1 = invalid (1..32 bytes, no control bytes).
+ssid_arg() {
+	_o=$(SSIDIN=$1 LC_ALL=C awk "$AWKLIB"'
+	BEGIN { n = dec(ENVIRON["SSIDIN"]); bad = (n == 0 || n > 32)
+		for (i = 1; i <= n; i++) if (BY[i] < 32 || BY[i] == 127) bad = 1
+		if (bad) printf "B"; else printf "G%sX", rawstr(n) }' </dev/null)
+	case "$_o" in G*X) ARGSSID=${_o#G}; ARGSSID=${ARGSSID%X}; return 0 ;; esac
+	ARGSSID=""; return 1
+}
+
+# do_list [CFGFILE]
+do_list() {
+	_lc=$1
+	[ -n "$_lc" ] || _lc=$(find_cfg) || return 0
+	[ -f "$_lc" ] || return 0
+	LC_ALL=C awk "$AWKLIB$LISTAWK" "$_lc"
+}
+
+# ---- WIFI.CFG storage
+
+store_mounted() { grep -q " $LOGMNT " /proc/mounts 2>/dev/null; }
+
+# cfg_target: where WIFI.CFG lives or would be created (empty + rc 1: no usable storage)
+cfg_target() {
+	if [ -n "$OLPC_WIFI_CFG" ]; then echo "$OLPC_WIFI_CFG"; return 0; fi
+	find_cfg && return 0
+	store_mounted && { echo "$LOGMNT/WIFI.CFG"; return 0; }
+	return 1
+}
+
+# cfg_xform MODE RAWSSID NEWLINE IN OUT
+#   put: drop entries of RAWSSID, insert NEWLINE before the first network line (comments stay on top)
+#   del: drop entries of RAWSSID (rc 2 when there was none)
+#   top: like put with the existing line of RAWSSID as NEWLINE (rc 2 when there is none)
+# Other lines are copied unchanged; the end-of-line style is CRLF when any line had CR.
+cfg_xform() {
+	_m=$1; _rs=$2; _new=$3; _in=$4; _out=$5
+	_eos=$CR
+	_eos="$_eos
+"
+	if [ -f "$_in" ] && ! grep -q "$CR" "$_in" 2>/dev/null; then _eos="
+"; fi
+	[ -f "$_in" ] || _eos="
+"
+	_found=0
+	if [ "$_m" = top ] || [ "$_m" = del ]; then
+		if [ -f "$_in" ]; then
+			while IFS= read -r _l || [ -n "$_l" ]; do
+				_b=${_l%"$CR"}
+				case "$_b" in ""|"#"*) continue ;; *[!" ""$TAB"]*) ;; *) continue ;; esac
+				if [ "${_b%%"$TAB"*}" = "$_rs" ]; then _found=1; [ "$_m" = top ] && { _new=$_b; break; }; fi
+			done <"$_in"
+		fi
+		[ "$_found" = 1 ] || return 2
+		[ "$_m" = del ] && _m=put_none
+	fi
+	_ins=0
+	{
+		if [ -f "$_in" ]; then
+			while IFS= read -r _l || [ -n "$_l" ]; do
+				_b=${_l%"$CR"}
+				case "$_b" in ""|"#"*) printf '%s%s' "$_b" "$_eos"; continue ;; *[!" ""$TAB"]*) ;; *) printf '%s%s' "$_b" "$_eos"; continue ;; esac
+				if [ "$_ins" = 0 ] && [ "$_m" != put_none ]; then printf '%s%s' "$_new" "$_eos"; _ins=1; fi
+				[ "${_b%%"$TAB"*}" = "$_rs" ] && continue
+				printf '%s%s' "$_b" "$_eos"
+			done <"$_in"
+		fi
+		if [ "$_ins" = 0 ] && [ "$_m" != put_none ]; then printf '%s%s' "$_new" "$_eos"; fi
+	} 2>/dev/null >"$_out"
+}
+
+# cfg_commit MODE RAWSSID NEWLINE: transform the real WIFI.CFG into a temp file next to it, flush, rename.
+# rc 0 ok, 2 entry not found (del/top), 4 storage unusable (nostore)
+cfg_commit() {
+	_ct=$(cfg_target) || return 4
+	_tmp=$_ct.tmp
+	cfg_xform "$1" "$2" "$3" "$_ct" "$_tmp"; _r=$?
+	if [ "$_r" = 2 ]; then rm -f "$_tmp"; return 2; fi
+	if [ "$_r" != 0 ]; then rm -f "$_tmp" 2>/dev/null; return 4; fi
+	sync -f "$_tmp" 2>/dev/null || sync
+	if ! mv "$_tmp" "$_ct" 2>/dev/null; then rm -f "$_tmp" 2>/dev/null; return 4; fi
+	sync -f "$_ct" 2>/dev/null || sync
+	return 0
+}
+
+# valid_key TYPE KEY
+valid_key() {
+	case "$1" in OPEN) [ -z "$2" ]; return ;; esac
+	[ -z "$(printf %s "$2" | tr -d ' -~')" ] || return 1       # printable ASCII only
+	_vl=${#2}
+	case "$1" in
+	WPA|WPA2) { [ "$_vl" -ge 8 ] && [ "$_vl" -le 63 ]; } || { [ "$_vl" -eq 64 ] && is_hex "$2"; } ;;
+	WEP) { [ "$_vl" -eq 5 ] || [ "$_vl" -eq 13 ]; } || { { [ "$_vl" -eq 10 ] || [ "$_vl" -eq 26 ]; } && is_hex "$2"; } ;;
+	*) return 1 ;;
+	esac
+}
+
+do_add() {
+	[ $# -ge 2 ] || { echo "usage: olpc-wifi add SSID TYPE   (key on stdin)" >&2; return 2; }
+	ssid_arg "$1" || { fail_res badssid; return 1; }
+	_ty=$(printf %s "$2" | tr 'a-z' 'A-Z')
+	case "$_ty" in WPA2|WPA|WEP|OPEN) ;; *) fail_res badtype; return 1 ;; esac
+	_key=""
+	if [ "$_ty" != OPEN ]; then IFS= read -r _key || [ -n "$_key" ]; fi
+	valid_key "$_ty" "$_key" || { fail_res badkey; _key=""; return 1; }
+	cfg_commit put "$ARGSSID" "$ARGSSID$TAB$_key$TAB$_ty"; _r=$?
+	_key=""
+	[ "$_r" = 0 ] || { fail_res nostore; return 1; }
+	wl "add: saved network '$ARGSSID' type=$_ty"
+	result ok "Saved"
+}
+
+do_forget() {
+	[ $# -ge 1 ] || { echo "usage: olpc-wifi forget SSID" >&2; return 2; }
+	ssid_arg "$1" || { fail_res badssid; return 1; }
+	cfg_commit del "$ARGSSID" ""; _r=$?
+	case $_r in
+	0) wl "forget: removed '$ARGSSID'"; result ok "Forgotten" ;;
+	2) fail_res notsaved; return 1 ;;
+	*) fail_res nostore; return 1 ;;
+	esac
+}
+
+# ---- autoconnect flag
+
+find_auto() {
+	[ -n "$OLPC_WIFI_AUTOCFG" ] && { echo "$OLPC_WIFI_AUTOCFG"; return 0; }
+	_ac=$(find_cfg) && _ad=$(dirname "$_ac") || _ad=$LOGMNT
+	for _f in "$_ad"/*; do
+		[ -f "$_f" ] || continue
+		[ "$(basename "$_f" | tr 'A-Z' 'a-z')" = wifiauto.cfg ] && { echo "$_f"; return 0; }
+	done
+	echo "$_ad/WIFIAUTO.CFG"
+}
+
+autoconnect_state() {
+	_af=$(find_auto); _av=""
+	[ -f "$_af" ] && read -r _av <"$_af"
+	_av=$(printf %s "$_av" | tr -d ' \t\r' | tr 'A-Z' 'a-z')
+	[ "$_av" = off ] && echo off || echo on
+}
+
+do_autoconnect() {
+	case "$1" in
+	status) autoconnect_state ;;
+	on|off)
+		_af=$(find_auto)
+		if { [ -n "$OLPC_WIFI_AUTOCFG" ] || cfg_target >/dev/null; } && printf '%s\n' "$1" >"$_af.tmp" 2>/dev/null; then
+			sync -f "$_af.tmp" 2>/dev/null || sync
+			if mv "$_af.tmp" "$_af" 2>/dev/null; then result ok "Connect at start: $1"; return; fi
+		fi
+		rm -f "$_af.tmp" 2>/dev/null
+		fail_res nostore; return 1 ;;
+	*) echo "usage: olpc-wifi autoconnect on|off|status" >&2; return 2 ;;
+	esac
+}
+
+# ---- scan
+
+wpa_running() { [ -n "$(wstat wpa_state)" ]; }
+
+# scan_wpa RAW: ask the running supplicant (real or temporary) to scan and save the table
+scan_wpa() {
+	wcli scan >/dev/null 2>&1
+	olpc_sleep "$SCANWAIT"
+	_cs; _e=$((CS + 400))
+	while [ "$(wstat wpa_state)" = SCANNING ]; do
+		_cs; [ "$CS" -ge "$_e" ] && break
+		olpc_sleep 1
+	done
+	wcli scan_results >"$1"
+	head -n1 "$1" | grep -qi '^bssid'
+}
+
+# scan_tmpwpa RAW: temporary supplicant without networks (used when iw cannot scan)
+scan_tmpwpa() {
+	for _drv in nl80211 wext; do
+		printf 'ctrl_interface=%s\nap_scan=1\n' "$CTRL" >"$WDIR/scan.conf"
+		wpa_supplicant -i "$IF" -c "$WDIR/scan.conf" -D "$_drv" >"$WDIR/scan.wpalog" 2>&1 &
+		_sp=$!
+		_cs; _e=$((CS + 500))
+		while [ -z "$(wstat wpa_state)" ]; do
+			_cs; [ "$CS" -ge "$_e" ] && break
+			kill -0 "$_sp" 2>/dev/null || break
+			olpc_sleep 1
+		done
+		_ok=1
+		[ -n "$(wstat wpa_state)" ] && scan_wpa "$1" && _ok=0
+		wcli terminate >/dev/null 2>&1
+		kill "$_sp" 2>/dev/null; wait "$_sp" 2>/dev/null
+		rm -f "$WDIR/scan.conf"
+		[ "$_ok" = 0 ] && { SCANFMT=wpa; return 0; }
+	done
+	return 1
+}
+
+# scan_down RAW: WiFi is off.  iw first (one shot, no daemon, no state to clean up); a supplicant
+# only as the fallback (wext-only drivers, or when nl80211 refuses).
+scan_down() {
+	_wasup=0
+	ip link show "$IF" 2>/dev/null | grep -q '[<,]UP[,>]' && _wasup=1
+	bounded 5 rfkill unblock wifi >/dev/null 2>&1
+	if [ ! -d "/sys/class/net/$IF" ]; then
+		bounded 20 modprobe usb8xxx >>"$BOOTDIR/wifi.log" 2>&1 || bounded 20 modprobe libertas_usb >>"$BOOTDIR/wifi.log" 2>&1
+		_cs; _e=$((CS + 1500))
+		while [ ! -d "/sys/class/net/$IF" ]; do
+			_cs; [ "$CS" -ge "$_e" ] && break
+			olpc_sleep 1
+		done
+	fi
+	if [ ! -d "/sys/class/net/$IF" ]; then SCANWHY=nodev; return 1; fi
+	ip link set "$IF" up >>"$BOOTDIR/wifi.log" 2>&1
+	_got=1
+	for _t in 1 2 3; do
+		bounded 20 iw dev "$IF" scan >"$1" 2>"$WDIR/iw.err"
+		_rc=$?
+		if [ "$_rc" = 0 ]; then SCANFMT=iw; _got=0; break; fi
+		grep -qi 'busy\|-16' "$WDIR/iw.err" || break
+		olpc_sleep 2
+	done
+	if [ "$_got" != 0 ]; then
+		wl "iw scan failed ($(head -n1 "$WDIR/iw.err" 2>/dev/null)), trying a temporary wpa_supplicant"
+		scan_tmpwpa "$1" && _got=0
+	fi
+	[ "$_wasup" = 1 ] || ip link set "$IF" down >/dev/null 2>&1
+	[ "$_got" = 0 ] || SCANWHY=failed
+	return "$_got"
+}
+
+do_scan() {
+	mkdir -p "$LOCKBASE" "$WDIR" 2>/dev/null
+	if ! lock_wait 10 scan; then result busy "$(reason_text busy)" >&2; return 3; fi
+	_raw=$WDIR/scan.raw; SCANFMT=wpa; SCANWHY=failed
+	do_list >"$WDIR/scan.saved" 2>/dev/null
+	if wpa_running; then
+		scan_wpa "$_raw"; _okscan=$?
+	else
+		scan_down "$_raw"; _okscan=$?
+	fi
+	if [ "$_okscan" != 0 ]; then
+		rm -f "$_raw"; lock_release
+		result "$SCANWHY" "$(reason_text "$SCANWHY")" >&2
+		return 1
+	fi
+	_conn=""
+	[ "$(wstat wpa_state)" = COMPLETED ] && _conn=$(wstat ssid)
+	SAVEDF=$WDIR/scan.saved CONN=$_conn FMT=$SCANFMT LC_ALL=C awk "$AWKLIB$SCANAWK" "$_raw" >"$SCANFILE.tmp"
+	chmod 644 "$SCANFILE.tmp" 2>/dev/null
+	mv "$SCANFILE.tmp" "$SCANFILE"
+	cat "$SCANFILE"
+	rm -f "$_raw" "$WDIR/scan.saved"
+	lock_release
+	return 0
+}
+
+# ---- link monitor
+
+start_watch() {
+	if [ -r "$WCLIPID" ] && kill -0 "$(cat "$WCLIPID" 2>/dev/null)" 2>/dev/null; then return 0; fi
+	wpa_cli -p "$CTRL" -i "$IF" -B -P "$WCLIPID" -a "$SELF" >/dev/null 2>&1
+}
+
+lock_busy() {
+	[ -d "$LOCK" ] || return 1
+	_lh=$(cat "$LOCK/pid" 2>/dev/null)
+	[ -z "$_lh" ] || kill -0 "$_lh" 2>/dev/null
+}
+
+# do_event IF EVENT: called by wpa_cli -a
+do_event() {
+	case "$2" in
+	DISCONNECTED)
+		lock_busy && return 0
+		wpa_running || return 0
+		wstatus connecting
+		wl "link: disconnected"
+		;;
+	CONNECTED)
+		lock_try || return 0
+		trap lock_release EXIT
+		_es=$(wstat ssid)
+		bounded 15 udhcpc -i "$IF" -n -q -t 3 -T 3 >>"$BOOTDIR/wifi.log" 2>&1
+		_ei=$(if_ip)
+		if [ -n "$_ei" ]; then wstatus connected "$_es" "$_ei"; wl "link: reconnected ssid='$_es' ip=$_ei"
+		else wstatus connecting; wl "link: reconnected but no IP"
+		fi
+		lock_release
+		;;
+	esac
+	return 0
+}
+
+# ---- connect
+
+# connect_live ESCSSID: supplicant already running: reload the config, select the network
+connect_live() {
+	wstatus connecting
+	_off=$(wc -l <"$WPALOG" 2>/dev/null); _off=$((${_off:-0} + 0))
+	wcli reconfigure >/dev/null 2>&1
+	olpc_sleep 1
+	wcli select_network 0 >/dev/null 2>&1
+	_cs; _e=$((CS + 3000)); _okc=1; UPREASON=timeout
+	while :; do
+		olpc_sleep 1
+		[ "$(wstat wpa_state)" = COMPLETED ] && { _okc=0; break; }
+		tail -n +$((_off + 1)) "$WPALOG" 2>/dev/null >"$WDIR/wpa.delta"
+		if grep -q 'pre-shared key may be incorrect\|WRONG_KEY' "$WDIR/wpa.delta"; then UPREASON=wrongkey; break; fi
+		wpa_running || { UPREASON=failed; break; }
+		_cs; if [ "$CS" -ge "$_e" ]; then UPREASON=$(why_code "$WDIR/wpa.delta"); break; fi
+	done
+	rm -f "$WDIR/wpa.delta"
+	[ "$_okc" = 0 ] || return 1
+	_ssid=$(wstat ssid)
+	step "connect: associated ssid='$_ssid' $(link_info)"
+	ip addr flush dev "$IF" >/dev/null 2>&1
+	bounded 30 udhcpc -i "$IF" -n -q -t 4 -T 3 >>"$BOOTDIR/wifi.log" 2>&1
+	_ip=$(if_ip)
+	if [ -z "$_ip" ]; then UPREASON=dhcp; step "FAIL: connect: DHCP gave no address"; return 1; fi
+	wcli enable_network all >/dev/null 2>&1
+	echo "$_ssid" >"$WDIR/connected"
+	wstatus connected "$_ssid" "$_ip"
+	UPREASON=""
+	start_watch
+	return 0
+}
+
+do_connect() {
+	[ $# -ge 1 ] || { echo "usage: olpc-wifi connect SSID" >&2; return 2; }
+	ssid_arg "$1" || { fail_res badssid; return 1; }
+	_cfg=$(find_cfg) || { fail_res notsaved; return 1; }
+	mkdir -p "$WDIR" 2>/dev/null
+	cfg_xform top "$ARGSSID" "" "$_cfg" "$WDIR/cfg.cur"; _r=$?
+	if [ "$_r" != 0 ]; then rm -f "$WDIR/cfg.cur"; fail_res notsaved; return 1; fi
+	if ! lock_wait 60 connect; then rm -f "$WDIR/cfg.cur"; fail_res busy; return 1; fi
+	cfg_commit top "$ARGSSID" "" || wl "connect: could not save the new priority (storage read-only?)"
+	genconf "$WDIR/cfg.cur" "$CONF.new"
+	_h=$(printf %s "$ARGSSID" | od -An -v -tx1 | tr -d ' \n')
+	_first=$(sed -n 's/^[ \t]*ssid=//p' "$CONF.new" | head -n1)
+	if [ "$NNET" -eq 0 ] || [ "$_first" != "$_h" ]; then
+		rm -f "$CONF.new" "$WDIR/cfg.cur"; lock_release
+		fail_res badkey; return 1
+	fi
+	mv "$CONF.new" "$CONF"
+	step "connect: '$ARGSSID'"
+	if wpa_running; then
+		connect_live; _r=$?
+	else
+		UPCFG=$WDIR/cfg.cur; do_up_real; _r=$?; UPCFG=""
+		[ "$_r" = 0 ] && UPREASON=""
+	fi
+	rm -f "$WDIR/cfg.cur"
+	if [ "$_r" != 0 ]; then
+		_why=${UPREASON:-failed}
+		do_down_real
+		echo "connect $$ 1 $_why" >"$RESULT"
+		lock_release
+		fail_res "$_why"; return 1
+	fi
+	echo "connect $$ 0" >"$RESULT"
+	lock_release
+	result ok "Connected"
+}
+
+# ---- boot hook
+
+do_autostart() {
+	if cmdline_has olpcboy.nowifi; then tl "wifi: autostart skipped (olpcboy.nowifi)"; return 0; fi
+	if [ -e "$AUTOMARK" ]; then return 0; fi
+	if ! find_cfg >/dev/null; then tl "wifi: autostart skipped (no WIFI.CFG)"; return 0; fi
+	if [ "$(autoconnect_state)" != on ]; then tl "wifi: autostart skipped (connect at start is off)"; return 0; fi
+	if [ -z "$(do_list)" ]; then tl "wifi: autostart skipped (no saved network)"; return 0; fi
+	mkdir -p "$LOCKBASE" 2>/dev/null
+	: >"$AUTOMARK"
+	tl "wifi: autostart"
+	do_up
+}
+
+# up / down with a RESULT line
+cmd_up() {
+	UPREASON=""
+	do_up; _r=$?
+	if [ "$_r" = 0 ]; then result ok "Connected"; else fail_res "${UPREASON:-failed}"; return 1; fi
+}
+cmd_down() { do_down; result ok "WiFi off"; }
+
 [ -n "$OLPC_WIFI_TEST" ] && return 0 2>/dev/null
 
 case "$1" in
-up)     do_up ;;
-check)  do_check ;;
-run)    do_run ;;
-status) do_status ;;
-down)   do_down ;;
-*)      echo "usage: olpc-wifi up|down|status|check|run" >&2; exit 2 ;;
+up)         cmd_up ;;
+check)      do_check ;;
+run)        do_run ;;
+status)     do_status ;;
+down)       cmd_down ;;
+scan)       do_scan ;;
+list)       do_list ;;
+add)        shift; do_add "$@" ;;
+forget)     shift; do_forget "$@" ;;
+connect)    shift; do_connect "$@" ;;
+autoconnect) shift; do_autoconnect "$@" ;;
+autostart)  do_autostart ;;
+event)      do_event "$2" "$3" ;;
+"$IF")      do_event "$1" "$2" ;;
+*)          echo "usage: olpc-wifi up|down|status|check|run|scan|list|add|forget|connect|autoconnect|autostart" >&2; exit 2 ;;
 esac

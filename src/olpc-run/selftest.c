@@ -790,6 +790,47 @@ static void overlay_tests(void)
 	for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
 	CHECK(o.st.vol == 1 && o.st.bri == 15, "status file back: re-opened");
 	CHECK(o.redraw_ns_max > 0 && o.redraw_ns >= o.redraw_ns_max, "redraw time is accounted");
+
+	/* battery slot: only it repaints, only when level / AC / charging change, nothing outside it */
+	{
+		const char *base = "vol=1 volmax=31 mute=0 bri=15 brimax=15 mono=0";
+		char ln[160];
+		static const struct { const char *tail; int redraw; const char *what; } steps[] = {
+			{ " bat=50 ac=0 chg=0\n", 1, "battery appears" },
+			{ " bat=50 ac=0 chg=0\n", 0, "same values rewritten: nothing" },
+			{ " bat=49 ac=0 chg=0\n", 1, "level changes" },
+			{ " bat=49 ac=1 chg=0\n", 1, "adapter plugged" },
+			{ " bat=49 ac=1 chg=1\n", 0, "charging starts on AC: same icon, nothing to redraw" },
+			{ " bat=49 ac=0 chg=1\n", 0, "adapter reported off while charging: same icon" },
+			{ " bat=15 ac=0 chg=0\n", 1, "low" },
+			{ " bat=5 ac=0 chg=0\n", 1, "critical" },
+			{ " bat=-1 ac=-1 chg=0\n", 1, "battery gone: slot cleared" },
+			{ "\n", 0, "old-format line: still unknown, nothing to redraw" },
+		};
+		size_t k;
+		int rx = 1092, ry = OVL_Y + 336;
+
+		ovl_init(&o);
+		o.status_path = pst; o.wifi_path = pwf; o.wireless_path = "/nonexistent"; o.period = 5; o.fake_base = 1717268830; o.fake_t0 = 0;
+		put_file(pst, "vol=1 volmax=31 mute=0 bri=15 brimax=15 mono=0\n");
+		for (i = 0; i < 1200 * 900; i++) fb[i] = ref[i] = 0x1234;
+		CHECK(ovl_place(&o, 1200, 900, 120, 18, 960, 864, (uint8_t *)fb, 2400, &t16) == 1, "place for the battery checks");
+		for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+		for (k = 0; k < sizeof steps / sizeof steps[0]; k++) {
+			memcpy(ref, fb, sizeof fb);
+			before = (long)o.redraws;
+			snprintf(ln, sizeof ln, "%s%s", base, steps[k].tail);
+			put_file(pst, ln);
+			for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+			CHECK((long)o.redraws == before + steps[k].redraw, "battery: %s: %ld slot(s) redrawn", steps[k].what, (long)o.redraws - before);
+			CHECK(count_changed(fb, ref, rx, ry, OVL_W, 64, 0) == 0, "battery: %s: nothing outside the slot changed", steps[k].what);
+			if (steps[k].redraw) CHECK(count_changed(fb, ref, rx, ry, OVL_W, 64, 1) > 0, "battery: %s: slot pixels changed", steps[k].what);
+		}
+		/* unknown battery: the slot is blank (all background) */
+		for (i = 0; i < 64; i++) { int j; for (j = 0; j < OVL_W; j++) if (fb[(ry + i) * 1200 + rx + j] != 0) break; if (j < OVL_W) break; }
+		CHECK(i == 64, "battery unknown: slot is blank");
+		ovl_close(&o);
+	}
 	ovl_close(&o);
 
 	/* the same into a 32-bit framebuffer */

@@ -108,3 +108,35 @@ void ind_bri(const struct gfx *g, int x, int y, const struct ind_pal *p, int pct
 	for (i = 0; i < 8; i++) gfx_fill(g, cx + ray[i][0] - 2, cy + ray[i][1] - 2, 4, 4, col);
 	ind_num(g, x, y, IND_W_BRI, pct, col);
 }
+
+void ind_bat(const struct gfx *g, int x, int y, const struct ind_pal *p, int pct, int ac, int chg)
+{
+	/* lightning bolt: per 2-pixel row, left edge and width in half-units of 2 px */
+	static const int bolt[9][2] = { { 6, 4 }, { 5, 4 }, { 4, 4 }, { 3, 4 }, { 2, 8 }, { 6, 4 }, { 5, 4 }, { 4, 4 }, { 3, 4 } };
+	int lvl = bat_level(pct), bx = x, by = y + IND_SLOT_H / 2 - 14, bw = 36, bh = 28, n, t, i;
+	uint16_t col = lvl == BAT_LOW || lvl == BAT_CRIT ? p->strike : p->on;
+	char b[16];
+
+	gfx_fill(g, x, y, IND_W_BAT, IND_SLOT_H, p->bg);
+	if (lvl == BAT_NONE) return;
+	t = lvl == BAT_CRIT ? 4 : 3;                                      /* outline thickness: heavier when critical */
+	gfx_fill(g, bx, by, bw, t, col); gfx_fill(g, bx, by + bh - t, bw, t, col);
+	gfx_fill(g, bx, by, t, bh, col); gfx_fill(g, bx + bw - t, by, t, bh, col);
+	gfx_fill(g, bx + bw, by + 8, 4, bh - 16, col);                    /* terminal nub */
+	n = (bw - 2 * t - 4) * pct / 100;                                 /* fill, 2 px inside the outline */
+	if (pct > 0 && n < 2) n = 2;
+	if (lvl == BAT_CRIT) n = 0;                                       /* hollow body */
+	if (lvl == BAT_LOW) gfx_fill(g, bx + t + 2, by + t + 5, n, bh - 2 * t - 10, col);   /* thinner bar */
+	else gfx_fill(g, bx + t + 2, by + t + 2, n, bh - 2 * t - 4, col);
+	if (ac == 1 || chg == 1) {                                        /* bolt on a background halo, readable over the fill */
+		int cx = bx + bw / 2 - 5, cy = by + (bh - 18) / 2;
+
+		for (i = 0; i < 9; i++) gfx_fill(g, cx + bolt[i][0] - 2, cy + i * 2 - 1, bolt[i][1] + 4, 4, p->bg);
+		for (i = 0; i < 9; i++) gfx_fill(g, cx + bolt[i][0], cy + i * 2, bolt[i][1], 2, p->on);
+	} else if (lvl == BAT_LOW || lvl == BAT_CRIT) {                   /* exclamation mark, right of centre so the bar stays visible */
+		gfx_fill(g, bx + bw / 2 + 4, by + 6, 4, 10, col);
+		gfx_fill(g, bx + bw / 2 + 4, by + 19, 4, 4, col);
+	}
+	snprintf(b, sizeof b, "%3d", pct);
+	gfx_text(g, x + IND_W_BAT - 48, y + IND_SLOT_H / 2 - 16, 2, col, (const unsigned char *)b);
+}

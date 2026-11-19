@@ -24,6 +24,7 @@ uint16_t gfx_blend(uint16_t a, uint16_t b, int t);   /* t/256 of b */
 #define IND_W_WIFI 44
 #define IND_W_VOL  88
 #define IND_W_BRI  92
+#define IND_W_BAT  96
 struct ind_pal {
 	uint16_t bg;
 	uint16_t on;        /* normal strokes and digits */
@@ -36,4 +37,10 @@ void ind_wifi(const struct gfx *g, int x, int y, const struct ind_pal *p, int st
 /* pct < 0 = unknown ("--") */
 void ind_vol(const struct gfx *g, int x, int y, const struct ind_pal *p, int pct, int mute);
 void ind_bri(const struct gfx *g, int x, int y, const struct ind_pal *p, int pct);
+/* Battery: outline with a nub, fill proportional to pct, the percentage on the right.  pct < 0 = no battery
+ * information: nothing is drawn but the cleared slot.  ac: adapter online (1), chg: charging (1) - either
+ * puts a bolt in the body.  Low (<= 15 %, bat_level) shows an exclamation mark and a thinner fill; critical
+ * (<= 5 %) an empty body with a heavy outline and the mark: shape and contrast, not colour, tell the
+ * states apart in DCON monochrome.  low/crit strokes use p->strike. */
+void ind_bat(const struct gfx *g, int x, int y, const struct ind_pal *p, int pct, int ac, int chg);
 #endif

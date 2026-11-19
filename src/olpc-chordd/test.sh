@@ -177,7 +177,9 @@ pnone() { grep -q '\[pad:' "$T/last.out" && { echo "  FAIL: pad acted"; fail=1; 
 prun "pad SELECT+L1 held 1 s: volume up, press + 5 repeats = 26, named in the log" "26 1 26 1 23 1 5" \
 	"0 SELECT 1" "100 L1 1" "1100 L1 0" "1110 SELECT 0"
 pexp 'volume Master 20 -> 21 (max 31), read back 21 \[pad: Test Pad\]'
-prun "pad SELECT+L2 (key) held 1 s: volume down 20 -> 14" "14 1 14 1 23 1 5" \
+# L2/R2 wait COMBO_GRACE_MS (150 ms) for their partner, so a held lone trigger steps at
+# press+150 and repeats 300 ms after that: 5 steps in the 1 s window (L1/R1: 6).
+prun "pad SELECT+L2 (key) held 1 s: first step at 250 ms, then 4 repeats: volume 20 -> 15" "15 1 15 1 23 1 5" \
 	"0 SELECT 1" "100 L2 1" "1100 L2 0" "1110 SELECT 0"
 PF="28 1 28 1 23 1" prun "pad volume up clamps at max 31" "31 1 31 1 23 1 5" \
 	"0 SELECT 1" "100 L1 1" "1100 L1 0"
@@ -194,7 +196,7 @@ prun "pad first repeat only after 300 ms (tap 250 ms = one step)" "20 1 20 1 23 
 	"0 SELECT 1" "100 R1 1" "350 R1 0" "900 UP 0"
 
 # analog-only triggers (xpad style: no key event), range 0..255: on > 85, off < 51
-prun "analog L2 (ABS_Z only) swept up and held 1 s: volume down 20 -> 14" "14 1 14 1 23 1 5" \
+prun "analog L2 (ABS_Z only) swept up and held 1 s: volume down 20 -> 15 (grace window)" "15 1 15 1 23 1 5" \
 	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 0" "105 ABS_Z 40" "110 ABS_Z 120" "115 ABS_Z 255" \
 	"600 ABS_Z 250" "1100 ABS_Z 255" "1105 ABS_Z 0" "1110 SELECT 0"
 prun "analog R1-side: ABS_RZ drives brightness down 5 -> 0" "20 1 20 1 23 1 0" \
@@ -236,13 +238,101 @@ prun "SELECT+START then L1 and R1 taps: both act" "21 1 21 1 23 1 6" \
 	"0 SELECT 1" "10 START 1" "100 L1 1" "150 L1 0" "200 R1 1" "250 R1 0" "300 START 0"
 prun "both groups held (L1 then R1): the second does nothing and the repeat stops" "21 1 21 1 23 1 5" \
 	"0 SELECT 1" "10 L1 1" "20 R1 1" "1000 R1 0" "1010 L1 0"
-prun "both groups held (R2 then L2): nothing for L2, repeat stops" "20 1 20 1 23 1 4" \
-	"0 SELECT 1" "10 R2 1" "20 L2 1" "1000 L2 0" "1010 R2 0"
+prun "both groups held (R2 then L1): the pending R2 is cancelled, nothing acts" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "10 R2 1" "20 L1 1" "1000 L1 0" "1010 R2 0"
+pnone
 prun "pad unplugged mid-chord: repeat stops (one press + one repeat = 22)" "22 1 22 1 23 1 5" \
 	"0 SELECT 1" "100 L1 1" "500 UNPLUG 1" "2000 UP 0"
 pexp 'pad gone'
 prun "events after unplug are harmless" "20 1 20 1 23 1 5" \
 	"0 UNPLUG 1" "100 SELECT 1" "110 L1 1" "2000 L1 0"
+
+# ---- SELECT + L2 + R2: toggle mono (grace window COMBO_GRACE_MS = 150 ms) ----------------
+# pmono <expected mono file> ; pcnt <regex> <expected count of log lines>
+pmono() { m=$(cat "$T/case/mono"); [ "$m" = "$1" ] && echo "  ok: mono=$m" || { echo "  FAIL: mono=$m, expected $1"; fail=1; }; }
+pcnt() { n=$(grep -c -- "$1" "$T/last.out"); [ "$n" = "$2" ] && echo "  ok: $n x $1" || { echo "  FAIL: $n x $1, expected $2"; fail=1; }; }
+S="vol=20 volmax=31 mute=0 bri=05 brimax=15 mono"
+prun "combo L2 then R2 80 ms apart: one toggle, no step" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "180 R2 1" "1500 R2 0" "1510 L2 0"
+pmono 1; pcnt 'mono mode, read back 1 \[pad: Test Pad\]' 1; pcnt 'volume\|brightness' 0; sx "$S=1"
+prun "combo R2 then L2 100 ms apart: one toggle, no step" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 R2 1" "200 L2 1" "1500 L2 0" "1510 R2 0"
+pmono 1; pcnt 'mono mode' 1
+prun "combo on the window edge (149 ms) toggles, no step" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "249 R2 1" "800 R2 0" "810 L2 0"
+pmono 1
+prun "second toggle needs both triggers released: R2 re-press with L2 held does nothing, full release re-arms" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "120 R2 1" "200 R2 0" "250 R2 1" "300 R2 0" "400 L2 0" "500 L2 1" "520 R2 1" "700 R2 0" "710 L2 0"
+pmono 0; pcnt 'mono mode, read back 1' 1; pcnt 'color mode, read back 0' 1
+prun "after a toggle: R2 released while L2 stays held 2 s: no volume steps" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "120 R2 1" "200 R2 0" "2200 L2 0"
+pmono 1; pcnt 'volume' 0
+prun "after a toggle: L2 released while R2 stays held 2 s: no brightness steps" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 R2 1" "120 L2 1" "200 L2 0" "2200 R2 0"
+pmono 1; pcnt 'brightness' 0
+prun "triggers 400 ms apart: L2 steps once (at 250), R2 stops the repeat and toggles" "19 1 19 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "500 R2 1" "2500 R2 0" "2510 L2 0"
+pmono 1; pcnt 'volume Master' 1; pcnt 'mono mode' 1
+prun "R2 first, L2 400 ms later: one brightness step then toggle" "20 1 20 1 23 1 4" \
+	"0 SELECT 1" "100 R2 1" "500 L2 1" "2500 L2 0" "2510 R2 0"
+pmono 1; pcnt 'brightness' 1
+prun "second trigger 10 ms after the window (160 ms): one stray step, then toggle, no second step" "19 1 19 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "260 R2 1" "1500 R2 0" "1510 L2 0"
+pmono 1; pcnt 'volume Master' 1
+prun "single L2 held 1 s: nothing before 250 ms, then press + repeats at 550/700/850/1000 = 5 steps" "15 1 15 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "249 UP 0" "1100 L2 0"
+pcnt 'volume Master' 5; pmono 0
+prun "single R2 held 1 s: 5 brightness steps" "20 1 20 1 23 1 0" \
+	"0 SELECT 1" "100 R2 1" "1100 R2 0"
+pcnt 'brightness' 5
+prun "L2 tap of 140 ms (shorter than the window): exactly one step, on release" "19 1 19 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "240 L2 0" "1500 UP 0"
+pcnt 'volume Master' 1; pmono 0
+prun "R2 tap of 30 ms: exactly one brightness step" "20 1 20 1 23 1 4" \
+	"0 SELECT 1" "100 R2 1" "130 R2 0" "1500 UP 0"
+pcnt 'brightness' 1
+prun "L2 tap with SELECT released first inside the window: no step" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "120 SELECT 0" "130 L2 0" "1500 UP 0"
+pnone
+prun "L2 held, SELECT released inside the window: nothing, even after the window" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "120 SELECT 0" "1500 L2 0"
+pnone
+prun "trigger held before SELECT, the other pressed after: not a chord, nothing" "20 1 20 1 23 1 5" \
+	"0 L2 1" "50 SELECT 1" "100 R2 1" "1000 R2 0" "1010 L2 0"
+pnone; pmono 0
+prun "L1 stays immediate, then R2 joins: both groups, nothing more, no toggle" "21 1 21 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "120 R2 1" "1500 R2 0" "1510 L1 0"
+pmono 0; pcnt 'volume Master' 1
+prun "L1+R1 together stays nothing" "21 1 21 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "110 R1 1" "1500 R1 0" "1510 L1 0"
+pmono 0
+prun "SELECT+START ignored, then the combo still works" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "10 START 1" "100 L2 1" "130 R2 1" "500 R2 0" "510 L2 0" "520 START 0"
+pmono 1
+prun "combo does not touch the chord flag and a second combo after full release toggles back" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "110 R2 1" "200 L2 0" "210 R2 0" "300 L2 1" "310 R2 1" "400 L2 0" "410 R2 0"
+pmono 0; pcnt 'mono mode' 1; pcnt 'color mode' 1
+PF="20 1 20 1 23 1" prun "analog-only triggers with a noisy axis: one toggle, no steps" "20 1 20 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 255" "130 ABS_RZ 120" "135 ABS_RZ 80" "140 ABS_RZ 200" "145 ABS_Z 60" \
+	"150 ABS_Z 90" "155 ABS_Z 52" "160 ABS_Z 100" "600 ABS_Z 0" "610 ABS_RZ 0"
+pmono 1; pcnt 'mono mode' 1; pcnt 'volume' 0; pcnt 'brightness' 0
+prun "pad reporting key AND axis for both triggers: one toggle" "20 1 20 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 L2 1" "101 ABS_Z 255" "120 R2 1" "121 ABS_RZ 255" "500 ABS_Z 0" "501 L2 0" "510 R2 0" "511 ABS_RZ 0"
+pmono 1; pcnt 'mono mode' 1; pcnt 'volume\|brightness' 0
+prun "pad without R2 (NOR2): L2 acts at once, no latency" "19 1 19 1 23 1 5" \
+	"NOR2" "0 SELECT 1" "100 L2 1" "110 L2 0"
+pcnt 'volume Master' 1
+prun "pad without R2 held 1 s: immediate press + 5 repeats = 6 steps" "14 1 14 1 23 1 5" \
+	"NOR2" "0 SELECT 1" "100 L2 1" "1100 L2 0"
+prun "pad without R2: R2 events cannot toggle (L2 stepped at once, then both groups: nothing)" "19 1 19 1 23 1 5" \
+	"NOR2" "0 SELECT 1" "100 L2 1" "105 R2 1" "1500 R2 0" "1510 L2 0"
+pmono 0
+fake 20 1 20 1 23 1
+echo "=== mono toggle with the DCON node missing: logged, no crash"
+printf '%s\n' "0 SELECT 1" "100 L2 1" "120 R2 1" "500 R2 0" "510 L2 0" "600 L2 1" "620 R2 1" \
+	| CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$T/none/*" CHORDD_MONO="$T/none/mono" CHORDD_STATE="$T/st7" "$T/chordd" --test >"$T/nm.out" 2>&1; rc=$?
+n=$(grep -c 'mono toggle: .*No such file' "$T/nm.out")
+[ $rc -eq 0 ] && [ "$n" = 2 ] && echo "  ok: rc=0, logged $n times" || { echo "  FAIL: rc=$rc n=$n"; fail=1; }
 
 # a pad repeat must survive built-in key traffic, and built-in chords still raise the flag
 fake 20 1 20 1 23 1
@@ -286,6 +376,16 @@ v=$(sed -n 's/^Master Playback Volume=0 31 2 \([0-9]*\) .*/\1/p' "$T/mixer")
 echo "  -> Master volume=$v (expect 19)"
 [ "$v" = 19 ] || { echo "  FAIL: binary pad replay"; fail=1; }
 
+echo "=== binary replay: pad SELECT + L2 + R2 (EV_ABS) toggles mono once, no steps"
+fake 20 1 20 1 23 1
+d="$T/bin"; echo 0 >"$d/mono"
+{ evt 1 0 1 314 1; evt 1 100000 3 2 255; evt 1 180000 3 5 255; evt 1 600000 3 2 0; evt 1 610000 3 5 0; } >"$d/rawcombo"
+CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$T/none/*" CHORDD_MONO="$d/mono" CHORDD_STATE="$d/state" "$T/chordd" --replay <"$d/rawcombo" 2>&1 \
+	| grep -v '^\[' | sed 's/^olpc-chordd: /  /'
+v=$(sed -n 's/^Master Playback Volume=0 31 2 \([0-9]*\) .*/\1/p' "$T/mixer")
+echo "  -> mono=$(cat "$d/mono") Master volume=$v (expect 1, 20)"
+{ [ "$(cat "$d/mono")" = 1 ] && [ "$v" = 20 ]; } || { echo "  FAIL: binary combo replay"; fail=1; }
+
 # ---- status file: written at init and after every change chordd makes ---------------------------
 # sx <expected content>: the status file of the last vrun/prun must be exactly that one line
 sx() {
@@ -294,50 +394,50 @@ sx() {
 }
 fake 20 1 20 1 23 1
 vrun "status at init (no events)" "20 1 20 1 23 1 5" "0 ROTATE 0"
-sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 20 1 20 1 23 1
 vrun "status after one volume-up step" "21 1 21 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 UP 1" "130 UP 0" "140 CROSS 0" "145 SQUARE 0"
-sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 20 1 20 1 23 1
 vrun "status after volume up held 1 s (final value, not the first step)" "26 1 26 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 UP 1" "1100 UP 0" "1110 CROSS 0" "1115 SQUARE 0"
-sx "vol=26 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=26 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 3 1 3 1 23 1
 vrun "status after volume down to the floor" "0 1 0 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 DOWN 1" "1100 DOWN 0"
-sx "vol=00 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=00 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 20 1 20 1 23 1
 vrun "status after mute" "20 0 20 0 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 LEFT 1" "150 LEFT 0"
-sx "vol=20 volmax=31 mute=1 bri=05 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=1 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 20 0 20 0 23 1
 vrun "status after unmute" "20 1 20 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 RIGHT 1" "150 RIGHT 0"
-sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 fake 20 1 20 1 23 1
 vrun "status after brightness up (chord)" "20 1 20 1 23 1 6" "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "130 UP 0"
-sx "vol=20 volmax=31 mute=0 bri=06 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=0 bri=06 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 vrun "status after brightness up held 1 s" "20 1 20 1 23 1 11" "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "1100 UP 0"
-sx "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 vrun "status after mono (chord LEFT)" "20 1 20 1 23 1 5" "0 CIRCLE 1" "5 CHECK 1" "100 LEFT 1" "150 LEFT 0"
-sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=1"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=1 bat=-1 ac=-1 chg=0"
 vrun "status after colour (mono set first, chord RIGHT)" "20 1 20 1 23 1 5" "0 CIRCLE 1" "5 CHECK 1" "100 LEFT 1" "150 LEFT 0" "200 RIGHT 1" "250 RIGHT 0"
-sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 prun "status after pad SELECT+L1 (volume up)" "21 1 21 1 23 1 5" "0 SELECT 1" "100 L1 1" "130 L1 0" "140 SELECT 0"
-sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0"
-prun "status after pad SELECT+R2 (brightness down)" "20 1 20 1 23 1 4" "0 SELECT 1" "100 R2 1" "130 R2 0" "140 SELECT 0"
-sx "vol=20 volmax=31 mute=0 bri=04 brimax=15 mono=0"
+sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
+prun "status after pad SELECT+R2 tap (brightness down)" "20 1 20 1 23 1 4" "0 SELECT 1" "100 R2 1" "130 R2 0" "140 SELECT 0"
+sx "vol=20 volmax=31 mute=0 bri=04 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 PF="31 1 31 1 23 1" prun "status when already at the ceiling" "31 1 31 1 23 1 5" "0 SELECT 1" "100 L1 1" "130 L1 0" "140 SELECT 0"
-sx "vol=31 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+sx "vol=31 volmax=31 mute=0 bri=05 brimax=15 mono=0 bat=-1 ac=-1 chg=0"
 [ "$(grep -c 'status: ' "$T/last.out")" = 1 ] && echo "  ok: a press at the limit does not rewrite the status file" || { echo "  FAIL: status rewritten at a limit"; fail=1; }
 # no sound card, no backlight, no DCON: unknown fields are -1, the file still exists
 d="$T/nocard"; rm -rf "$d"; mkdir -p "$d"
 echo "=== status without card, backlight or DCON"
 printf '%s\n' "0 ROTATE 0" | CHORDD_FAKE_MIXER="$T/absent" CHORDD_BACKLIGHT_GLOB="$d/none/*" CHORDD_MONO="$d/none" CHORDD_STATE="$d/state" \
 	"$T/chordd" --test 2>/dev/null
-[ "$(cat "$d/status")" = "vol=-1 volmax=-1 mute=0 bri=-1 brimax=-1 mono=-1" ] && echo "  ok: $(cat "$d/status")" || { echo "  FAIL: nocard status: $(cat "$d/status")"; fail=1; }
+[ "$(cat "$d/status")" = "vol=-1 volmax=-1 mute=0 bri=-1 brimax=-1 mono=-1 bat=-1 ac=-1 chg=0" ] && echo "  ok: $(cat "$d/status")" || { echo "  FAIL: nocard status: $(cat "$d/status")"; fail=1; }
 # explicit CHORDD_STATUS path, and a status file written in place (same inode across rewrites)
 d="$T/explicit"; rm -rf "$d"; mkdir -p "$d/bl/dcon-bl"; echo 15 >"$d/bl/dcon-bl/max_brightness"; echo 5 >"$d/bl/dcon-bl/brightness"; echo 0 >"$d/mono"
 fake 20 1 20 1 23 1
 printf '%s\n' "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "1100 UP 0" | CHORDD_STATUS="$d/st.out" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$d/bl/*" \
 	CHORDD_MONO="$d/mono" CHORDD_STATE="$d/state" "$T/chordd" --test 2>/dev/null
-[ "$(cat "$d/st.out")" = "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0" ] && [ ! -e "$d/status" ] && echo "  ok: CHORDD_STATUS honoured" || { echo "  FAIL: CHORDD_STATUS"; fail=1; }
+[ "$(cat "$d/st.out")" = "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0 bat=-1 ac=-1 chg=0" ] && [ ! -e "$d/status" ] && echo "  ok: CHORDD_STATUS honoured" || { echo "  FAIL: CHORDD_STATUS"; fail=1; }
 # a reader with inotify would see every rewrite as a modify of the same file: check one write per change
 if command -v strace >/dev/null 2>&1; then
 	strace -f -e trace=pwrite64 -o "$T/strace.out" env CHORDD_STATUS="$d/st.out" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$d/bl/*" CHORDD_MONO="$d/mono" \
@@ -345,5 +445,85 @@ if command -v strace >/dev/null 2>&1; then
 	n=$(grep -c ', 53) *= 53\|pwrite64' "$T/strace.out" 2>/dev/null)
 	[ "${n:-0}" -ge 1 ] && echo "  ok: status written with pwrite64 ($n calls)" || echo "  (strace gave no pwrite64 lines)"
 fi
+
+# ---- battery / AC: found by type, read at start and every 60 s of (simulated) time ----------------
+# pw <capacity|-> <status> <ac|->: a fake power_supply class dir with nodes named like nothing real
+pw() {
+	d="$T/pw"; rm -rf "$d"; mkdir -p "$d/zzz-ac" "$d/aaa-batt" "$d/usb"
+	echo Mains >"$d/zzz-ac/type"; echo Battery >"$d/aaa-batt/type"; echo USB >"$d/usb/type"
+	[ "$1" = - ] || echo "$1" >"$d/aaa-batt/capacity"
+	echo "$2" >"$d/aaa-batt/status"
+	[ "$3" = - ] || echo "$3" >"$d/zzz-ac/online"
+	echo 1 >"$d/usb/online"
+}
+# prw <title> <expected status suffix> <input...>; the replay runs against $T/pw, full status in $T/pw.out
+prw() {
+	title=$1; exp=$2; shift 2
+	echo "=== $title"
+	rm -f "$T/pw.status"
+	printf '%s\n' "$@" | CHORDD_POWER_DIR="$T/pw" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$T/none/*" CHORDD_MONO="$T/none/mono" \
+		CHORDD_STATE="$T/pw.state" CHORDD_STATUS="$T/pw.status" CHORDD_TAIL_MS=0 "$T/chordd" --test >"$T/pw.out" 2>&1
+	got=$(sed 's/.* mono=-*[01] //' "$T/pw.status")
+	[ "$got" = "$exp" ] && echo "  ok: $got" || { echo "  FAIL: battery fields \"$got\", expected \"$exp\""; fail=1; }
+}
+fake 20 1 20 1 23 1
+pw 93 Discharging 0
+prw "battery at init: bat=93 ac=0 chg=0 (found by type, not by name; USB supply ignored)" "bat=93 ac=0 chg=0" "0 ROTATE 0"
+pw 71 Charging 1
+prw "charging on AC at init" "bat=71 ac=1 chg=1" "0 ROTATE 0"
+pw 100 Full 1
+prw "full on AC: chg=0" "bat=100 ac=1 chg=0" "0 ROTATE 0"
+pw 100 "Not charging" 1
+prw "Not charging: chg=0" "bat=100 ac=1 chg=0" "0 ROTATE 0"
+pw - Discharging 0
+prw "battery without a capacity node: bat=-1" "bat=-1 ac=0 chg=0" "0 ROTATE 0"
+pw 93 Discharging -
+prw "no adapter online node: ac=-1" "bat=93 ac=-1 chg=0" "0 ROTATE 0"
+echo 250 >"$T/pw/aaa-batt/capacity"
+prw "capacity out of range: bat=-1" "bat=-1 ac=-1 chg=0" "0 ROTATE 0"
+rm -rf "$T/pw"
+prw "no power_supply dir at all (QEMU): bat=-1 ac=-1" "bat=-1 ac=-1 chg=0" "0 ROTATE 0" "200000 ROTATE 0"
+# the values are cached: a change in sysfs is NOT seen before 60 s, and then seen exactly once
+pw 93 Discharging 0
+prw "no read before 60 s" "bat=93 ac=0 chg=0" "0 ROTATE 0" "1000 PSET aaa-batt/capacity 50" "59500 ROTATE 0" "59900 ROTATE 0"
+pw 93 Discharging 0
+prw "after 60 s the new level, AC and charge state appear" "bat=50 ac=1 chg=1" "0 ROTATE 0" "1000 PSET aaa-batt/capacity 50" \
+	"2000 PSET aaa-batt/status Charging" "3000 PSET zzz-ac/online 1" "60500 ROTATE 0"
+pw 93 Discharging 0
+prw "second period (120 s): next change picked up" "bat=49 ac=0 chg=0" "0 ROTATE 0" "1000 PSET aaa-batt/capacity 50" "60500 ROTATE 0" \
+	"61000 PSET aaa-batt/capacity 49" "119500 ROTATE 0" "121000 ROTATE 0"
+n=$(grep -c 'status: ' "$T/pw.out")
+[ "$n" = 3 ] && echo "  ok: init + 2 changes = 3 status writes" || { echo "  FAIL: $n status writes, expected 3"; fail=1; }
+pw 93 Discharging 0
+prw "unchanged values after 60 s and 120 s: the file is not rewritten" "bat=93 ac=0 chg=0" "0 ROTATE 0" "61000 ROTATE 0" "125000 ROTATE 0"
+n=$(grep -c 'status: ' "$T/pw.out")
+[ "$n" = 1 ] && echo "  ok: one status write (init only)" || { echo "  FAIL: $n status writes, expected 1"; fail=1; }
+pw 93 Discharging 0
+echo Unknown >"$T/pw/aaa-batt/type"
+prw "battery node added at 10 s is seen at 60 s" "bat=77 ac=0 chg=0" "0 ROTATE 0" "10000 PSET aaa-batt/type Battery" \
+	"10100 PSET aaa-batt/capacity 77" "10200 PSET aaa-batt/status Discharging" "61000 ROTATE 0"
+# the 60 s timer must not disturb the chord repeat and the pad combo grace timing: the same gesture
+# run with a battery read in the middle of it (t0 = 59.9 s) and far from any read (t0 = 9.9 s) must give
+# the same result, and the repeat count must match the closed form (steps at 100, 400, 550, ... ms)
+fake 20 1 20 1 23 1
+pw 93 Discharging 0
+d="$T/rep"; rm -rf "$d"; mkdir -p "$d/bl/dcon-bl"; echo 15 >"$d/bl/dcon-bl/max_brightness"; echo 0 >"$d/mono"
+echo "=== battery read in the middle of a held chord repeat: cadence unchanged"
+for t0 in 59500 9500; do
+	echo 0 >"$d/bl/dcon-bl/brightness"
+	printf '%s\n' "$t0 CIRCLE 1" "$((t0 + 5)) CHECK 1" "$((t0 + 100)) UP 1" "$((t0 + 960)) UP 0" | CHORDD_POWER_DIR="$T/pw" CHORDD_BACKLIGHT_GLOB="$d/bl/*" CHORDD_MONO="$d/mono" \
+		CHORDD_STATE="$d/state" "$T/chordd" --test >"$d/o" 2>&1
+	eval "rep_$t0=$(cat "$d/bl/dcon-bl/brightness")"
+done
+exp=$((1 + (860 - 300) / 150 + 1))
+[ "$rep_59500" = "$exp" ] && [ "$rep_9500" = "$exp" ] && echo "  ok: $rep_59500 steps in both runs (expected $exp)" || { echo "  FAIL: steps $rep_59500 / $rep_9500, expected $exp"; fail=1; }
+echo "=== battery read inside a pad combo grace window and a held trigger: same steps as without the read"
+for t0 in 59900 9900; do
+	fake 20 1 20 1 23 1
+	printf '%s\n' "$t0 SELECT 1" "$((t0 + 50)) L2 1" "$((t0 + 1050)) L2 0" "$((t0 + 1100)) SELECT 0" | CHORDD_POWER_DIR="$T/pw" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$T/none/*" \
+		CHORDD_MONO="$d/mono" CHORDD_STATE="$d/state" "$T/chordd" --test >"$d/o" 2>&1
+	eval "pad_$t0=$(sed -n 's/^Master Playback Volume=0 31 2 \([0-9]*\) .*/\1/p' "$T/mixer")"
+done
+[ "$pad_59900" = "$pad_9900" ] && [ "$pad_9900" -lt 20 ] && echo "  ok: volume $pad_59900 in both runs" || { echo "  FAIL: volume $pad_59900 / $pad_9900"; fail=1; }
 
 [ $fail -eq 0 ] && echo "ALL OK" || { echo "FAILED"; exit 1; }

@@ -33,10 +33,11 @@ int status_parse(const char *buf, struct sysstat *s)
 	struct { const char *k; int *v; } f[] = {
 		{ "vol", &s->vol }, { "volmax", &s->volmax }, { "mute", &s->mute },
 		{ "bri", &s->bri }, { "brimax", &s->brimax }, { "mono", &s->mono },
+		{ "bat", &s->bat }, { "ac", &s->ac }, { "chg", &s->chg },
 	};
 	size_t i;
 
-	s->vol = s->volmax = s->mute = s->bri = s->brimax = s->mono = -1;
+	s->vol = s->volmax = s->mute = s->bri = s->brimax = s->mono = s->bat = s->ac = s->chg = -1;
 	if (n >= sizeof line) n = sizeof line - 1;
 	memcpy(line, buf, n);
 	line[n] = 0;
@@ -59,7 +60,16 @@ int status_parse(const char *buf, struct sysstat *s)
 	if (s->bri >= 0 && (s->brimax < 0 || s->bri > s->brimax)) s->bri = -1;
 	if (s->mute > 1) s->mute = -1;
 	if (s->mono > 1) s->mono = -1;
-	return (s->vol >= 0) + (s->volmax >= 0) + (s->mute >= 0) + (s->bri >= 0) + (s->brimax >= 0) + (s->mono >= 0);
+	if (s->bat > 100) s->bat = -1;
+	if (s->ac > 1) s->ac = -1;
+	if (s->chg > 1) s->chg = -1;
+	return (s->vol >= 0) + (s->volmax >= 0) + (s->mute >= 0) + (s->bri >= 0) + (s->brimax >= 0) + (s->mono >= 0) +
+	       (s->bat >= 0) + (s->ac >= 0) + (s->chg >= 0);
+}
+
+int bat_level(int pct)
+{
+	return pct < 0 ? BAT_NONE : pct <= 5 ? BAT_CRIT : pct <= 15 ? BAT_LOW : BAT_NORMAL;
 }
 
 int pct_of_max(int v, int max)
