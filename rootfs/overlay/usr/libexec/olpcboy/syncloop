@@ -3,11 +3,22 @@
 #   every ~3 s : sync   (the log fs is mounted WITHOUT the sync option; this
 #                        loop bounds what a hard power-off can lose)
 #   every ~6 s : make sure the kmsg reader is still alive
+# While a game runs (/run/olpcboy/running holds the pid of a live olpc-run) both
+# back off to every ~18 s: sync of the whole FAT partition is the one heavy
+# periodic job, and the loop's forks (pgrep) compete with the emulator.
 . /usr/libexec/olpcboy/common.sh
 i=0
+playing() {
+	read -r _pp </run/olpcboy/running 2>/dev/null || return 1
+	[ -n "$_pp" ] && [ -d "/proc/$_pp" ]
+}
 while :; do
-	sync
 	i=$((i + 1))
+	if playing; then
+		# every 6th round only; i % 2 below is then always 0 on those rounds
+		[ $((i % 6)) -eq 0 ] || { olpc_sleep 3; continue; }
+	fi
+	sync
 	if [ $((i % 2)) -eq 0 ] && [ -c /dev/kmsg ]; then
 		if ! pgrep -f 'cat /dev/kmsg' >/dev/null 2>&1; then
 			echo "--- kmsg reader restarted at uptime $(olpc_uptime) ---" >>"$BOOTDIR/kmsg.log"

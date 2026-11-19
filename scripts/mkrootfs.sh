@@ -101,6 +101,18 @@ if [ -f out/cores/coretest ]; then
 	ls -l "$R/usr/lib/libretro" "$R/usr/share/olpcboy/bench" | sed "s/^/  /"
 fi
 
+echo "== olpc-run"
+# Host tests (scaler/resampler/input self-test; full core runs when out/cores exists), then the
+# dynamically linked i386 build for the Geode (cores are dlopen()ed from /usr/lib/libretro).
+sh src/olpc-run/test.sh >"$WORK/olpc-run-test.log" 2>&1 \
+	|| { cat "$WORK/olpc-run-test.log" >&2; echo "ERROR: olpc-run tests failed" >&2; exit 1; }
+grep -E '^(== |[0-9]+ checks|olpc-run tests)' "$WORK/olpc-run-test.log" | tail -n 4
+mkdir -p "$R/usr/local/bin"
+make -C src/olpc-run OUT="$R/usr/local/bin" CFLAGS="-O2 -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/bin/olpc-run"
+file "$R/usr/local/bin/olpc-run" | sed "s/^/  /"
+ls -l "$R/usr/local/bin/olpc-run" | sed "s/^/  /"
+
 echo "== runlevels"
 RL=$R/etc/runlevels
 rm -rf "$RL"

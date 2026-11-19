@@ -1,6 +1,7 @@
 #!/bin/sh
 # tty1 driver (respawned by init): button capture -> selftest -> status screen.
-# The button capture comes first: it is the one thing that needs the user.
+# The button capture and the sound test are opt-in (kernel command line
+# olpcboy.buttons / olpcboy.soundtest) so the games come up sooner.
 # Never waits for keyboard input.  Runs only once per boot.
 # The screen is repainted as little as possible (the display flickered on the
 # first boot): one clear per phase, line-by-line output, status redrawn only
@@ -12,7 +13,7 @@ mkdir -p /run/olpcboy
 
 if [ ! -e "$STATE" ]; then
 	: >"$STATE"
-	if ! cmdline_has olpcboy.nobuttons; then
+	if cmdline_has olpcboy.buttons; then
 		tl "tty1: buttons start"
 		/usr/local/sbin/olpc-buttons
 		tl "tty1: buttons done"
@@ -23,7 +24,7 @@ if [ ! -e "$STATE" ]; then
 	tl "tty1: selftest done"
 	olpc_sync
 	# audible tone so the volume chord can be tried by ear
-	if [ -c /dev/snd/controlC0 ] && ! cmdline_has olpcboy.nosoundtest; then
+	if [ -c /dev/snd/controlC0 ] && cmdline_has olpcboy.soundtest; then
 		printf '\033[2J\033[H\n  SOUND TEST - 25 SECONDS\n\n'
 		printf '  A tone is playing. Hold SQUARE + CROSS and press:\n'
 		printf '    UP / DOWN    volume\n    LEFT         mute\n    RIGHT        unmute\n'
@@ -33,9 +34,10 @@ if [ ! -e "$STATE" ]; then
 		amixer contents >"$BOOTDIR/soundtest-amixer.txt" 2>&1
 		olpc_sync
 	fi
-	# one-shot framebuffer/audio/timer benchmark; the tool restores the video
-	# mode itself and bounds itself with an alarm, `bounded` is the last resort
-	if ! cmdline_has olpcboy.nofbbench; then
+	# one-shot framebuffer/audio/timer benchmark (numbers are in: off by default,
+	# enable with olpcboy.fbbench on the kernel command line); the tool restores
+	# the video mode itself and bounds itself with an alarm, `bounded` is the last resort
+	if cmdline_has olpcboy.fbbench; then
 		printf '\n  Benchmark running, up to 60 s (do not power off)\n'
 		tl "tty1: fbbench start"
 		bounded 75 /usr/local/sbin/olpc-fbbench -o "$BOOTDIR/fbbench.log"
@@ -44,11 +46,12 @@ if [ ! -e "$STATE" ]; then
 		printf '\033[2J\033[H'
 	fi
 	# headless emulator speed: frames/s of each core with no video or audio
-	if [ -x /usr/local/bin/coretest ] && ! cmdline_has olpcboy.nocorebench; then
+	# (numbers are in: off by default, enable with olpcboy.corebench)
+	if [ -x /usr/local/bin/coretest ] && cmdline_has olpcboy.corebench; then
 		printf '\n  Emulator speed test, up to 3 min (do not power off)\n'
 		tl "tty1: corebench start"
 		B=/usr/share/olpcboy/bench
-		for t in gambatte:gb gambatte:gbc quicknes:nes fceumm:nes; do
+		for t in gambatte:gb gambatte:gbc quicknes:nes; do
 			c=${t%:*}; r=$B/rom.${t#*:}
 			[ -f "$r" ] || continue
 			printf '    %s %s\n' "$c" "${t#*:}"
@@ -59,6 +62,99 @@ if [ ! -e "$STATE" ]; then
 		done
 		tl "tty1: corebench done"
 		printf '\033[2J\033[H'
+	fi
+	# real emulator runs with video and audio: 20 s per core, the built-in
+	# buttons are live, then an open-ended GB session until rotate is held 1 s.
+	# Skip all of it with olpcboy.norun.  Without the Geode framebuffer (QEMU)
+	# the runs use null sinks and a short frame count, and the session is skipped.
+	RUN=/usr/local/bin/olpc-run
+	if [ -x "$RUN" ] && ! cmdline_has olpcboy.norun; then
+		B=/usr/share/olpcboy/bench
+		HAVEFB=0
+		[ "$(cat /sys/class/graphics/fb0/name 2>/dev/null)" = "Geode LX" ] && HAVEFB=1
+		if [ "$HAVEFB" = 1 ]; then SINKS=""; else SINKS="--no-video --no-audio"; fi
+		mkdir -p /run/olpcboy/saves
+		tl "tty1: olpc-run sequence start fb=$HAVEFB"
+		# what the kernel says about the PCM (xrun_debug lives in pcm0p/, the rest in pcm0p/sub0/)
+		{
+			ls -lR /proc/asound 2>&1
+			for f in /proc/asound/card0/pcm0p/info /proc/asound/card0/pcm0p/xrun_debug /proc/asound/card0/pcm0p/sub0/*; do
+				[ -f "$f" ] || continue
+				printf '\n== %s\n' "$f"
+				cat "$f" 2>&1
+			done
+		} >"$BOOTDIR/asound-proc.txt" 2>&1
+		# olpc_run NAME SYSTEM FRAMES [olpc-run options...]
+		# The statistics are written by olpc-run at exit only (the stick is never touched while
+		# playing); --stats-live keeps a copy on tmpfs, picked up here when the exit file is missing
+		# (a run killed by the hard timeout).
+		olpc_run() {
+			n=$1; s=$2; fr=$3; shift 3
+			[ -f "$B/rom.$s" ] || { tl "tty1: run $n skipped (no rom.$s)"; return; }
+			[ "$HAVEFB" = 1 ] || fr=120
+			printf '\033[2J\033[H\n  RUN: %s  (%s frames, about %s s)\n\n' "$n" "$fr" "$((fr / 60))"
+			printf '  Built-in buttons are live: play now.\n  D-pad = D-pad, check = A, cross = B,\n  square = SELECT, circle = START.\n'
+			[ "$HAVEFB" = 1 ] && olpc_sleep 3
+			tl "tty1: run $n start"
+			rm -f "/run/olpcboy/run-$n.live"
+			bounded 45 "$RUN" "$@" $SINKS --frames "$fr" --max-seconds 30 --savedir /run/olpcboy/saves \
+				--stats "$BOOTDIR/run-$n.stats" --stats-live "/run/olpcboy/run-$n.live" "$s" "$B/rom.$s" >"$BOOTDIR/run-$n.log" 2>&1
+			rc=$?
+			# a hard kill leaves the console in graphics mode: give it back
+			[ "$rc" = 0 ] || "$RUN" --restore-console >>"$BOOTDIR/run-$n.log" 2>&1
+			rm -f /run/olpcboy/running
+			[ -s "$BOOTDIR/run-$n.stats" ] || cp "/run/olpcboy/run-$n.live" "$BOOTDIR/run-$n.live" 2>/dev/null
+			tl "tty1: run $n done rc=$rc"
+			olpc_sync
+		}
+		# Audio underrun hunt, 20 s each, kernel xrun logging on.  --xrun-debug 5 = bit 0 (log
+		# XRUN and hw_ptr anomalies) + bit 2 (jiffies check); bit 1 would add a stack dump per event.
+		#   gb            defaults: expected no underruns
+		#   gb-stall      a 150 ms stall at frames 300 and 700: expected exactly two underruns,
+		#                 each recovered within a few frames
+		#   gb-stall-p16  the same with 16 ms periods
+		XD="--xrun-debug 5"
+		if [ "$HAVEFB" = 1 ]; then STALL_AT=300,700; else STALL_AT=30,90; fi
+		olpc_run gb gb 1200 $XD
+		olpc_run gb-stall gb 1200 $XD --test-stall-ms 150 --test-stall-at $STALL_AT
+		olpc_run gb-stall-p16 gb 1200 $XD --test-stall-ms 150 --test-stall-at $STALL_AT --audio-period-ms 16
+		olpc_run gbc gbc 1200 $XD
+		olpc_run nes-quicknes nes 1200 $XD
+		dmesg | grep -i -E "xrun|pcm|lost interrupt|cs5535" >"$BOOTDIR/xrun-dmesg.txt" 2>&1
+		olpc_sync
+		printf '\033[2J\033[H'
+		if [ "$HAVEFB" = 1 ] && [ -f "$B/rom.gb" ]; then
+			printf '\n  GB session: play as long as you like.\n  Hold ROTATE for 1 second to leave.\n'
+			olpc_sleep 3
+			tl "tty1: session start"
+			"$RUN" --max-seconds 1500 --savedir /run/olpcboy/saves --stats "$BOOTDIR/run-session.stats" \
+				--stats-live /run/olpcboy/run-session.live gb "$B/rom.gb" \
+				>"$BOOTDIR/run-session.log" 2>&1
+			rc=$?
+			[ "$rc" = 0 ] || "$RUN" --restore-console >>"$BOOTDIR/run-session.log" 2>&1
+			rm -f /run/olpcboy/running
+			[ -s "$BOOTDIR/run-session.stats" ] || cp /run/olpcboy/run-session.live "$BOOTDIR/run-session.live" 2>/dev/null
+			tl "tty1: session done rc=$rc"
+			olpc_sync
+			printf '\033[2J\033[H'
+			dmesg | grep -i -E "xrun|pcm|lost interrupt|cs5535" >"$BOOTDIR/xrun-dmesg-session.txt" 2>&1
+			olpc_sync
+		fi
+		# WiFi + cover-art download test, run here (not as a boot service) so it
+		# cannot disturb the timed runs or the play session above.
+		if [ "$HAVEFB" = 1 ] && ! cmdline_has olpcboy.nowifi; then
+			printf '\033[2J\033[H\n  WiFi test, up to 4 minutes (do not power off)\n'
+			tl "tty1: wifi start"
+			bounded 240 /usr/local/sbin/olpc-wifi run >"$BOOTDIR/wifi-run.out" 2>&1
+			tl "tty1: wifi done rc=$?"
+			/usr/local/sbin/olpc-wifi status >"$BOOTDIR/wifi-status.txt" 2>&1
+			sed 's/^/  /' "$BOOTDIR/wifi-status.txt"
+			bounded 20 /usr/local/sbin/olpc-wifi down >>"$BOOTDIR/wifi-run.out" 2>&1
+			olpc_sync
+			olpc_sleep 4 2>/dev/null || true
+		fi
+		printf '\033[2J\033[H'
+		tl "tty1: olpc-run sequence done"
 	fi
 	tl "tty1: status screen"
 fi

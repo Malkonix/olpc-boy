@@ -221,6 +221,13 @@ CONFIG_MTD_CMDLINE_PARTS=y
 CONFIG_LOG_BUF_SHIFT=19
 CONFIG_SND_PROC_FS=y
 CONFIG_SND_VERBOSE_PROCFS=y
+# PCM xrun diagnostics: /proc/asound/card0/pcm0p/xrun_debug (1 = log XRUN and
+# hw_ptr anomalies, 2 = + stack, 4 = + jiffies check that also corrects a
+# position that jumps) and xrun_injection.  SND_DEBUG itself only turns
+# snd_BUG_ON into WARN and adds the debug printk helpers; the run-time cost
+# is a flag test per period interrupt.
+CONFIG_SND_DEBUG=y
+CONFIG_SND_PCM_XRUN_DEBUG=y
 CONFIG_RTC_INTF_SYSFS=y
 CONFIG_RTC_INTF_PROC=y
 CONFIG_RTC_INTF_DEV=y

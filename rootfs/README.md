@@ -86,3 +86,174 @@ dir, and the repeat timer runs on a virtual clock taken from the event stream.
 
 Not covered by the test: real evdev ioctls, inotify, hot-unplug, and timing on the
 Geode itself.
+
+## `olpc-run` (libretro frontend)
+
+Source: `src/olpc-run/` (`olpc-run.c` main loop, ROMs, saves, stats; `scale.c` integer
+scaler; `audio.c` + `resample.c` raw-ALSA sink; `input.c` evdev; `libretro.h` is the
+MIT-licensed API header). Built by `scripts/mkrootfs.sh` as a **dynamically linked**
+musl binary (`-O2 -march=geode -mtune=geode`, it `dlopen`s the cores) into
+`/usr/local/bin/olpc-run`. Cores live in `/usr/lib/libretro/<name>_libretro.so`.
+
+    olpc-run [options] <gb|gbc|nes|core.so> <rom | rom.zip>
+
+`gb`/`gbc` use gambatte, `nes` uses quicknes; `--core fceumm` (or a name/path) overrides.
+Options: `--stats FILE` (written at exit only), `--stats-live FILE` (also every 10 s; point it at tmpfs), `--frames N`, `--max-seconds N`, `--no-audio`, `--no-video`,
+`--savedir DIR`, `--max-skip N` (default 4), `--max-scale N`, `--audio-period-ms X`
+(default 4), `--audio-latency-ms X` (default 45), `--audio-target N` (frames, overrides
+the latency), `--no-rt`, `--xrun-debug N` (writes N to the PCM's
+`/proc/asound/cardX/pcmDp/xrun_debug`, 0..31: bit 0 = log XRUN and hw_ptr anomalies, bit 1 = also a stack dump, bit 2 = jiffies check; the boot test uses 5), `--test-stall-ms M --test-stall-at F[,F2..]` (sleeps M ms in the loop at those frames, to exercise the recovery), `--no-fill-query` (never calls the DELAY
+ioctl: paced by `poll()` only, frame skipping falls back to "the previous frame's core +
+blit took longer than a frame", fill statistics are -1), `--running-file F`, `--audio-dev PATH`, `--libdir DIR`, `--sysdir DIR`,
+`--restore-console` (only give the text console back and clear the screen), `olpc-run`
+without arguments prints them all. Exit code 0 for every deliberate exit (frame limit,
+exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usage.
+
+* **ROMs**: plain files, or `.zip` (detected by the `PK` magic): the first entry ending
+  in `.gb/.gbc/.nes/.sgb` is found with `unzip -l` and read from `unzip -p` through a
+  pipe (busybox applets, fork/exec, no zip library); ROMs are capped at 16 MB. The
+  extracted data goes to the core from memory; only a core that sets `need_fullpath`
+  gets a temporary file in `/run/olpcboy`.
+* **Saves**: `<savedir>/<rom basename without extension>.srm` (and `.rtc` when the core
+  has one). Default savedir is `saves/` next to the ROM directory (`<romdir>/../saves`),
+  created on demand. Loaded at start, written on exit and every 60 s when the contents
+  changed, always as temp file + `fsync` + `rename` + directory `fsync`. A failed
+  `mkdir`/write is logged and the game goes on. A crash (SIGSEGV, SIGKILL, power loss)
+  loses what was not written yet. The boot test uses `/run/olpcboy/saves` (tmpfs).
+* **Video**: largest integer scale that fits 1200x900, centred, borders cleared once and
+  again on a geometry change. Each source row is expanded once and `memcpy`d for the
+  repeated lines; rows equal to the previous drawn frame are skipped (a copy of the
+  last drawn source is kept; the framebuffer is never read). RGB565, 0RGB1555 and
+  XRGB8888 sources are converted to RGB565. Note quicknes outputs 240x224 (not
+  256x240), so `auto` picks 4x (960x896); `--max-scale 3` gives 720x672. The console
+  is in `KD_GRAPHICS` while running and always restored (text mode, screen cleared, VT
+  bounce so fbcon repaints) on normal exit, SIGINT/SIGTERM/SIGHUP and the time limit;
+  SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT restore text mode and clear but skip the VT
+  bounce. SIGKILL cannot be handled: run `olpc-run --restore-console` afterwards (the
+  boot script does). Without `/dev/fb0` the run continues with a null video sink.
+* **Audio**: `/dev/snd/pcmC0D0p` (then `pcmC1D0p`) through raw ioctls, S16 stereo. It
+  first asks for the core's own rate (32768 Hz for gambatte); if `hw_params` refuses it
+  opens 48000 Hz and resamples (linear, 32.32 fixed point). `poll()` on the PCM only
+  wakes on period interrupts, so the period is the pacing granularity: the default is 4 ms
+  (period 128 frames at 32768 Hz, 192 at 48000 Hz, rounded to 16 frames and clamped to
+  the hardware limits), in a buffer of at least 4096 frames (32 x 128, or 24 x 192). The
+  card's clock is the pacing source: before handing a frame's audio over, `poll()` blocks
+  until the fill is down to the target (`avail_min` = buffer - target, playback starts at
+  `start_threshold` = target): 45 ms rounded up to whole periods, i.e. 1536 frames
+  (46.9 ms) at 32768 Hz and 2304 (48 ms) at 48000 Hz. The previous layout (1024-frame
+  periods, 2048 target) is `--audio-period-ms 31.25 --audio-latency-ms 62.5` at 32768 Hz.
+  No `sleep` is used. The hardware may grant other values; the stats report the real
+  ones. When the fill is lower than the expected
+  core + blit time (moving averages, plus 128 frames of margin, device-rate frames
+  whatever the period) the blit of that frame is skipped; the core still runs. At most
+  `--max-skip` consecutive frames, and never during the first 30 frames. Duplicate frames
+  from the core (`NULL` data) are counted as `frames_dupe`.
+* **Priority**: with a real PCM, `olpc-run` calls `mlockall(MCL_CURRENT|MCL_FUTURE)` and
+  switches itself to `SCHED_FIFO` priority 10 (the kernel is HZ=100 with voluntary
+  preemption, so a background job could otherwise hold the CPU for a whole 10 ms tick). It
+  blocks on the sound card for about 10 of every 16.6 ms, which leaves the rest to
+  `olpc-chordd` and the shell jobs. If 90 frames in a row do not block at all (the core is
+  slower than the card) it drops back to `SCHED_OTHER` and logs it. musl's
+  `sched_setscheduler` is a stub that returns ENOSYS, so the raw syscall is used and the
+  policy is read back with `sched_getscheduler` (`rt_policy`, 1 = FIFO; `rt_errno` on failure). No `SCHED_FIFO` in
+  clock mode or with `--no-audio`; `--no-rt` also skips `mlockall`. Failures are logged and
+  ignored; the stats say `rt=fifo|demoted|failed|no-rt|n/a`.
+* **Running marker**: while the loop runs `olpc-run` keeps `/run/olpcboy/running` (its pid,
+  `--running-file`). `syncloop` syncs every ~18 s instead of every ~3 s while the pid in it
+  is alive; `olpc-tty1` removes the file after each run.
+* **Input**: reads `/dev/input/event*` directly, no grab; `inotify` on `/dev/input`
+  picks up pads plugged later. Built-in buttons (device "AT Translated Set 2 keyboard"):
+  D-pad = D-pad, CHECK (KEY_END) = A, CROSS (KEY_PAGEDOWN) = B, CIRCLE (KEY_PAGEUP) =
+  START, SQUARE (KEY_HOME) = SELECT. The chord keys overlap game buttons (CIRCLE+CHECK =
+  START+A, SQUARE+CROSS = SELECT+B): accepted. USB pads are unchanged. Pads (any node with BTN_GAMEPAD or BTN_JOYSTICK):
+  D-pad from ABS_HAT0X/Y, BTN_DPAD_* or the left stick ABS_X/Y (past half deflection),
+  BTN_SOUTH = B, BTN_EAST = A, BTN_SELECT, BTN_START; generic clones: BTN_TRIGGER = B,
+  BTN_THUMB = A, BTN_BASE3/BTN_BASE4 = SELECT/START. The tables are at the top of
+  `input.c`. While `/run/olpcboy/chord` is `1` the built-in D-pad is not passed to the
+  game. **Exit**: hold ROTATE (KEY_DIRECTION, 153) for 1 s, or pad SELECT+START for
+  1 s, or SIGTERM. ROTATE re-sends presses while held; only the held state is tracked.
+* **Storage never blocks the loop**: nothing in the frame loop writes to the USB stick. The
+  statistics are kept in memory and written once at exit (`--stats`); `--stats-live` is a
+  copy every 10 s meant for tmpfs, which `olpc-tty1` uses so a run killed by the hard timeout
+  still leaves something (`run-<name>.live`). Diagnostic messages from inside the loop
+  (`dlog`) are buffered in memory (8 KB) and printed at exit. The `/run/olpcboy/chord` flag
+  is read with one `pread` on a descriptor kept open. Battery saves are written by a helper
+  thread (normal priority, nice 10, signals blocked, started before `SCHED_FIFO` is taken):
+  the loop only compares the save RAM with its private copy of what is on disk every 60 s,
+  copies it into a snapshot buffer when it changed (a try-lock, never a wait) and the helper
+  does temp file + `fsync` + `rename` + directory `fsync`. At exit the loop copies the RAM
+  once more, unloads the core, restores the screen and then waits at most 8 s for the helper
+  (`saves_unfinished` in the stats; a dead SD card cannot hang the exit).
+* **Underrun recovery** (`diag.c` `recov_*`, performed in `audio.c`): an underrun opens an
+  incident. First underrun: `DROP` + `PREPARE` + silence up to the target fill. A second one
+  while the incident is open: close and reopen the PCM (full `hw_free`/`hw_params`). A third:
+  clock pacing for the rest of the run. While an incident is open the loop is paced by the
+  clock (sleeps to the frame deadline, no catch-up bursts) instead of running free. The
+  incident closes at the first frame whose `poll()` really blocked (at least 1 ms) or after 6
+  clean frames; the first event of each incident then gets `rec_frames` and `rec_ms`.
+* **Statistics**: `--stats FILE`, text `status=running` only in the live copy and
+  `status=<frames|exit-button|signal|timeout>` at exit.
+  `key=value` lines: `frames_run`, `frames_drawn`, `frames_skipped`, `frames_dupe`,
+  `wall_s`, `fps_effective`; per-frame `core_ms_*` (core only, blit excluded),
+  `blit_ms_*` (average over drawn frames), `audio_wait_ms_*` (poll + write),
+  `work_ms_*` (core + blit, the real headroom measure), `frame_ms_*`, each `_avg` and
+  `_max`; `underruns`, `audio_stalls` (a 250 ms poll timeout), `audio_mode`
+  (`alsa`/`clock`/`null`), `audio_core_rate`, `audio_device_rate`, `audio_period`,
+  `audio_buffer`, `audio_target`, `audio_period_ms`, `audio_target_ms`, `audio_avail_min`,
+  `audio_start_threshold`, the requested `audio_req_*`, `audio_fill_min`/`audio_fill_max`
+  (frames and `_ms`; the fill when poll woke up / right after the write, after the first
+  30 frames), `frame_hist_lt14`, `_14_18`, `_18_22`, `_22_30`, `_30_40`, `_gt40` (frame
+  time buckets in ms), `core_over12_frames`, `blit_over12_frames`,
+  `audio_wait_over12_frames` (frames where that phase took more than 12 ms), `rt`,
+  `rt_policy`, `rt_errno`, `mlockall`, `fill_query`, `underruns_poll` / `underruns_write`
+  (how each underrun was noticed: `POLLERR` from `poll()` or `EPIPE` from the write),
+  `underrun_recover_failed`, `recover_prepare` / `recover_reopen` / `recover_clock` /
+  `recover_reopen_failed`, `incidents`, `incidents_recovered`, `recovery_paced_frames`,
+  `xrun_debug_req` / `xrun_debug_applied` / `xrun_debug_errno` / `xrun_debug_path`,
+  `test_stall_ms`, `test_stalls_done`, `saves_written`, `saves_failed`, `saves_unfinished`,
+  `xrun_events_total`,
+  `xrun_events_kept` and up to 64 `xrun_event_N=frame=.. since_prev_ms=.. work_ms=a,b,c
+  fill=.. via=poll|write action=prepare|reopen|clock rec_frames=.. rec_ms=..` lines (the last 64 underruns: frame number, time since the previous
+  frame started, core + blit time of the previous three frames, last fill read before it).
+  `video_mode` (`fb`/`fake`/`null`), `video_scale`,
+  `video_rect`, `rows_drawn_pct` (share of source rows actually redrawn). The log on
+  stderr states the chosen audio rate/buffer, video geometry and a final summary line.
+
+Boot test (`olpc-tty1`, after the selftest; first `asound-proc.txt` = `ls -lR /proc/asound`
+plus `pcm0p/xrun_debug` and `pcm0p/sub0/*`): `olpc-run` plays `bench/rom.<sys>` for 1200
+frames (about 20 s) with video and audio, all with `--xrun-debug 5` (basic log + jiffies
+check; 3 would add stack dumps), soft limit 30 s, hard `bounded` kill at 45 s:
+`gb` (defaults; expected: no underruns), `gb-stall` (`--test-stall-ms 150 --test-stall-at
+300,700`; expected: exactly two underruns, each recovered in a few frames), `gb-stall-p16`
+(the same with `--audio-period-ms 16`), `gbc`, `nes-quicknes`. Each leaves
+`$BOOTDIR/run-<name>.stats` (written at exit), `run-<name>.log` and, when the exit file is
+missing, `run-<name>.live` (the tmpfs copy). After them the kernel's xrun/pcm/cs5535
+messages are saved to `$BOOTDIR/xrun-dmesg.txt`. Then an open-ended GB session
+(`run-session.*`, also `xrun-dmesg-session.txt`) until ROTATE is held for 1 s, then the
+WiFi test, then the status screen. (The FCEUmm core stays installed, `--core fceumm`, but is
+not in the sequence: too slow.)
+Kernel command line flags:
+`olpcboy.norun` skips the whole sequence, `olpcboy.buttons` and `olpcboy.soundtest`
+re-enable the 60 s button capture and the 25 s sound test (off by default now),
+`olpcboy.fbbench` and `olpcboy.corebench` the two older benchmarks. Without the Geode
+framebuffer (QEMU) all five runs use `--no-video --no-audio` with 120 frames (the stall
+frames become 30,90); the interactive session and the WiFi test are skipped.
+
+Tests: `make olpc-run-test` (or `sh src/olpc-run/test.sh` in the builder container;
+`mkrootfs.sh` runs it and fails the build on failure). Self-test of the scaler (all
+source/destination formats, odd sizes, strides and offsets against a per-pixel reference,
+dirty-row logic), the resampler (chunking independence, length, error against an ideal
+sine), the input mapping (via pipes) and the audio buffer derivation (period, buffer,
+target, `avail_min` from rate, requested ms and hardware limits), and the diagnostics helpers
+(underrun ring buffer and its formatting, time-based skip criterion, strict option parsing, the recovery policy driven by a fake stream, clock pacing, the stall list), the save helper (content, snapshot isolation, no `.tmp`, a bounded exit wait with a writer blocked on a FIFO) and the in-place chord flag; then, if `out/cores` holds the cores and ROMs,
+600 frames of every core through the real frontend with null sinks and with a fake
+framebuffer (`OLPC_RUN_FAKEFB=<file of 1200x900x2 bytes>`; the file keeps the last
+frame, and a checker counts non-black pixels inside and outside the expected
+rectangle), zip loading with glob characters in the entry name, the clock fallback, forced
+frame skipping (`--test-blit-delay-ms`) and save write/reload (`--test-poke-save`).
+Not covered without hardware: the ALSA path, the real framebuffer and console modes,
+evdev nodes, inotify and all timing on the Geode.
+
+### WiFi
+Put `wifi.cfg` in the repo root (git-ignored; `make image` copies it to WIFI.CFG in the FAT root, and it can be edited from any PC). One network per line, TAB-separated: `SSID<TAB>key<TAB>TYPE`, TYPE = WPA2|WPA|WEP|OPEN (case-insensitive); first line = highest priority; `#` comments, blank lines and CRLF are fine; spaces allowed in SSID and key; leave the key empty for OPEN.
+`olpc-wifi up|down|status|check|run` loads usb8xxx, starts wpa_supplicant (nl80211, then wext fallback), runs DHCP and a one-shot NTP; `check` tests connectivity and downloads a test cover. Details are in `wifi.log` in the boot dir (never the key); timeline lines are prefixed `wifi:`. The boot test sequence calls `olpc-wifi run` after the play session; `olpcboy.nowifi` on the cmdline skips it. The `olpc-wifi` OpenRC service exists but is not enabled.

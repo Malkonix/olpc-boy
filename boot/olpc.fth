@@ -31,9 +31,7 @@
 \                                   device appears; this makes atkbd bind without
 \                                   probing, so D-pad / game-key scancodes sent by
 \                                   the EC are delivered
-\   i8042.debug=1 i8042.unmask_kbd_data=1 : log every byte from the keyboard
-\                                   controller to the kernel log (debug image only)
-" console=tty0 fbcon=font:TER16x32 loglevel=4 printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1 vt.global_cursor_default=0 consoleblank=0 i8042.dumbkbd=1 i8042.debug=1 i8042.unmask_kbd_data=1" to boot-file
+" console=tty0 fbcon=font:TER16x32 loglevel=4 printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1 vt.global_cursor_default=0 consoleblank=0 i8042.dumbkbd=1" to boot-file
 
 \ Load the kernel from boot-device with boot-file as its command line and run it
 boot

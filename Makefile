@@ -22,7 +22,7 @@ INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
 ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
 
-.PHONY: chordd-test fbbench-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: chordd-test fbbench-test olpc-run-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -75,6 +75,10 @@ distclean:
 # Logic test of src/olpc-chordd in the builder container (no hardware).
 chordd-test:
 	$(RUN_USER) sh src/olpc-chordd/test.sh
+
+# Host tests of src/olpc-run (needs out/cores for the core runs).
+olpc-run-test:
+	$(RUN_USER) sh src/olpc-run/test.sh
 
 # Scaling-kernel self-test of src/olpc-fbbench in the builder container.
 fbbench-test:
