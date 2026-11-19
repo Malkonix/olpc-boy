@@ -1044,6 +1044,13 @@ static void launch(void)
 	rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 after:
 	logf_("olpc-run exited with %d", rc);
+	/* take the screen back explicitly: the child may have changed the VT mode */
+	if (g_tty >= 0 && !g_fake) {
+		int m = -1;
+		ioctl(g_tty, KDGETMODE, &m);
+		logf_("console mode after game: %d (1 = graphics)", m);
+		if (ioctl(g_tty, KDSETMODE, KD_GRAPHICS) == 0) g_kd_graphics = 1;
+	}
 	input_resync();
 	if (rc != 0) {
 		err_rc = rc;
@@ -1053,6 +1060,12 @@ after:
 	} else {
 		draw_main(now_ms());
 	}
+	/* Repaint twice: on hardware the first repaint after a game was lost (black
+	 * screen until the next change), so push the whole frame again shortly after. */
+	flush();
+	{ struct timespec ts = { 0, 200000000 }; nanosleep(&ts, NULL); }
+	dirty_add(0, 0, FBW, FBH);
+	flush();
 }
 
 /* ------------------------------------------------------------------ script */

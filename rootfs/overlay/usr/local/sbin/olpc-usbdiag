@@ -1,0 +1,709 @@
+#!/bin/sh
+# olpc-usbdiag -- background watcher for USB game pads that misbehave (hot-plug,
+# "never enumerates", drops off the bus right after probing).
+#
+# Started by the olpc-usbdiag service (nice 19) and kept alive for the whole
+# session.  Idle cost: one sleep-based poll every 2 s (one `tail`, shell
+# builtins otherwise).  With no Sony device (VID 054c) and no port stuck in
+# enumeration it writes nothing at all.
+#
+# What it does
+#  * Keeps a usbmon text capture (debugfs usb/usbmon/<bus>u) of the OHCI bus
+#    from service start, in tmpfs, as a ring of fixed-size chunks (newest
+#    ~2 MB kept).  The bus is found from sysfs (root hub with a ohci* parent).
+#    The capture is paused while a game runs (/run/olpcboy/running).
+#  * Watches the kernel log copy ($BOOTDIR/kmsg.log, raw /dev/kmsg records, by
+#    sequence number) for: "new <speed> USB device" on a port, "New USB device
+#    found", "USB disconnect", enumeration errors.  A port that stays in "new
+#    ... USB device" with no result for 10 s is "stuck" (the usb core retries
+#    descriptor reads silently at this log level; dev_dbg is compiled out).
+#  * On Sony appear / Sony disconnect / port stuck / enumeration failed /
+#    a new device replacing a still-pending one, writes a snapshot (at most 6
+#    per boot) to $BOOTDIR/usbdiag/snap-NN-<reason>/:
+#       usbmon-bus<N>.txt.gz   the ring (includes the moments before the event)
+#       state.txt              OHCI root hub registers decoded (roothub.a/b/status,
+#                              per-port connect/enable/suspend/over-current/power/
+#                              reset bits), OHCI async+periodic schedule, sysfs
+#                              power attrs of the root hubs and ports, devices,
+#                              input devices, power supplies, usb/hid kernel lines
+#    For "stuck" it first triggers sysrq-w (blocked tasks with stacks, goes to
+#    the kernel log) so the hub thread's wait point is recorded.
+#  * Recovery attempts (only a Sony device that is present, has had no input
+#    device for 30 s, and no game running; once per plug-in):
+#      1 rebind  2 pm-on  3 authorized 0->1 (NOT a reset in 6.1)  4 config 0->n
+#      5 port-cycle (sysfs `disable`; skipped when another device shares the bus)
+#    Never run when the pad works.  Only the Sony device and its port are touched.
+# While a game runs: no capture, no snapshots, no recovery; the log is scanned
+# every 6 s and events are written to usbdiag.log only.
+# POSIX sh / busybox ash.  Waits use uptime (see common.sh).
+
+if [ -z "$OLPC_USBDIAG_TEST" ]; then
+	. /usr/libexec/olpcboy/common.sh
+fi
+
+USBDEV=${OLPC_USBDIAG_SYSFS:-/sys/bus/usb/devices}
+VID=054c
+DBG=${OLPC_USBDIAG_DEBUGFS:-/sys/kernel/debug}
+INPUT=${OLPC_USBDIAG_INPUT:-/sys/class/input}
+PSU=${OLPC_USBDIAG_PSU:-/sys/class/power_supply}
+SYSRQ=${OLPC_USBDIAG_SYSRQ:-/proc/sysrq-trigger}
+RUNNING=${OLPC_USBDIAG_RUNNING:-/run/olpcboy/running}
+POLL=${OLPC_USBDIAG_POLL:-2}
+POLL_GAME=${OLPC_USBDIAG_POLL_GAME:-6}
+SNAPMAX=${OLPC_USBDIAG_SNAPMAX:-6}
+STUCK_S=${OLPC_USBDIAG_STUCK:-10}
+RECOVER_S=${OLPC_USBDIAG_RECOVER_AFTER:-30}
+MONCHUNK=${OLPC_USBDIAG_CHUNK:-256k}       # split -b size
+MONKEEP=${OLPC_USBDIAG_KEEP:-8}            # chunks kept: 8 x 256k = 2 MB
+MON_IN_GAME=${OLPC_USBDIAG_MON_IN_GAME:-0}
+OUT=${BOOTDIR:-/var/log/olpc-fallback}/usbdiag
+LOG=$OUT/usbdiag.log
+MON=${STAGE:-/run/olpcboy/stage}/usbmon
+KMSG=${OLPC_USBDIAG_KMSG:-}
+[ -n "$KMSG" ] || KMSG=${BOOTDIR:-/nonexistent}/kmsg.log
+[ -r "$KMSG" ] || { [ -r /run/olpcboy/kmsg.log ] && KMSG=/run/olpcboy/kmsg.log; }
+TMPK=$MON.kmsg
+MARK=$MON.mark
+SCANN=0
+
+LASTSEQ=0
+FIRST=1
+PEND=""          # "port=ts_us ..." ports in "new ... USB device" without a result
+SENT=""          # "port=ts_us" stuck snapshot already taken for that attempt
+SONYPORTS=" "    # " 2-4 " ports that currently hold a Sony device
+SONYNOW=""       # Sony devices seen in sysfs at the last poll
+REASONS=""
+NSNAP=0
+CAPLOGGED=0
+MONBUS=""
+MONGEN=0; MONCUR=""
+MONFAIL=0
+MONLAST=0
+GAME=0
+PORTDIR=""; PARENT=""; DEV=""; BUS=""; DEVNUM=""
+
+# ---- small helpers ---------------------------------------------------------
+
+ul() {
+	if [ ! -e "$LOG" ]; then
+		mkdir -p "$OUT" 2>/dev/null
+		echo "$(olpc_uptime) usbdiag running; usbmon bus ${MONBUS:-none}, ring ${MONKEEP} x ${MONCHUNK}" >>"$LOG"
+	fi
+	echo "$(olpc_uptime) $*" >>"$LOG"
+}
+step() { ul "$*"; tl "usbdiag: $*"; }
+
+# san STRING -> $SAN with every non [A-Za-z0-9] replaced by _
+san() {
+	_s=$1; SAN=""
+	while [ -n "$_s" ]; do
+		_c=${_s%"${_s#?}"}; _s=${_s#?}
+		case "$_c" in [A-Za-z0-9]) SAN=$SAN$_c ;; *) SAN=${SAN}_ ;; esac
+	done
+}
+
+now_us() { _cs; NOW_US=$((CS * 10000)); }
+
+playing() {
+	[ -r "$RUNNING" ] || return 1
+	read -r _gp <"$RUNNING" || return 1
+	[ -n "$_gp" ] && [ -d "/proc/$_gp" ]
+}
+
+has_input() {
+	for _hn in "$INPUT"/input*/name; do
+		[ -r "$_hn" ] || continue
+		read -r _hv <"$_hn"
+		case "$_hv" in *"Wireless Controller"*) return 0 ;; esac
+	done
+	return 1
+}
+
+# wait_input SECS: poll every 0.5 s; 0 when the input device exists
+wait_input() {
+	_cs; _wi_end=$((CS + $1 * 100))
+	while :; do
+		has_input && return 0
+		_cs; [ "$CS" -ge "$_wi_end" ] && return 1
+		olpc_sleep 0.5
+	done
+}
+
+# dump_attrs DIR: name=value for every readable plain file (first line)
+dump_attrs() {
+	for _da in "$1"/*; do
+		[ -f "$_da" ] || continue
+		case "${_da##*/}" in descriptors|remove|bind|unbind|uevent|new_id|remove_id) continue ;; esac
+		{ read -r _dv <"$_da"; } 2>/dev/null || _dv="(unreadable)"
+		echo "${_da##*/}=$_dv"
+	done
+}
+
+port_has() { case "$SONYPORTS" in *" $1 "*) return 0 ;; esac; return 1; }
+port_add() { port_has "$1" || SONYPORTS="$SONYPORTS$1 "; }
+port_del() {
+	_n=" "
+	for _x in $SONYPORTS; do [ "$_x" = "$1" ] || _n="$_n$_x "; done
+	SONYPORTS=$_n
+}
+
+# pend_get PORT -> $PV (ts in us) or empty
+pend_get() {
+	PV=""
+	for _x in $PEND; do case "$_x" in "$1="*) PV=${_x#*=}; return 0 ;; esac; done
+	return 1
+}
+pend_del() {
+	_n=""
+	for _x in $PEND; do case "$_x" in "$1="*) ;; *) _n="$_n $_x" ;; esac; done
+	PEND=${_n# }
+}
+pend_set() { pend_del "$1"; PEND="$PEND $1=$2"; PEND=${PEND# }; }
+
+reason() { REASONS="$REASONS $1"; }
+
+# ---- OHCI register decoding ---------------------------------------------------
+
+# decode_ps HEX -> $DEC: OHCI HcRhPortStatus bits by name
+decode_ps() {
+	_v=$(( $1 )); DEC=""
+	[ $((_v & 0x1)) -ne 0 ]     && DEC="$DEC CONNECTED"
+	[ $((_v & 0x2)) -ne 0 ]     && DEC="$DEC ENABLED"
+	[ $((_v & 0x4)) -ne 0 ]     && DEC="$DEC SUSPENDED"
+	[ $((_v & 0x8)) -ne 0 ]     && DEC="$DEC OVER-CURRENT"
+	[ $((_v & 0x10)) -ne 0 ]    && DEC="$DEC RESET"
+	[ $((_v & 0x100)) -ne 0 ]   && DEC="$DEC POWERED"
+	[ $((_v & 0x200)) -ne 0 ]   && DEC="$DEC LOW-SPEED"
+	[ $((_v & 0x10000)) -ne 0 ] && DEC="$DEC +connect-change"
+	[ $((_v & 0x20000)) -ne 0 ] && DEC="$DEC +enable-change"
+	[ $((_v & 0x40000)) -ne 0 ] && DEC="$DEC +suspend-change"
+	[ $((_v & 0x80000)) -ne 0 ] && DEC="$DEC +OVER-CURRENT-change"
+	[ $((_v & 0x100000)) -ne 0 ] && DEC="$DEC +reset-done"
+	[ -n "$DEC" ] || DEC=" (none)"
+}
+
+# decode_ohci_regs FILE: the roothub.* lines of an OHCI debugfs `registers` file
+decode_ohci_regs() {
+	while read -r _k _a _b _rest; do
+		case "$_k" in
+		roothub.a)    # _a = hex without 0x
+			_v=$(( 0x$_a ))
+			_o="NDP=$((_v & 0xff)) power-good-delay=$(( ((_v >> 24) & 0xff) * 2 ))ms"
+			if [ $((_v & 0x200)) -ne 0 ]; then _o="$_o no-power-switching"
+			elif [ $((_v & 0x100)) -ne 0 ]; then _o="$_o per-port-power-switching"
+			else _o="$_o ganged-power-switching"; fi
+			if [ $((_v & 0x1000)) -ne 0 ]; then _o="$_o NO-OVER-CURRENT-PROTECTION(NOCP)"
+			elif [ $((_v & 0x800)) -ne 0 ]; then _o="$_o per-port-over-current-reporting"
+			else _o="$_o global-over-current-reporting"; fi
+			echo "roothub.a  0x$_a: $_o" ;;
+		roothub.b)    echo "roothub.b  0x$_a: port-power-control-mask=$(( (0x$_a >> 16) & 0xffff )) device-removable=$(( 0x$_a & 0xffff ))" ;;
+		roothub.status)
+			_v=$(( 0x$_a )); _o=""
+			[ $((_v & 0x1)) -ne 0 ]     && _o="$_o local-power-lost"
+			[ $((_v & 0x2)) -ne 0 ]     && _o="$_o GLOBAL-OVER-CURRENT"
+			[ $((_v & 0x20000)) -ne 0 ] && _o="$_o +over-current-change"
+			echo "roothub.status 0x$_a:${_o:- (none)}" ;;
+		roothub.portstatus)   # "roothub.portstatus [0] 0x00000103 PPS PES CCS"
+			decode_ps "$_b"
+			echo "roothub.port$_a $_b:$DEC" ;;
+		esac
+	done <"$1"
+}
+
+# ---- usbmon ring -------------------------------------------------------------
+
+# find the OHCI bus from sysfs: root hub (usbN) whose parent PCI device is bound
+# to ohci*; fallback: the first full-speed (12) root hub
+mon_find_bus() {
+	MONBUS=""; _fb=""
+	for _rd in "$USBDEV"/usb*; do
+		[ -r "$_rd/busnum" ] || continue
+		read -r _bn <"$_rd/busnum"
+		read -r _sp <"$_rd/speed" 2>/dev/null
+		_real=$(readlink -f "$_rd" 2>/dev/null)
+		_drv=$(readlink "${_real%/*}/driver" 2>/dev/null); _drv=${_drv##*/}
+		case "$_drv" in ohci*) MONBUS=$_bn; return 0 ;; esac
+		[ "$_sp" = 12 ] && [ -z "$_fb" ] && _fb=$_bn
+	done
+	MONBUS=$_fb
+	[ -n "$MONBUS" ]
+}
+
+dbg_up() {
+	[ -d "$DBG/usb" ] && return 0
+	[ -z "$OLPC_USBDIAG_TEST" ] || return 1
+	bounded 5 mount -t debugfs debugfs "$DBG" >/dev/null 2>&1
+	[ -d "$DBG/usb" ]
+}
+
+mon_pid() { MPID=""; [ -r "$MON/pid" ] && read -r MPID <"$MON/pid"; [ -n "$MPID" ]; }
+mon_alive() { mon_pid && [ -d "/proc/$MPID" ]; }
+
+mon_start() {
+	[ -n "$MONBUS" ] || return 1
+	_mf=$DBG/usb/usbmon/${MONBUS}u
+	[ -r "$_mf" ] || return 1
+	mkdir -p "$MON" 2>/dev/null
+	MONGEN=$((MONGEN + 1))
+	rm -f "$MON/pid"
+	# One chunk file per cat process (busybox on the device has no `split`):
+	# mon_ensure restarts the capture into a new chunk when this one is full.
+	MONCUR="$MON/c$(printf %05d "$MONGEN").txt"
+	sh -c 'echo $$ >"$1"; exec cat "$2" >"$3"' sh "$MON/pid" "$_mf" "$MONCUR" 2>/dev/null &
+	_cs; MONLAST=$CS
+	return 0
+}
+
+mon_stop() {
+	if mon_alive; then
+		kill "$MPID" 2>/dev/null
+		ul "usbmon capture paused (game running)"
+	fi
+	rm -f "$MON/pid"
+}
+
+# keep the capture running (restart at most every 20 s if it died) and the ring bounded
+mon_ensure() {
+	[ -n "$MONBUS" ] || return 0
+	# roll to a new chunk when the current one is full (loses a few ms of traffic)
+	if mon_alive && [ -n "$MONCUR" ] && [ -f "$MONCUR" ]; then
+		_sz=$(wc -c <"$MONCUR" 2>/dev/null)
+		case "$MONCHUNK" in *k) _lim=$((${MONCHUNK%k} * 1024)) ;; *) _lim=$MONCHUNK ;; esac
+		if [ "${_sz:-0}" -ge "$_lim" ]; then
+			kill "$MPID" 2>/dev/null; rm -f "$MON/pid"; mon_start
+		fi
+	fi
+	if ! mon_alive; then
+		_cs
+		if [ $((CS - MONLAST)) -ge 2000 ] || [ "$MONLAST" -eq 0 ]; then
+			mon_start || { [ $MONFAIL -eq 0 ] && ul "usbmon: $DBG/usb/usbmon/${MONBUS}u not readable (no CONFIG_USB_MON or debugfs)"; MONFAIL=1; }
+		fi
+	fi
+	mon_prune
+}
+
+mon_prune() {
+	set -- "$MON"/c*.*
+	[ -e "$1" ] || return 0
+	_cnt=$#
+	while [ "$_cnt" -gt "$MONKEEP" ]; do
+		rm -f "$1"; shift; _cnt=$((_cnt - 1))
+	done
+}
+
+# ---- snapshot ------------------------------------------------------------------
+
+state_dump() {
+	echo "== uptime $(olpc_uptime)  reason: $1"
+	echo "== OHCI debugfs (root hub registers decoded)"
+	for _od in "$DBG"/usb/ohci/*; do
+		[ -r "$_od/registers" ] || continue
+		echo "-- controller ${_od##*/}"
+		grep -E '^roothub' "$_od/registers" 2>&1
+		decode_ohci_regs "$_od/registers"
+		echo "-- ${_od##*/} async (control/bulk schedule: TDs of a stuck transfer)"
+		head -n 60 "$_od/async" 2>&1
+		echo "-- ${_od##*/} periodic"
+		head -n 40 "$_od/periodic" 2>&1
+	done
+	echo "== debugfs usb/devices"
+	cat "$DBG/usb/devices" 2>&1
+	echo "== root hubs and ports (sysfs)"
+	for _rh in "$USBDEV"/usb*; do
+		[ -d "$_rh" ] || continue
+		echo "-- ${_rh##*/}"
+		dump_attrs "$_rh"
+		echo "-- ${_rh##*/}/power"
+		dump_attrs "$_rh/power"
+		for _pd in "$_rh/${_rh##*/}"-port*; do
+			[ -d "$_pd" ] || continue
+			echo "-- ${_pd##*/}"
+			dump_attrs "$_pd"
+		done
+	done
+	echo "== devices"
+	for _dd in "$USBDEV"/*; do
+		_db=${_dd##*/}
+		case "$_db" in *:*) continue ;; esac
+		[ -r "$_dd/idVendor" ] || continue
+		echo "$_db $(cat "$_dd/idVendor" 2>/dev/null):$(cat "$_dd/idProduct" 2>/dev/null) speed=$(cat "$_dd/speed" 2>/dev/null) bMaxPower=$(cat "$_dd/bMaxPower" 2>/dev/null) bus=$(cat "$_dd/busnum" 2>/dev/null) dev=$(cat "$_dd/devnum" 2>/dev/null) power/control=$(cat "$_dd/power/control" 2>/dev/null) runtime_status=$(cat "$_dd/power/runtime_status" 2>/dev/null)"
+		for _si in "$_dd":*; do
+			[ -d "$_si" ] || continue
+			_sd=$(readlink "$_si/driver" 2>/dev/null); _sd=${_sd##*/}
+			echo "    ${_si##*/} driver=${_sd:-(none)}"
+		done
+	done
+	echo "== power supplies (XO battery / AC)"
+	for _ps in "$PSU"/*; do
+		[ -d "$_ps" ] || continue
+		echo "-- ${_ps##*/}"
+		for _pa in type status online present voltage_now current_now capacity; do
+			[ -r "$_ps/$_pa" ] && echo "$_pa=$(cat "$_ps/$_pa" 2>/dev/null)"
+		done
+	done
+	echo "== input devices"
+	grep -E '^N: Name' /proc/bus/input/devices 2>&1
+	echo "== kernel log (usb/hid/ohci), last 100"
+	[ -r "$KMSG" ] && tail -c 65536 "$KMSG" | grep -E ';(usb |usbhid|sony |hid|input: |ohci|Sysrq|sysrq|task:|Workqueue|Call Trace|.* hub_|.* usb_)' | tail -n 100
+}
+
+snapshot() {
+	if [ "$NSNAP" -ge "$SNAPMAX" ]; then
+		[ "$CAPLOGGED" -eq 1 ] || { step "snapshot cap ($SNAPMAX per boot) reached: later events are only logged"; CAPLOGGED=1; }
+		return 0
+	fi
+	NSNAP=$((NSNAP + 1))
+	san "$1"
+	_sd=$OUT/snap-$(printf %02d "$NSNAP")-$SAN
+	mkdir -p "$_sd" 2>/dev/null
+	step "snapshot $NSNAP ($1) -> $_sd"
+	case "$1" in stuck-*)
+		# blocked tasks with stack: shows where the hub thread waits
+		echo w >"$SYSRQ" 2>/dev/null
+		olpc_sleep 1 ;;
+	esac
+	state_dump "$1" >"$_sd/state.txt" 2>&1
+	if ls "$MON"/c*.* >/dev/null 2>&1; then
+		if command -v gzip >/dev/null 2>&1; then
+			cat "$MON"/c*.* | gzip -1 >"$_sd/usbmon-bus${MONBUS:-x}.txt.gz" 2>/dev/null
+		else
+			cat "$MON"/c*.* >"$_sd/usbmon-bus${MONBUS:-x}.txt" 2>/dev/null
+		fi
+	else
+		echo "no usbmon capture (bus ${MONBUS:-unknown})" >"$_sd/usbmon-none.txt"
+	fi
+	olpc_sync
+}
+
+do_snapshots() {
+	_rs=$REASONS; REASONS=""
+	if [ "$GAME" -eq 1 ]; then
+		ul "snapshot(s) skipped, game running:$_rs"
+		return 0
+	fi
+	for _r in $_rs; do snapshot "$_r"; done
+}
+
+# ---- kernel log events ---------------------------------------------------------
+
+# one message "usb 2-4: ..." -> acts on it
+ev_usb() { # PORT TS MSG
+	_p=$1; _t=$2; _m=$3
+	case "$_m" in
+	*": new "*" USB device number "*)
+		if pend_get "$_p"; then
+			_age=$(( (_t - PV) / 1000000 ))
+			ul "port $_p: new device attached while the previous enumeration was still pending (${_age}s without result)"
+			[ "$FIRST" -eq 1 ] || reason "replug-pending-$_p"
+		fi
+		pend_set "$_p" "$_t"
+		;;
+	*": New USB device found, "*)
+		pend_del "$_p"
+		case "$_m" in *"idVendor=$VID,"*)
+			port_add "$_p"
+			step "Sony device on $_p: ${_m#*found, } (kmsg t=$_t)"
+			[ "$FIRST" -eq 1 ] || reason "appear-$_p" ;;
+		esac
+		;;
+	*": USB disconnect, device number "*)
+		_had=""; pend_get "$_p" && _had=1
+		pend_del "$_p"
+		if port_has "$_p"; then
+			port_del "$_p"
+			step "Sony device on $_p disconnected (kmsg t=$_t)"
+			# A/B in one boot: after the first drop, the next plug-in of a wired
+			# DualShock 4 probes in minimal mode (no feature or output reports).
+			_mp=/sys/module/hid_sony/parameters/ds4_usb_minimal
+			if [ -z "$OLPC_USBDIAG_TEST" ] && [ -w "$_mp" ] && [ "$(cat "$_mp" 2>/dev/null)" != 1 ]; then
+				echo 1 >"$_mp" 2>/dev/null
+				step "hid_sony.ds4_usb_minimal set to $(cat "$_mp" 2>/dev/null) for the next plug-in"
+			fi
+			[ "$FIRST" -eq 1 ] || reason "disconnect-$_p"
+		elif [ -n "$_had" ]; then
+			ul "port $_p: disconnect while an enumeration was pending"
+		fi
+		;;
+	*"unable to enumerate"*)
+		pend_del "$_p"
+		step "port $_p: unable to enumerate USB device (kmsg t=$_t)"
+		[ "$FIRST" -eq 1 ] || reason "enum-failed-$_p"
+		;;
+	*"device descriptor read"*|*"not accepting address"*|*"can't set config"*|*"connect-debounce"*|*"Cannot enable"*|*"over-current"*|*"over current"*|*"over power budget"*)
+		if pend_get "$_p" || port_has "$_p"; then ul "port $_p: ${_m#*: } (kmsg t=$_t)"; fi
+		case "$_m" in *over-current*|*"over current"*) [ "$FIRST" -eq 1 ] || reason "overcurrent-$_p" ;; esac
+		;;
+	esac
+}
+
+scan_kmsg() {
+	KMSG_OK=0
+	[ -r "$KMSG" ] || return 0
+	KMSG_OK=1
+	# unchanged log file (mtime, no fork) -> skip; a forced scan every 5th poll
+	# covers the coarse FAT timestamps
+	SCANN=$((SCANN + 1))
+	if [ "$FIRST" -eq 0 ] && [ -z "$OLPC_USBDIAG_TEST" ] && [ -e "$MARK" ] &&
+	   [ ! "$KMSG" -nt "$MARK" ] && [ $((SCANN % 5)) -ne 0 ]; then
+		return 0
+	fi
+	: >"$MARK" 2>/dev/null
+	if [ "$FIRST" -eq 1 ]; then _nb=131072; else _nb=24576; fi
+	mkdir -p "${TMPK%/*}" 2>/dev/null
+	tail -c "$_nb" "$KMSG" >"$TMPK" 2>/dev/null
+	while IFS=, read -r _lv _sq _ts _rest; do
+		case "$_lv" in [0-7]) ;; *) continue ;; esac
+		case "$_sq" in ''|*[!0-9]*) continue ;; esac
+		[ "$_sq" -gt "$LASTSEQ" ] || continue
+		LASTSEQ=$_sq
+		_msg=${_rest#*;}
+		case "$_msg" in
+		"usb "[0-9]*": "*)
+			_pn=${_msg#usb }; _pn=${_pn%%:*}
+			ev_usb "$_pn" "$_ts" "$_msg" ;;
+		"usb usb"[0-9]*"-port"[0-9]*": "*)
+			# port messages: "usb usb2-port4: ..." (root) / "usb usb1-1-port2: ..." -> 2-4 / 1-1.2
+			_pn=${_msg#usb usb}; _pn=${_pn%%:*}
+			_ph=${_pn%-port*}; _pi=${_pn##*-port}
+			case "$_ph" in *-*) _pn=$_ph.$_pi ;; *) _pn=$_ph-$_pi ;; esac
+			ev_usb "$_pn" "$_ts" "$_msg" ;;
+		"sony "*|"usbhid "*|"hid-generic "*)
+			if [ "$SONYPORTS" != " " ]; then
+				case "$_msg" in *fail*|*"can't"*|*rror*|*timed*) ul "kmsg: $_msg" ;; esac
+			fi ;;
+		esac
+	done <"$TMPK"
+	rm -f "$TMPK"
+}
+
+check_stuck() {
+	[ -n "$PEND" ] || return 0
+	now_us
+	for _x in $PEND; do
+		_p=${_x%%=*}; _ts=${_x#*=}
+		case " $SENT " in *" $_x "*) continue ;; esac
+		if [ $((NOW_US - _ts)) -ge $((STUCK_S * 1000000)) ]; then
+			SENT="$SENT $_x"
+			step "port $_p: enumeration pending for $(( (NOW_US - _ts) / 1000000 )) s with no result (usb core retrying silently)"
+			reason "stuck-$_p"
+		fi
+	done
+}
+
+# ---- sysfs view of Sony devices (appear fallback + recovery bookkeeping) ------
+
+sysfs_sony() {
+	SONYNOW=""
+	for _fd in "$USBDEV"/*; do
+		_fb=${_fd##*/}
+		case "$_fb" in *:*|usb*) continue ;; esac
+		[ -r "$_fd/idVendor" ] || continue
+		read -r _fv <"$_fd/idVendor"
+		[ "$_fv" = "$VID" ] || continue
+		SONYNOW="$SONYNOW $_fb"
+		san "$_fb"
+		read -r _dn <"$_fd/devnum" 2>/dev/null
+		eval "_old=\$SEEN_$SAN"
+		if [ "$_old" != "$_dn" ]; then
+			eval "SEEN_$SAN=\$_dn"
+			_cs; eval "SINCE_$SAN=\$CS"
+			if ! port_has "$_fb"; then          # kmsg not available / missed
+				port_add "$_fb"
+				step "Sony device $_fb seen in sysfs: $_fv:$(cat "$_fd/idProduct" 2>/dev/null) speed=$(cat "$_fd/speed" 2>/dev/null) bMaxPower=$(cat "$_fd/bMaxPower" 2>/dev/null)"
+				reason "appear-$_fb"
+			fi
+		fi
+	done
+	# without a readable kernel log, a vanished Sony device is only visible here
+	if [ "$KMSG_OK" -eq 0 ]; then
+		for _x in $SONYPORTS; do
+			case " $SONYNOW " in *" $_x "*) ;; *)
+				port_del "$_x"; step "Sony device $_x gone from sysfs"; reason "disconnect-$_x" ;;
+			esac
+		done
+	fi
+}
+
+# ---- recovery (only for a present Sony device that has no input device) --------
+
+select_dev() {
+	DEV=$1
+	BUS=$(cat "$USBDEV/$DEV/busnum" 2>/dev/null)
+	DEVNUM=$(cat "$USBDEV/$DEV/devnum" 2>/dev/null)
+	REAL=$(readlink -f "$USBDEV/$DEV")
+	PARENT=${REAL%/*}
+	PNUM=${DEV##*[-.]}
+	PORTDIR=$PARENT/$(basename "$PARENT")-port$PNUM
+}
+
+hid_intfs() {
+	for _hi in "$USBDEV/$DEV":*; do
+		[ -d "$_hi" ] || continue
+		read -r _hc <"$_hi/bInterfaceClass"
+		[ "$_hc" = 03 ] && echo "${_hi##*/}"
+	done
+}
+
+bind_hid() {
+	for _bi in $(hid_intfs); do
+		if [ -e "$USBDEV/$_bi/driver" ]; then
+			_bd=$(readlink "$USBDEV/$_bi/driver"); _bd=${_bd##*/}
+			ul "$_bi already bound to $_bd: unbind first"
+			bounded 10 sh -c "echo '$_bi' >'$USBDEV/$_bi/driver/unbind'"
+			ul "unbind $_bi rc=$?"
+		fi
+		bounded 35 sh -c "echo '$_bi' >${OLPC_USBDIAG_DRV:-/sys/bus/usb/drivers/usbhid}/bind"
+		ul "usbhid bind $_bi rc=$?"
+	done
+}
+
+act_rebind() { bind_hid; }
+
+act_pm_on() {
+	echo on >"$USBDEV/$DEV/power/control" 2>/dev/null; ul "$DEV power/control=on rc=$?"
+	for _pi in "$USBDEV/$DEV":*; do
+		[ -e "$_pi/power/control" ] || continue
+		echo on >"$_pi/power/control" 2>/dev/null; ul "${_pi##*/} power/control=on rc=$?"
+	done
+	bind_hid
+}
+
+act_authorized() {
+	[ -e "$USBDEV/$DEV/authorized" ] || { ul "no authorized attribute"; return 1; }
+	echo 0 >"$USBDEV/$DEV/authorized" 2>/dev/null; ul "authorized=0 rc=$?"
+	olpc_sleep 1
+	bounded 45 sh -c "echo 1 >'$USBDEV/$DEV/authorized'"
+	ul "authorized=1 rc=$?"
+}
+
+act_config() {
+	_cv=$(cat "$USBDEV/$DEV/bConfigurationValue" 2>/dev/null)
+	[ -n "$_cv" ] && [ "$_cv" != 0 ] || _cv=1
+	echo 0 >"$USBDEV/$DEV/bConfigurationValue" 2>/dev/null; ul "bConfigurationValue=0 rc=$?"
+	olpc_sleep 1
+	bounded 45 sh -c "echo $_cv >'$USBDEV/$DEV/bConfigurationValue'"
+	ul "bConfigurationValue=$_cv rc=$?"
+	for _ci in $(hid_intfs); do
+		[ -e "$USBDEV/$_ci/driver" ] || { ul "$_ci still unbound: bind"; bind_hid; break; }
+	done
+}
+
+bus_shared() {
+	for _bd in "$USBDEV"/*; do
+		_bn=${_bd##*/}
+		case "$_bn" in *:*|usb*|"$DEV") continue ;; esac
+		[ -r "$_bd/busnum" ] || continue
+		read -r _bb <"$_bd/busnum"
+		[ "$_bb" = "$BUS" ] && { echo "$_bn"; return 0; }
+	done
+	return 1
+}
+
+act_port_cycle() {
+	[ -e "$PORTDIR/disable" ] || { ul "port-cycle: $PORTDIR/disable missing"; return 1; }
+	_other=$(bus_shared)
+	if [ -n "$_other" ]; then ul "port-cycle skipped: $_other shares bus $BUS"; return 1; fi
+	ul "port-cycle: power off $PORTDIR"
+	echo 1 >"$PORTDIR/disable" 2>/dev/null; ul "disable=1 rc=$?"
+	olpc_sleep 2
+	echo 0 >"$PORTDIR/disable" 2>/dev/null; ul "disable=0 rc=$?"
+	_cs; _pe=$((CS + 1500))
+	while [ ! -r "$USBDEV/$DEV/idVendor" ]; do
+		_cs; [ "$CS" -ge "$_pe" ] && { ul "port-cycle: $DEV did not come back in 15 s (replug it)"; return 1; }
+		olpc_sleep 0.5
+	done
+	ul "port-cycle: $DEV is back"
+	_cs; _pe=$((CS + 3000))
+	while [ ! -e "$USBDEV/$DEV:1.0/driver" ]; do
+		_cs; [ "$CS" -ge "$_pe" ] && break
+		olpc_sleep 1
+	done
+}
+
+# attempt N LABEL ACTION
+attempt() {
+	_an=$1; _al=$2; _af=$3
+	_cs; _a0=$CS
+	step "attempt $_an ($_al): start"
+	$_af >>"$LOG" 2>&1
+	_arc=$?
+	wait_input 8
+	_ar=$?
+	_cs; _ams=$(( (CS - _a0) * 10 ))
+	if [ $_ar -eq 0 ]; then
+		step "attempt $_an ($_al): SUCCESS in ${_ams} ms"
+		return 0
+	fi
+	step "attempt $_an ($_al): no input device (action rc=$_arc, ${_ams} ms)"
+	return 1
+}
+
+recover_dev() {
+	select_dev "$1"
+	step "recovery for $DEV: no input device ${RECOVER_S}s after it appeared ($(cat "$USBDEV/$DEV/idVendor" 2>/dev/null):$(cat "$USBDEV/$DEV/idProduct" 2>/dev/null) speed=$(cat "$USBDEV/$DEV/speed" 2>/dev/null) bMaxPower=$(cat "$USBDEV/$DEV/bMaxPower" 2>/dev/null))"
+	RESULT=none; n=0
+	for spec in "rebind:act_rebind" "pm-on:act_pm_on" "authorized:act_authorized" "config:act_config" "port-cycle:act_port_cycle"; do
+		n=$((n + 1)); label=${spec%%:*}; fn=${spec#*:}
+		[ -d "$USBDEV/$DEV" ] || { step "$DEV is gone, stopping"; break; }
+		has_input && { RESULT=already-working; break; }
+		if attempt "$n" "$label" "$fn"; then RESULT=$label; break; fi
+	done
+	step "$DEV: recovery result=$RESULT"
+	reason "recovery-$RESULT"
+}
+
+recovery_check() {
+	for _rd in $SONYNOW; do
+		san "$_rd"
+		read -r _dn <"$USBDEV/$_rd/devnum" 2>/dev/null
+		eval "_rec=\$REC_$SAN"
+		[ "$_rec" = "$_dn" ] && continue
+		has_input && continue                    # the pad works: leave it alone
+		eval "_since=\$SINCE_$SAN"
+		_cs
+		[ $((CS - ${_since:-$CS})) -ge $((RECOVER_S * 100)) ] || continue
+		eval "REC_$SAN=\$_dn"
+		recover_dev "$_rd"
+	done
+}
+
+# ---- main ------------------------------------------------------------------------
+
+poll_once() {
+	if playing; then GAME=1; else GAME=0; fi
+	if [ "$GAME" -eq 1 ] && [ "$MON_IN_GAME" != 1 ]; then mon_stop; fi
+	scan_kmsg
+	if [ "$FIRST" -eq 1 ]; then
+		FIRST=0
+		# history seen at start-up: one snapshot if something is already in play
+		if [ "$SONYPORTS" != " " ]; then reason "startup"; fi
+	fi
+	sysfs_sony
+	check_stuck
+	[ -z "$REASONS" ] || do_snapshots
+	if [ "$GAME" -eq 0 ]; then
+		mon_ensure
+		recovery_check
+		[ -z "$REASONS" ] || do_snapshots
+	fi
+}
+
+main() {
+	mkdir -p "$STAGE" 2>/dev/null
+	# one instance
+	_lk=/run/olpcboy/usbdiag.pid
+	if [ -r "$_lk" ]; then read -r _op <"$_lk"; [ -n "$_op" ] && [ -d "/proc/$_op" ] && exit 0; fi
+	echo $$ >"$_lk" 2>/dev/null
+	# existing snapshots of this boot count against the cap (service restarted)
+	for _e in "$OUT"/snap-*; do [ -d "$_e" ] && NSNAP=$((NSNAP + 1)); done
+	dbg_up
+	mon_find_bus
+	while :; do
+		poll_once
+		if [ "$GAME" -eq 1 ]; then olpc_sleep "$POLL_GAME"; else olpc_sleep "$POLL"; fi
+	done
+}
+
+[ -n "$OLPC_USBDIAG_TEST" ] && return 0 2>/dev/null
+
+main

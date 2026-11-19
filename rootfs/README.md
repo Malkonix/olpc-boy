@@ -44,6 +44,36 @@ Behaviour:
   unmute (explicit, not a toggle; the volume level is kept while muted). With all four
   chord keys held nothing happens, and a repeat or a held direction never carries over
   from one chord to the other: the direction has to be pressed again.
+* USB gamepads: every `/dev/input/event*` that is not the built-in keyboard but has
+  EV_KEY `BTN_SELECT` plus at least one of `BTN_TL`/`BTN_TR`/`BTN_TL2`/`BTN_TR2` or an
+  `ABS_Z`/`ABS_RZ` axis is watched too (capabilities are tested, not names, so DS4
+  "Touchpad" and "Motion Sensors" nodes are skipped). A pad lacking some buttons just
+  lacks those chords. Hot-plug uses the same inotify rescan; an unplugged pad (ENODEV)
+  is closed and its repeat stops. Never grabbed. Chords, with the same steps, limits,
+  repeat timing (300 ms, then 150 ms) and log lines as above, the source named at the
+  end of the line (`volume Master 27 -> 28 (max 31), read back 28 [pad: <device name>]`):
+
+  | chord | action |
+  |---|---|
+  | SELECT + L1 | volume up |
+  | SELECT + L2 | volume down |
+  | SELECT + R1 | brightness up |
+  | SELECT + R2 | brightness down |
+
+  The shoulder/trigger has to be pressed **after** SELECT (one already held when SELECT
+  goes down, or SELECT re-pressed over a held one, does nothing). If a volume and a
+  brightness button are both held, nothing happens and the repeat stops. START
+  (`BTN_START`) is ignored: SELECT+START is the emulator's quit chord, and a held START
+  never blocks these. State is per device. Pad chords do **not** set
+  `/run/olpcboy/chord` (no D-pad is involved); only the built-in chords do.
+* Analog trigger rule: L2/R2 count as pressed when the key (`BTN_TL2`/`BTN_TR2`) is
+  down **or** the axis (`ABS_Z`/`ABS_RZ`, range read per device with `EVIOCGABS`, so a
+  non-zero rest value or a signed range works) is above `min + range/3`; it counts as
+  released only below `min + range/5` (hysteresis, so a noisy axis does not chatter).
+  Only transitions act; axis events that do not cross a threshold are ignored. A pad
+  that reports both key and axis (DualShock 4) gives one step per press, not two.
+  Xbox 360 pads (xpad) report L2/R2 as analog only. Pads exposing none of these codes
+  (e.g. only `BTN_BASE..`) are not supported.
 * Volume goes through raw ALSA control ioctls on `/dev/snd/controlC0` (no alsa-lib, no
   fork/exec; the control device is opened once per action). Element lookup is by name:
   `Master Playback Volume` first, then `PCM Playback Volume`; mute uses the matching
@@ -78,7 +108,9 @@ backend is never exercised by the test, and in `--test` mode it is pointed at a
 non-existent path unless `CHORDD_SND_CTL` is set).
 
 Tests without hardware: `make chordd-test` (or `sh src/olpc-chordd/test.sh` anywhere
-with gcc). `olpc-chordd --test` replays text events from stdin (`<ms> <KEY> <0|1|2>`),
+with gcc). `olpc-chordd --test` replays text events from stdin (`<ms> <KEY> <0|1|2>`;
+pad: keys `SELECT START L1 R1 L2 R2`, `<ms> ABS_Z|ABS_RZ <value>`, a `PAD <min> <max>` line sets the
+trigger range, `<ms> UNPLUG 1` removes the pad),
 `--replay` replays raw 16-byte i386 `input_event` records (the struct is declared with
 fixed widths, so a 64-bit build reads the same bytes); sysfs paths point at a temp
 dir, and the repeat timer runs on a virtual clock taken from the event stream.

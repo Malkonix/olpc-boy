@@ -113,6 +113,10 @@ static void console_redraw(void)
 	struct vt_stat st;
 
 	console_text();
+	/* Started from a program that owns the screen (the launcher keeps the VT in
+	 * KD_GRAPHICS): there is no text to repaint, and bouncing VTs would let
+	 * fbcon touch the display behind the caller's back. */
+	if (g_kd_saved == KD_GRAPHICS) return;
 	if (g_tty >= 0 && ioctl(g_tty, VT_GETSTATE, &st) == 0 && st.v_active >= 1 && st.v_active < 63) {
 		int cur = st.v_active, other = cur == 1 ? 2 : 1;
 		if (ioctl(g_tty, VT_ACTIVATE, other) == 0) ioctl(g_tty, VT_WAITACTIVE, other);

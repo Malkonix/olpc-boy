@@ -26,12 +26,16 @@
 \   consoleblank=0                : the screen must never blank or power down
 \ (no ramoops/memmap reservation: safe RAM addresses beside Open Firmware's own
 \  top-of-memory area on the 256 MB XO-1 could not be verified)
+\   usbcore.autosuspend=-1        : never autosuspend a USB device (the default here is
+\                                   2 s): removes runtime suspend/resume of the Sony
+\                                   game pad and of the boot stick as a variable; costs
+\                                   a little power, nothing else
 \   i8042.dumbkbd=1               : the keyboard module of this unit is unplugged,
 \                                   so atkbd's probe gets no answer and no input
 \                                   device appears; this makes atkbd bind without
 \                                   probing, so D-pad / game-key scancodes sent by
 \                                   the EC are delivered
-" console=tty0 fbcon=font:TER16x32 loglevel=4 printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1 vt.global_cursor_default=0 consoleblank=0 i8042.dumbkbd=1" to boot-file
+" console=tty0 fbcon=font:TER16x32 loglevel=4 printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1 vt.global_cursor_default=0 consoleblank=0 usbcore.autosuspend=-1 i8042.dumbkbd=1" to boot-file
 
 \ Load the kernel from boot-device with boot-file as its command line and run it
 boot

@@ -1,0 +1,125 @@
+From: olpc-boy
+Subject: HID: sony: do not fail a wired DualShock 4 when its feature reports time out
+
+On a wired DualShock 4, sony_input_configured() reads three feature reports
+(0x81 MAC in sony_check_add(), 0x02 calibration, 0xA3 version) and aborts the
+probe when any of them fails, so no input device is created at all.  They are
+only needed for the duplicate-connection check, the motion-sensor scaling and
+two sysfs attributes; buttons, D-pad and touchpad need none of them.  Every
+failed read also costs a 5 s control timeout (USB_CTRL_GET_TIMEOUT).
+
+For DUALSHOCK4_CONTROLLER_USB only: a failing 0x81 read is a warning, the
+other two reads are then skipped (one 5 s wait instead of three), a failing
+0x02 or 0xA3 read is a warning, and the motion calibration table is filled
+with an identity transform so that dualshock4_parse_report() (which scales
+every sample and always uses sensor_dev) neither divides by zero nor sees a
+missing device.  Bluetooth and the dongle keep the strict behaviour.
+
+This does not help when the failure is earlier, in usbhid_parse() fetching
+the report descriptor: see kernel/README.md.
+
+---
+--- a/drivers/hid/hid-sony.c
++++ b/drivers/hid/hid-sony.c
+@@ -581,6 +581,8 @@
+ 	bool fw_version_created;
+ 	unsigned hw_version;
+ 	bool hw_version_created;
++	/* DS4 over USB: the 0x81/0x02/0xA3 feature reports failed (timeout) */
++	bool ds4_features_failed;
+ 	u8 *output_report_dmabuf;
+ 
+ #ifdef CONFIG_SONY_FF
+@@ -1863,6 +1865,24 @@
+ 	return ret;
+ }
+ 
++/*
++ * Identity calibration: dualshock4_parse_report() scales every sample with
++ * ds4_calib_data[] and must never divide by zero.  Used when the calibration
++ * feature report could not be read (the motion values are then raw).
++ */
++static void dualshock4_default_calibration(struct sony_sc *sc)
++{
++	static const int codes[6] = { ABS_RX, ABS_RY, ABS_RZ, ABS_X, ABS_Y, ABS_Z };
++	int n;
++
++	for (n = 0; n < 6; n++) {
++		sc->ds4_calib_data[n].abs_code = codes[n];
++		sc->ds4_calib_data[n].bias = 0;
++		sc->ds4_calib_data[n].sens_numer = 1;
++		sc->ds4_calib_data[n].sens_denom = 1;
++	}
++}
++
+ static void dualshock4_calibration_work(struct work_struct *work)
+ {
+ 	struct sony_sc *sc = container_of(work, struct sony_sc, hotplug_worker);
+@@ -2624,8 +2644,21 @@
+ 				HID_REQ_GET_REPORT);
+ 
+ 		if (ret != DS4_FEATURE_REPORT_0x81_SIZE) {
+-			hid_err(sc->hdev, "failed to retrieve feature report 0x81 with the DualShock 4 MAC address\n");
+ 			ret = ret < 0 ? ret : -EINVAL;
++			/*
++			 * The MAC only feeds the duplicate-connection check and
++			 * the uniq string.  A wired DS4 that does not answer
++			 * feature reports (each try costs a 5 s control
++			 * timeout) must still give buttons and D-pad: go on
++			 * without the MAC and skip the other two feature reads.
++			 */
++			if (sc->quirks & DUALSHOCK4_CONTROLLER_USB) {
++				hid_warn(sc->hdev, "feature report 0x81 (MAC) failed: %d, continuing without MAC, calibration and version info\n", ret);
++				sc->ds4_features_failed = true;
++				ret = 0;
++				goto out_free;
++			}
++			hid_err(sc->hdev, "failed to retrieve feature report 0x81 with the DualShock 4 MAC address\n");
+ 			goto out_free;
+ 		}
+ 
+@@ -2852,16 +2885,35 @@
+ 
+ 		sony_init_output_report(sc, sixaxis_send_output_report);
+ 	} else if (sc->quirks & DUALSHOCK4_CONTROLLER) {
+-		ret = dualshock4_get_calibration_data(sc);
+-		if (ret < 0) {
+-			hid_err(hdev, "Failed to get calibration data from Dualshock 4\n");
+-			goto err_stop;
++		/*
++		 * Wired DS4: calibration and version data are only needed for
++		 * the motion sensors and two sysfs files.  When the device does
++		 * not answer feature reports keep the pad working (buttons,
++		 * D-pad, touchpad) with identity calibration.  Bluetooth and
++		 * the dongle keep the original strict behaviour.
++		 */
++		if (!sc->ds4_features_failed) {
++			ret = dualshock4_get_calibration_data(sc);
++			if (ret < 0) {
++				if (!(sc->quirks & DUALSHOCK4_CONTROLLER_USB)) {
++					hid_err(hdev, "Failed to get calibration data from Dualshock 4\n");
++					goto err_stop;
++				}
++				hid_warn(hdev, "Failed to get calibration data from Dualshock 4 (%d), motion data is uncalibrated\n", ret);
++				sc->ds4_features_failed = true;
++			}
+ 		}
+-
+-		ret = dualshock4_get_version_info(sc);
+-		if (ret < 0) {
+-			hid_err(sc->hdev, "Failed to get version data from Dualshock 4\n");
+-			goto err_stop;
++		if (sc->ds4_features_failed) {
++			dualshock4_default_calibration(sc);
++		} else {
++			ret = dualshock4_get_version_info(sc);
++			if (ret < 0) {
++				if (!(sc->quirks & DUALSHOCK4_CONTROLLER_USB)) {
++					hid_err(sc->hdev, "Failed to get version data from Dualshock 4\n");
++					goto err_stop;
++				}
++				hid_warn(sc->hdev, "Failed to get version data from Dualshock 4 (%d)\n", ret);
++			}
+ 		}
+ 
+ 		ret = device_create_file(&sc->hdev->dev, &dev_attr_firmware_version);

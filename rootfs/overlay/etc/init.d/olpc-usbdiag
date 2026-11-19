@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# USB game pad watcher: usbmon ring of the OHCI bus + kernel-log events,
+# snapshots on Sony appear/disconnect and on a port stuck in enumeration,
+# recovery attempts for a Sony pad that has no input device.  One small
+# background loop (nice 19); writes nothing while there is nothing to report.
+
+description="olpc-boy: watch USB game pads (usbmon ring, snapshots, recovery)"
+
+depend() {
+	need olpclog
+	after olpc-bootdone
+}
+
+start() {
+	ebegin "Starting the USB game pad watcher"
+	setsid nice -n 19 /usr/local/sbin/olpc-usbdiag </dev/null >/dev/null 2>&1 &
+	eend 0
+}

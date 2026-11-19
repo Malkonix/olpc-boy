@@ -7,6 +7,14 @@
  *                         LEFT = mute, RIGHT = unmute.
  *   All four held: nothing.
  *
+ * USB gamepads (EV_KEY with BTN_SELECT and a shoulder/trigger) add, with the
+ * same steps, limits and repeat:
+ *   SELECT + L1 = volume up      SELECT + L2 = volume down
+ *   SELECT + R1 = brightness up  SELECT + R2 = brightness down
+ * L2/R2 count as pressed when their key (BTN_TL2/BTN_TR2) is down or their
+ * analog axis (ABS_Z/ABS_RZ) is above 1/3 of its range (released below 1/5).
+ * Pad chords never touch the chord flag file (no D-pad is involved).
+ *
  * Observes every /dev/input/event* that offers those keys (never EVIOCGRAB),
  * sleeps in poll() and only wakes for input, for inotify on /dev/input, and
  * for the repeat timer while UP/DOWN is held inside a chord.
@@ -47,6 +55,12 @@
 #define K_DOWN   108
 #define K_PAGEDN 109
 #define K_ROTATE 153
+#define BTN_SEL  0x13a	/* BTN_SELECT */
+#define BTN_STA  0x13b	/* BTN_START: deliberately not part of any pad chord */
+#define BTN_L1   0x136	/* BTN_TL  */
+#define BTN_R1   0x137	/* BTN_TR  */
+#define BTN_L2   0x138	/* BTN_TL2 */
+#define BTN_R2   0x139	/* BTN_TR2 */
 
 #define REPEAT_FIRST_MS 300	/* delay before the first auto-repeat step */
 #define REPEAT_MS       150	/* auto-repeat period */
@@ -58,6 +72,11 @@ enum { B_CIRCLE = 1, B_CHECK = 2, B_UP = 4, B_DOWN = 8, B_LEFT = 16, B_RIGHT = 3
 #define B_BRIGHT (B_CIRCLE | B_CHECK)
 #define B_VOL    (B_SQUARE | B_CROSS)
 #define B_DPAD (B_UP | B_DOWN | B_LEFT | B_RIGHT)
+
+/* gamepad pressed-button bitmask (per device) */
+enum { P_SEL = 1, P_L1 = 2, P_L2 = 4, P_R1 = 8, P_R2 = 16 };
+#define P_VOL    (P_L1 | P_L2)
+#define P_BRIGHT (P_R1 | P_R2)
 
 static int keybit(int code)
 {
@@ -80,6 +99,7 @@ struct ev16 { uint32_t sec, usec; uint16_t type, code; int32_t value; };
 /* ---- configuration (environment overrides) ----------------------------- */
 static const char *p_input, *p_bl_glob, *p_mono, *p_state, *p_timeline, *p_snd, *p_fake;
 static int test_mode;
+static const char *log_src;	/* "pad: <name>" while a gamepad chord acts, else NULL */
 
 static const char *envp(const char *n, const char *def)
 {
@@ -99,6 +119,10 @@ static void logf_(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(msg, sizeof msg, fmt, ap);
 	va_end(ap);
+	if (log_src) {
+		size_t l = strlen(msg);
+		snprintf(msg + l, sizeof msg - l, " [%s]", log_src);
+	}
 	fprintf(stderr, "olpc-chordd: %s\n", msg);
 	if (test_mode && !getenv("CHORDD_TIMELINE"))
 		return;
@@ -446,6 +470,9 @@ static int state_fd = -1;
 static int rep_dir;		/* +1 / -1 while UP / DOWN auto-repeats, else 0 */
 static int rep_kind;		/* chord (B_BRIGHT / B_VOL) the repeat belongs to */
 static long rep_due;		/* ms timestamp of the next auto-repeat step */
+static unsigned rep_pad;	/* id of the gamepad owning the repeat, 0 = built-in buttons */
+static int rep_bit;		/* pad button (P_*) that drives a pad repeat */
+static char rep_tag[96];	/* log source of a pad repeat */
 
 /* Active chord: B_BRIGHT or B_VOL; 0 for none, and 0 when all four keys are held. */
 static int chord_kind(void)
@@ -487,18 +514,18 @@ static void on_change(int before, long now)
 
 	if (kind == B_BRIGHT) {
 		/* Directions act only when pressed while the chord is already held. */
-		if (pressed & B_UP)    { do_brightness(+1, 1); rep_dir = +1; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
-		if (pressed & B_DOWN)  { do_brightness(-1, 1); rep_dir = -1; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
+		if (pressed & B_UP)    { do_brightness(+1, 1); rep_dir = +1; rep_pad = 0; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
+		if (pressed & B_DOWN)  { do_brightness(-1, 1); rep_dir = -1; rep_pad = 0; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
 		if (pressed & B_RIGHT) do_mono(0);
 		if (pressed & B_LEFT)  do_mono(1);
 	} else if (kind == B_VOL) {
-		if ((pressed & B_UP) && do_volume(+1, 1) == 0)   { rep_dir = +1; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
-		if ((pressed & B_DOWN) && do_volume(-1, 1) == 0) { rep_dir = -1; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
+		if ((pressed & B_UP) && do_volume(+1, 1) == 0)   { rep_dir = +1; rep_pad = 0; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
+		if ((pressed & B_DOWN) && do_volume(-1, 1) == 0) { rep_dir = -1; rep_pad = 0; rep_kind = kind; rep_due = now + REPEAT_FIRST_MS; }
 		if (pressed & B_RIGHT) do_mute(0);
 		if (pressed & B_LEFT)  do_mute(1);
 	}
 	/* a repeat dies with its chord (also on a direct switch to the other chord) */
-	if (rep_dir && (kind != rep_kind ||
+	if (rep_dir && !rep_pad && (kind != rep_kind ||
 	    (rep_dir > 0 ? (released & B_UP) : (released & B_DOWN))))
 		rep_dir = 0;
 	export_state();
@@ -507,16 +534,25 @@ static void on_change(int before, long now)
 static void tick(long now)
 {
 	if (rep_dir && now >= rep_due) {
-		if (rep_kind == B_VOL) { if (do_volume(rep_dir, 0) < 0) { rep_dir = 0; return; } }
+		log_src = rep_pad ? rep_tag : NULL;
+		if (rep_kind == B_VOL) { if (do_volume(rep_dir, 0) < 0) { rep_dir = 0; log_src = NULL; return; } }
 		else do_brightness(rep_dir, 0);
+		log_src = NULL;
 		rep_due += REPEAT_MS;
 		if (rep_due <= now) rep_due = now + REPEAT_MS;	/* we were late: no burst */
 	}
 }
 
 /* ---- devices -------------------------------------------------------------------- */
-static struct dev { int fd; int held; char path[64]; } devs[MAXDEV];
+static struct dev {
+	int fd; int held; char path[64];
+	/* gamepad part (pad != 0): held buttons by key / by analog axis */
+	int pad; unsigned id; int pkey, paxis; int abs_ok;	/* abs_ok: bit0 ABS_Z, bit1 ABS_RZ usable */
+	long a_on[2], a_off[2];	/* press / release thresholds for ABS_Z, ABS_RZ */
+	char tag[96];
+} devs[MAXDEV];
 static int ndev;
+static unsigned next_id = 1;
 
 static long mono_ms(void)
 {
@@ -546,10 +582,85 @@ static void dev_key(int i, int code, int value, long now)
 	on_change(before, now);
 }
 
+/* ---- gamepad chords ---------------------------------------------------------- */
+static int padbit(int code)
+{
+	switch (code) {
+	case BTN_SEL: return P_SEL;
+	case BTN_L1:  return P_L1;
+	case BTN_L2:  return P_L2;
+	case BTN_R1:  return P_R1;
+	case BTN_R2:  return P_R2;
+	}
+	return 0;	/* includes BTN_START: it neither acts nor blocks */
+}
+
+/* Press above 1/3 of the range, release below 1/5 (integer maths; min may be non-zero). */
+static void pad_set_axis(struct dev *d, int ax, long min, long max)
+{
+	long range = max - min;
+
+	if (range < 5) { d->abs_ok &= ~(1 << ax); return; }
+	d->a_on[ax] = min + range / 3;
+	d->a_off[ax] = min + range / 5;
+	d->abs_ok |= 1 << ax;
+}
+
+static void pad_start_rep(struct dev *d, int dir, int kind, int bit, long now)
+{
+	rep_dir = dir; rep_kind = kind; rep_pad = d->id; rep_bit = bit;
+	snprintf(rep_tag, sizeof rep_tag, "%s", d->tag);
+	rep_due = now + REPEAT_FIRST_MS;
+}
+
+static void pad_update(struct dev *d, int before, long now)
+{
+	int cur = d->pkey | d->paxis, pressed = cur & ~before, bit;
+	int both = (cur & P_VOL) && (cur & P_BRIGHT);
+
+	/* the repeat dies with its button, with SELECT, or when both groups are held */
+	if (rep_dir && rep_pad == d->id && (!(cur & rep_bit) || !(cur & P_SEL) || both))
+		rep_dir = 0;
+	if (!(cur & P_SEL) || both) return;
+	for (bit = P_L1; bit <= P_R2; bit <<= 1) {
+		int dir = (bit & (P_L1 | P_R1)) ? +1 : -1, kind = (bit & P_VOL) ? B_VOL : B_BRIGHT;
+
+		if (!(pressed & bit)) continue;
+		log_src = d->tag;
+		if (kind == B_VOL) {
+			if (do_volume(dir, 1) == 0) pad_start_rep(d, dir, kind, bit, now);
+		} else {
+			do_brightness(dir, 1);
+			pad_start_rep(d, dir, kind, bit, now);
+		}
+		log_src = NULL;
+	}
+}
+
+static void pad_event(struct dev *d, int type, int code, int value, long now)
+{
+	int before = d->pkey | d->paxis, b;
+
+	if (type == EV_KEY) {
+		if (!(b = padbit(code)) || value > 1) return;
+		if (value) d->pkey |= b; else d->pkey &= ~b;
+	} else if (type == EV_ABS) {
+		int ax = code == ABS_Z ? 0 : code == ABS_RZ ? 1 : -1;
+
+		if (ax < 0 || !(d->abs_ok & (1 << ax))) return;
+		b = ax ? P_R2 : P_L2;
+		if (d->paxis & b) { if (value < d->a_off[ax]) d->paxis &= ~b; }
+		else if (value > d->a_on[ax]) d->paxis |= b;
+	} else
+		return;
+	if ((d->pkey | d->paxis) != before) pad_update(d, before, now);
+}
+
 static void dev_close(int i, long now)
 {
 	int before = held;
 
+	if (devs[i].pad && rep_pad == devs[i].id) rep_dir = 0;
 	close(devs[i].fd);
 	devs[i] = devs[--ndev];
 	held = all_held();
@@ -570,16 +681,53 @@ static void scan(long now)
 		fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 		if (fd < 0) continue;
 		memset(keys, 0, sizeof keys);
-		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys) < 0 ||
-		    !testbit(keys, K_PAGEUP) || !testbit(keys, K_END) ||
-		    !testbit(keys, K_UP) || !testbit(keys, K_DOWN) ||
-		    !testbit(keys, K_LEFT) || !testbit(keys, K_RIGHT)) {
-			close(fd);
+		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys) < 0) { close(fd); continue; }
+		memset(&devs[ndev], 0, sizeof devs[ndev]);
+		if (!(testbit(keys, K_PAGEUP) && testbit(keys, K_END) &&
+		      testbit(keys, K_UP) && testbit(keys, K_DOWN) &&
+		      testbit(keys, K_LEFT) && testbit(keys, K_RIGHT))) {
+			/* not the built-in buttons: a gamepad needs SELECT and a shoulder/trigger */
+			unsigned long abits[(ABS_MAX + LONGBITS) / LONGBITS];
+			struct input_absinfo ai;
+			struct dev *d = &devs[ndev];
+			int ax, tr;
+
+			memset(abits, 0, sizeof abits);
+			ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abits), abits);
+			for (ax = 0; ax < 2; ax++) {
+				if (!testbit(abits, ax ? ABS_RZ : ABS_Z)) continue;
+				if (ioctl(fd, EVIOCGABS(ax ? ABS_RZ : ABS_Z), &ai) == 0)
+					pad_set_axis(d, ax, ai.minimum, ai.maximum);
+			}
+			tr = testbit(keys, BTN_L1) || testbit(keys, BTN_R1) ||
+			     testbit(keys, BTN_L2) || testbit(keys, BTN_R2) || d->abs_ok;
+			if (!testbit(keys, BTN_SEL) || !tr) { close(fd); continue; }
+			d->pad = 1;
+			d->id = next_id++;
+			/* start from the real state: anything already held is not a new press */
+			memset(keys, 0, sizeof keys);
+			if (ioctl(fd, EVIOCGKEY(sizeof keys), keys) >= 0) {
+				static const int codes[] = { BTN_SEL, BTN_L1, BTN_L2, BTN_R1, BTN_R2 };
+				for (i = 0; i < 5; i++)
+					if (testbit(keys, codes[i])) d->pkey |= padbit(codes[i]);
+			}
+			for (ax = 0; ax < 2; ax++)
+				if ((d->abs_ok & (1 << ax)) &&
+				    ioctl(fd, EVIOCGABS(ax ? ABS_RZ : ABS_Z), &ai) == 0 &&
+				    ai.value > d->a_on[ax])
+					d->paxis |= ax ? P_R2 : P_L2;
+			strcpy(name, "?");
+			ioctl(fd, EVIOCGNAME(sizeof name), name);
+			snprintf(d->tag, sizeof d->tag, "pad: %.80s", name);
+			strcpy(d->path, path);
+			d->fd = fd;
+			logf_("watching %s (%s) as gamepad%s%s", path, name,
+			      d->abs_ok & 1 ? ", analog L2" : "", d->abs_ok & 2 ? ", analog R2" : "");
+			ndev++;
 			continue;
 		}
 		strcpy(devs[ndev].path, path);
 		devs[ndev].fd = fd;
-		devs[ndev].held = 0;
 		/* start from the real key state (a key may already be down) */
 		memset(keys, 0, sizeof keys);
 		if (ioctl(fd, EVIOCGKEY(sizeof keys), keys) >= 0) {
@@ -597,6 +745,12 @@ static void scan(long now)
 }
 
 
+static void dev_event(int i, int type, int code, int value, long now)
+{
+	if (devs[i].pad) pad_event(&devs[i], type, code, value, now);
+	else if (type == EV_KEY) dev_key(i, code, value, now);
+}
+
 /* ---- test / replay ------------------------------------------------------------------ */
 static int name_to_code(const char *s)
 {
@@ -604,6 +758,8 @@ static int name_to_code(const char *s)
 		{"UP", K_UP}, {"DOWN", K_DOWN}, {"LEFT", K_LEFT}, {"RIGHT", K_RIGHT},
 		{"CIRCLE", K_PAGEUP}, {"CHECK", K_END}, {"CROSS", K_PAGEDN},
 		{"SQUARE", K_HOME}, {"ROTATE", K_ROTATE},
+		{"SELECT", BTN_SEL}, {"START", BTN_STA}, {"L1", BTN_L1}, {"R1", BTN_R1},
+		{"L2", BTN_L2}, {"R2", BTN_R2},
 	};
 	size_t i;
 	for (i = 0; i < sizeof t / sizeof *t; i++)
@@ -619,19 +775,40 @@ static int name_to_code(const char *s)
  */
 static int replay(FILE *in, int text)
 {
-	ndev = 1;		/* devs[0] is the pseudo device */
 	long now = 0, end = 0;
 	char line[128], nm[32];
+	long amin = 0, amax = 255;
+	int ax;
+
+	/* devs[0] = built-in buttons, devs[1] = pseudo gamepad (range: "PAD <min> <max>") */
+	ndev = 2;
+	devs[0].fd = devs[1].fd = -1;
+	devs[1].pad = 1;
+	devs[1].id = next_id++;
+	snprintf(devs[1].tag, sizeof devs[1].tag, "pad: Test Pad");
+	for (ax = 0; ax < 2; ax++) pad_set_axis(&devs[1], ax, amin, amax);
 
 	for (;;) {
 		long t;
-		int code, val;
+		int code, type = EV_KEY, val, unplug = 0;
 
 		if (text) {
-			unsigned v;
+			int v;
 			if (!fgets(line, sizeof line, in)) break;
 			if (line[0] == '#' || line[0] == '\n') continue;
-			if (sscanf(line, "%ld %31s %u", &t, nm, &v) != 3 || (code = name_to_code(nm)) < 0) {
+			if (sscanf(line, "PAD %ld %ld", &amin, &amax) == 2) {
+				for (ax = 0; ax < 2; ax++) pad_set_axis(&devs[1], ax, amin, amax);
+				continue;
+			}
+			if (sscanf(line, "%ld %31s %d", &t, nm, &v) != 3) {
+				fprintf(stderr, "bad line: %s", line);
+				return 2;
+			}
+			if (!strcmp(nm, "ABS_Z") || !strcmp(nm, "ABS_RZ")) {
+				type = EV_ABS; code = nm[5] ? ABS_RZ : ABS_Z;
+			} else if (!strcmp(nm, "UNPLUG")) {
+				unplug = 1; code = 0;
+			} else if ((code = name_to_code(nm)) < 0) {
 				fprintf(stderr, "bad line: %s", line);
 				return 2;
 			}
@@ -639,14 +816,22 @@ static int replay(FILE *in, int text)
 		} else {
 			struct ev16 e;
 			if (fread(&e, sizeof e, 1, in) != 1) break;
-			if (e.type != EV_KEY) continue;
+			if (e.type != EV_KEY && e.type != EV_ABS) continue;
 			t = (long)e.sec * 1000 + e.usec / 1000;
-			code = e.code; val = e.value;
+			type = e.type; code = e.code; val = e.value;
 		}
 		while (rep_dir && rep_due <= t) { now = rep_due; tick(now); }
 		now = t;
-		fprintf(stderr, "[%6ld ms] key %d value %d\n", t, code, val);
-		dev_key(0, code, val, now);
+		if (unplug) {
+			fprintf(stderr, "[%6ld ms] pad unplugged\n", t);
+			if (ndev > 1) { logf_("pad gone"); dev_close(1, now); }
+			continue;
+		}
+		fprintf(stderr, "[%6ld ms] %s %d value %d\n", t, type == EV_ABS ? "abs" : "key", code, val);
+		if (type == EV_ABS || padbit(code) || code == BTN_STA) {
+			if (ndev > 1) dev_event(1, type, code, val, now);
+		} else
+			dev_event(0, type, code, val, now);
 	}
 	end = now + atol(envp("CHORDD_TAIL_MS", "0"));
 	while (rep_dir && rep_due <= end) { now = rep_due; tick(now); }
@@ -658,7 +843,9 @@ static void usage(void)
 {
 	fputs("usage: olpc-chordd                run the daemon\n"
 	      "       olpc-chordd --test        replay text events from stdin\n"
-	      "                                 (\"<ms> <UP|DOWN|LEFT|RIGHT|CIRCLE|CHECK|...> <0|1|2>\")\n"
+	      "                                 (\"<ms> <UP|DOWN|LEFT|RIGHT|CIRCLE|CHECK|...> <0|1|2>\";\n"
+	      "                                 pad: SELECT START L1 R1 L2 R2, \"<ms> ABS_Z|ABS_RZ <value>\",\n"
+	      "                                 \"PAD <min> <max>\" sets the trigger range, \"<ms> UNPLUG 1\")\n"
 	      "       olpc-chordd --replay      replay raw 16-byte input_event records from stdin\n"
 	      "environment: CHORDD_INPUT_DIR (/dev/input), CHORDD_BACKLIGHT_GLOB (/sys/class/backlight/*),\n"
 	      "  CHORDD_MONO (/sys/devices/platform/dcon/monochrome), CHORDD_STATE (/run/olpcboy/chord),\n"
@@ -758,7 +945,8 @@ int main(int argc, char **argv)
 				continue;
 			}
 			for (k = 0; k < r / (int)sizeof e[0]; k++)
-				if (e[k].type == EV_KEY) dev_key(i, e[k].code, e[k].value, now);
+				if (e[k].type == EV_KEY || e[k].type == EV_ABS)
+					dev_event(i, e[k].type, e[k].code, e[k].value, now);
 		}
 		if (ino_fd >= 0 && (pfd[nd].revents & POLLIN)) {
 			char buf[512];

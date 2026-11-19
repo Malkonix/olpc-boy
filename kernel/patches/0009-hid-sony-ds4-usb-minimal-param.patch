@@ -1,0 +1,157 @@
+From: olpc-boy
+Subject: HID: sony: hid_sony.ds4_usb_minimal, input-only bring-up of a wired DualShock 4
+
+Applies on top of 0008.  New boolean module parameter (default 0: behaviour
+unchanged).  For a wired DualShock 4 (DUALSHOCK4_CONTROLLER_USB) only, when
+set, sony_probe()/sony_input_configured() do:
+
+  * no feature report at all (0x81 MAC, 0x02 calibration, 0xA3 version), no
+    duplicate-connection check, no firmware/hardware_version attributes;
+  * no output report, ever: sony_init_output_report() is not called, so
+    state_worker_initialized stays 0 and sony_schedule_work() is a no-op; no
+    sony_leds_init() (the light bar is not switched on by the driver), no
+    rumble, no sony_init_ff();
+  * no battery power_supply and no hid_hw_open() at probe: the interrupt IN
+    pipe is only polled while the input or hidraw node is open;
+  * no touchpad and no motion-sensor input device; dualshock4_parse_report()
+    skips the corresponding data when those devices do not exist.
+The main "Wireless Controller" input device (buttons, sticks, triggers, D-pad)
+and hidraw are created as before.
+
+Built in, the parameter is spelled  hid_sony.ds4_usb_minimal=1  on the kernel
+command line, and is also writable at run time (read at probe, i.e. applies to
+the next plug-in) via /sys/module/hid_sony/parameters/ds4_usb_minimal.
+
+---
+--- a/drivers/hid/hid-sony.c
++++ b/drivers/hid/hid-sony.c
+@@ -44,6 +44,20 @@
+ 
+ #include "hid-ids.h"
+ 
++/*
++ * Wired DualShock 4 only: bring up the input device and nothing else.  No
++ * feature report (MAC, calibration, version), no output report (light bar,
++ * LEDs, rumble), no LED/battery class devices, no touchpad / motion sensor
++ * input devices, and the interrupt IN pipe is only polled while somebody
++ * has the input or hidraw node open.  For bring-up of pads that drop off
++ * the bus right after probing.  Built in: hid_sony.ds4_usb_minimal=1 on the
++ * kernel command line, or /sys/module/hid_sony/parameters/ds4_usb_minimal
++ * (read at probe time, so it applies to the next plug-in).
++ */
++static bool ds4_usb_minimal;
++module_param(ds4_usb_minimal, bool, 0644);
++MODULE_PARM_DESC(ds4_usb_minimal, "Wired DualShock 4: input only, no feature/output reports, LEDs, battery, touchpad or motion sensors");
++
+ #define VAIO_RDESC_CONSTANT       BIT(0)
+ #define SIXAXIS_CONTROLLER_USB    BIT(1)
+ #define SIXAXIS_CONTROLLER_BT     BIT(2)
+@@ -583,6 +597,8 @@
+ 	bool hw_version_created;
+ 	/* DS4 over USB: the 0x81/0x02/0xA3 feature reports failed (timeout) */
+ 	bool ds4_features_failed;
++	/* wired DS4 with hid_sony.ds4_usb_minimal=1: input only */
++	bool ds4_minimal;
+ 	u8 *output_report_dmabuf;
+ 
+ #ifdef CONFIG_SONY_FF
+@@ -1105,6 +1121,10 @@
+ 		input_sync(input_dev);
+ 	}
+ 
++	/* ds4_usb_minimal registers no motion sensor device */
++	if (!sc->sensor_dev)
++		goto battery;
++
+ 	/* Convert timestamp (in 5.33us unit) to timestamp_us */
+ 	offset = data_offset + DS4_INPUT_REPORT_TIMESTAMP_OFFSET;
+ 	timestamp = get_unaligned_le16(&rd[offset]);
+@@ -1143,6 +1163,7 @@
+ 	}
+ 	input_sync(sc->sensor_dev);
+ 
++battery:
+ 	/*
+ 	 * The lower 4 bits of byte 30 (or 32 for BT) contain the battery level
+ 	 * and the 5th bit contains the USB cable state.
+@@ -1197,6 +1218,10 @@
+ 	sc->battery_status = battery_status;
+ 	spin_unlock_irqrestore(&sc->lock, flags);
+ 
++	/* ds4_usb_minimal registers no touchpad device */
++	if (!sc->touchpad)
++		return;
++
+ 	/*
+ 	 * The Dualshock 4 multi-touch trackpad data starts at offset 33 on USB
+ 	 * and 35 on Bluetooth.
+@@ -2615,6 +2640,10 @@
+ 	u8 *buf = NULL;
+ 	int n, ret;
+ 
++	/* no feature report (MAC) and no duplicate-connection check */
++	if (sc->ds4_minimal)
++		return 0;
++
+ 	if ((sc->quirks & DUALSHOCK4_CONTROLLER_BT) ||
+ 	    (sc->quirks & MOTION_CONTROLLER_BT) ||
+ 	    (sc->quirks & NAVIGATION_CONTROLLER_BT) ||
+@@ -2884,6 +2913,14 @@
+ 		}
+ 
+ 		sony_init_output_report(sc, sixaxis_send_output_report);
++	} else if (sc->ds4_minimal) {
++		/*
++		 * ds4_usb_minimal: no calibration/version feature reports, no
++		 * sysfs attributes, no touchpad or sensor device, no output
++		 * report worker (sony_schedule_work() is then a no-op).
++		 */
++		hid_info(hdev, "ds4_usb_minimal: input only, no output or feature reports\n");
++		ret = 0;
+ 	} else if (sc->quirks & DUALSHOCK4_CONTROLLER) {
+ 		/*
+ 		 * Wired DS4: calibration and version data are only needed for
+@@ -2985,13 +3022,13 @@
+ 		ret = 0;
+ 	}
+ 
+-	if (sc->quirks & SONY_LED_SUPPORT) {
++	if ((sc->quirks & SONY_LED_SUPPORT) && !sc->ds4_minimal) {
+ 		ret = sony_leds_init(sc);
+ 		if (ret < 0)
+ 			goto err_stop;
+ 	}
+ 
+-	if (sc->quirks & SONY_BATTERY_SUPPORT) {
++	if ((sc->quirks & SONY_BATTERY_SUPPORT) && !sc->ds4_minimal) {
+ 		ret = sony_battery_probe(sc, append_dev_id);
+ 		if (ret < 0)
+ 			goto err_stop;
+@@ -3004,7 +3041,7 @@
+ 		}
+ 	}
+ 
+-	if (sc->quirks & SONY_FF_SUPPORT) {
++	if ((sc->quirks & SONY_FF_SUPPORT) && !sc->ds4_minimal) {
+ 		ret = sony_init_ff(sc);
+ 		if (ret < 0)
+ 			goto err_close;
+@@ -3054,6 +3091,7 @@
+ 	sc->device_id = -1;
+ 
+ 	sc->quirks = quirks;
++	sc->ds4_minimal = ds4_usb_minimal && (quirks & DUALSHOCK4_CONTROLLER_USB);
+ 	hid_set_drvdata(hdev, sc);
+ 	sc->hdev = hdev;
+ 
+@@ -3148,7 +3186,9 @@
+ 		usb_free_urb(sc->ghl_urb);
+ 	}
+ 
+-	hid_hw_close(hdev);
++	/* ds4_usb_minimal never called hid_hw_open() */
++	if (!sc->ds4_minimal)
++		hid_hw_close(hdev);
+ 
+ 	if (sc->quirks & DUALSHOCK4_CONTROLLER_BT)
+ 		device_remove_file(&sc->hdev->dev, &dev_attr_bt_poll_interval);

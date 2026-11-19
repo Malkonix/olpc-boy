@@ -29,6 +29,10 @@ CONFIG_BLK_DEV_BSG=n
 CONFIG_MQ_IOSCHED_DEADLINE=y
 CONFIG_EXT4_USE_FOR_EXT2=y
 CONFIG_USB_ANNOUNCE_NEW_DEVICES=y
+# usbmon text capture (/sys/kernel/debug/usb/usbmon/Nu) + debugfs (usb/devices,
+# usb/ohci/*/registers): used by olpc-usbdiag
+CONFIG_DEBUG_FS=y
+CONFIG_USB_MON=y
 CONFIG_SCSI_PROC_FS=y
 CONFIG_ZONE_DMA=y
 # --- CPU / platform ---

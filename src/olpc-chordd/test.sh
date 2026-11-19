@@ -76,7 +76,7 @@ vrun() {
 	echo 15 >"$d/bl/dcon-bl/max_brightness"; echo 5 >"$d/bl/dcon-bl/brightness"; echo 0 >"$d/mono"
 	echo "=== $title"
 	printf '%s\n' "$@" | CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$d/bl/*" CHORDD_MONO="$d/mono" \
-		CHORDD_STATE="$d/state" "$T/chordd" --test 2>&1 | grep -v '^\[' | sed 's/^olpc-chordd: /  /'
+		CHORDD_STATE="$d/state" "$T/chordd" --test 2>&1 | grep -v '^\[' | tee "$T/last.out" | sed 's/^olpc-chordd: /  /'
 	got=$(awk -F= '{ split($2, a, " "); v[$1] = a[4] }
 		END { printf "%s %s %s %s %s %s", v["Master Playback Volume"], v["Master Playback Switch"],
 			v["Master Mono Playback Volume"], v["Master Mono Playback Switch"],
@@ -158,6 +158,101 @@ printf '%s\n' "0 SQUARE 1" "5 CROSS 1" "100 CROSS 0" "110 SQUARE 0" \
 	| CHORDD_FAKE_MIXER="$T/mixer" CHORDD_STATE="$T/st6" "$T/chordd" --test 2>&1 | grep 'state file' | sed 's/^olpc-chordd: /  /'
 [ "$(cat "$T/st6")" = 0 ] || { echo "  FAIL: flag not cleared"; fail=1; }
 
+# ---- gamepad chords (pseudo pad; "PAD <min> <max>" sets the trigger range) ----
+# prun = vrun + the chord flag must never have been raised by a pad chord.
+# (vrun filters the "[ms] ..." trace; the state trace is "state file = N".)
+prun() {
+	if [ -n "${PF:-}" ]; then fake $PF; else fake 20 1 20 1 23 1; fi; PF=
+	vrun "$@"
+	d="$T/case"
+	if grep -q 'state file = 1' "$T/last.out" || [ "$(cat "$d/state")" != 0 ]; then
+		echo "  FAIL: pad chord raised the chord flag"; fail=1
+	fi
+}
+# pexp <log text>: the last run must have logged it
+pexp() { grep -q -- "$1" "$T/last.out" || { echo "  FAIL: log lacks: $1"; fail=1; }; }
+# pnolog: the last run must not have acted
+pnone() { grep -q '\[pad:' "$T/last.out" && { echo "  FAIL: pad acted"; fail=1; }; }
+
+prun "pad SELECT+L1 held 1 s: volume up, press + 5 repeats = 26, named in the log" "26 1 26 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "1100 L1 0" "1110 SELECT 0"
+pexp 'volume Master 20 -> 21 (max 31), read back 21 \[pad: Test Pad\]'
+prun "pad SELECT+L2 (key) held 1 s: volume down 20 -> 14" "14 1 14 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "1100 L2 0" "1110 SELECT 0"
+PF="28 1 28 1 23 1" prun "pad volume up clamps at max 31" "31 1 31 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "1100 L1 0"
+PF="3 1 3 1 23 1" prun "pad volume down clamps at 0" "0 1 0 1 23 1 5" \
+	"0 SELECT 1" "100 L2 1" "1100 L2 0"
+prun "pad SELECT+R1 held 1 s: brightness 5 -> 11, volume untouched" "20 1 20 1 23 1 11" \
+	"0 SELECT 1" "100 R1 1" "1100 R1 0"
+pexp 'brightness 5 -> 6 (max 15, step 1), read back 6 \[pad: Test Pad\]'
+prun "pad SELECT+R2 (key) held 1 s: brightness clamps at 0" "20 1 20 1 23 1 0" \
+	"0 SELECT 1" "100 R2 1" "1100 R2 0"
+prun "pad SELECT+R1 short tap: exactly one step" "20 1 20 1 23 1 6" \
+	"0 SELECT 1" "100 R1 1" "200 R1 0" "900 UP 0"
+prun "pad first repeat only after 300 ms (tap 250 ms = one step)" "20 1 20 1 23 1 6" \
+	"0 SELECT 1" "100 R1 1" "350 R1 0" "900 UP 0"
+
+# analog-only triggers (xpad style: no key event), range 0..255: on > 85, off < 51
+prun "analog L2 (ABS_Z only) swept up and held 1 s: volume down 20 -> 14" "14 1 14 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 0" "105 ABS_Z 40" "110 ABS_Z 120" "115 ABS_Z 255" \
+	"600 ABS_Z 250" "1100 ABS_Z 255" "1105 ABS_Z 0" "1110 SELECT 0"
+prun "analog R1-side: ABS_RZ drives brightness down 5 -> 0" "20 1 20 1 23 1 0" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_RZ 255" "1100 ABS_RZ 0"
+prun "noisy axis around the threshold: hysteresis gives 2 steps, not one per wiggle" "18 1 18 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 90" "110 ABS_Z 80" "120 ABS_Z 90" "130 ABS_Z 84" "140 ABS_Z 86" \
+	"150 ABS_Z 60" "160 ABS_Z 100" "170 ABS_Z 52" "180 ABS_Z 50" "190 ABS_Z 90" "200 ABS_Z 0"
+prun "noisy axis: wiggling 52..100 without ever dropping below 51 = one step" "19 1 19 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 90" "110 ABS_Z 52" "120 ABS_Z 100" "130 ABS_Z 53" "140 ABS_Z 99" "150 ABS_Z 0"
+prun "resting value 30..220 (on > 93, off < 68): 90 is not a press, 94 is" "19 1 19 1 23 1 5" \
+	"PAD 30 220" "0 SELECT 1" "100 ABS_Z 30" "110 ABS_Z 90" "120 ABS_Z 94" "130 ABS_Z 30"
+prun "signed range -128..127 (on > -43, off < -77)" "19 1 19 1 23 1 5" \
+	"PAD -128 127" "0 SELECT 1" "100 ABS_Z -128" "110 ABS_Z -50" "120 ABS_Z -40" "130 ABS_Z -128"
+prun "pad reporting key AND axis (DS4): one step per press, key first then axis" "19 1 19 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 L2 1" "101 ABS_Z 255" "150 L2 0" "160 ABS_Z 0"
+prun "pad reporting key AND axis: axis first then key, two presses = two steps" "18 1 18 1 23 1 5" \
+	"PAD 0 255" "0 SELECT 1" "100 ABS_Z 255" "101 L2 1" "150 ABS_Z 0" "151 L2 0" \
+	"200 ABS_Z 255" "201 L2 1" "250 L2 0" "251 ABS_Z 0"
+
+# the press has to come after SELECT, the same rule as the built-in chords
+prun "shoulder held before SELECT: nothing, also after SELECT is re-pressed" "20 1 20 1 23 1 5" \
+	"0 L1 1" "100 SELECT 1" "900 L1 0" "910 SELECT 0" "1000 SELECT 1" "1010 SELECT 0"
+pnone
+prun "analog trigger held before SELECT: nothing" "20 1 20 1 23 1 5" \
+	"PAD 0 255" "0 ABS_Z 200" "100 SELECT 1" "900 ABS_Z 0" "910 SELECT 0"
+pnone
+prun "L1 without SELECT: nothing" "20 1 20 1 23 1 5" \
+	"0 L1 1" "50 R1 1" "500 L1 0" "510 R1 0" "520 R2 1" "530 R2 0" "540 L2 1" "550 L2 0"
+pnone
+prun "SELECT then SELECT released while L1 held: repeat stops" "21 1 21 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "200 SELECT 0" "2000 L1 0"
+# START is the emulator's quit chord with SELECT: ignored, and a held START never blocks a chord
+prun "SELECT+START alone: nothing" "20 1 20 1 23 1 5" \
+	"0 SELECT 1" "10 START 1" "1500 START 0" "1510 SELECT 0"
+pnone
+prun "START held, then SELECT+L1: chord still works" "21 1 21 1 23 1 5" \
+	"0 START 1" "10 SELECT 1" "100 L1 1" "150 L1 0" "160 SELECT 0" "170 START 0"
+prun "SELECT+START then L1 and R1 taps: both act" "21 1 21 1 23 1 6" \
+	"0 SELECT 1" "10 START 1" "100 L1 1" "150 L1 0" "200 R1 1" "250 R1 0" "300 START 0"
+prun "both groups held (L1 then R1): the second does nothing and the repeat stops" "21 1 21 1 23 1 5" \
+	"0 SELECT 1" "10 L1 1" "20 R1 1" "1000 R1 0" "1010 L1 0"
+prun "both groups held (R2 then L2): nothing for L2, repeat stops" "20 1 20 1 23 1 4" \
+	"0 SELECT 1" "10 R2 1" "20 L2 1" "1000 L2 0" "1010 R2 0"
+prun "pad unplugged mid-chord: repeat stops (one press + one repeat = 22)" "22 1 22 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "500 UNPLUG 1" "2000 UP 0"
+pexp 'pad gone'
+prun "events after unplug are harmless" "20 1 20 1 23 1 5" \
+	"0 UNPLUG 1" "100 SELECT 1" "110 L1 1" "2000 L1 0"
+
+# a pad repeat must survive built-in key traffic, and built-in chords still raise the flag
+fake 20 1 20 1 23 1
+vrun "pad repeat keeps going while an unrelated built-in key changes" "26 1 26 1 23 1 5" \
+	"0 SELECT 1" "100 L1 1" "500 ROTATE 1" "510 ROTATE 0" "1100 L1 0"
+fake 20 1 20 1 23 1
+vrun "built-in chord still raises the flag with a pad present" "20 1 20 1 23 1 6" \
+	"0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "150 UP 0" "160 CHECK 0" "165 CIRCLE 0"
+grep -q 'state file = 1' "$T/last.out" || { echo "  FAIL: built-in chord did not set the flag"; fail=1; }
+
 # Binary path: the same decoder fed raw 16-byte i386 input_event records.
 echo "=== binary replay (raw 16-byte records): chord CIRCLE+CHECK, RIGHT"
 d="$T/bin"; mkdir -p "$d"; echo 0 >"$d/mono"
@@ -174,5 +269,21 @@ CHORDD_BACKLIGHT_GLOB="$T/none/*" CHORDD_MONO="$d/mono" CHORDD_STATE="$d/state" 
 	| grep -v '^\[' | sed 's/^olpc-chordd: /  /'
 echo "  -> mono=$(cat "$d/mono") (expect 0)"
 [ "$(cat "$d/mono")" = 0 ] || fail=1
+
+echo "=== binary replay: pad ABS_Z record (EV_ABS) with SELECT key"
+fake 20 1 20 1 23 1
+d="$T/bin"; echo 5 >"$d/bl-brightness" 2>/dev/null
+evt() { # evt sec usec type code value (value may be up to 255)
+	printf "$(printf '\\%03o\\%03o\\000\\000' $(( $1 & 255 )) $(( ($1>>8) & 255 )))"
+	printf "$(printf '\\%03o\\%03o\\000\\000' $(( $2 & 255 )) $(( ($2>>8) & 255 )))"
+	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(( $3 & 255 )) 0 $(( $4 & 255 )) $(( ($4>>8) & 255 )))"
+	printf "$(printf '\\%03o\\000\\000\\000' "$5")"
+}
+{ evt 1 0 1 314 1; evt 1 100000 3 2 255; evt 1 150000 3 2 0; } >"$d/rawpad"
+CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$T/none/*" CHORDD_STATE="$d/state" "$T/chordd" --replay <"$d/rawpad" 2>&1 \
+	| grep -v '^\[' | sed 's/^olpc-chordd: /  /'
+v=$(sed -n 's/^Master Playback Volume=0 31 2 \([0-9]*\) .*/\1/p' "$T/mixer")
+echo "  -> Master volume=$v (expect 19)"
+[ "$v" = 19 ] || { echo "  FAIL: binary pad replay"; fail=1; }
 
 [ $fail -eq 0 ] && echo "ALL OK" || { echo "FAILED"; exit 1; }

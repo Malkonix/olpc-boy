@@ -2,6 +2,8 @@
 # olpc-wifi -- WiFi client for the XO-1 (Marvell usb8388, module usb8xxx, wlan0).
 #
 #   olpc-wifi up       read WIFI.CFG, start wpa_supplicant, DHCP, one-shot NTP
+#                      (already connected: fast no-op; another `up` or `down` in
+#                      progress: wait for it and return ITS result)
 #   olpc-wifi check    connectivity + cover-art download test
 #   olpc-wifi run      skip-checks, then up + check (what the service runs)
 #   olpc-wifi status   connected or not, SSID, IP, signal
@@ -29,6 +31,13 @@ LOGMNT=${OLPC_WIFI_LOGMNT:-/mnt/olpclog}
 # one real cover of the Game Boy set (the exact name must exist on the server)
 COVER_SET="Nintendo - Game Boy"
 COVER_NAME=${OLPC_WIFI_COVER:-Super Mario Land (World).png}
+# single-instance lock (mkdir is atomic): $LOCK/pid holds the owner's pid.  A
+# lock whose pid is dead is taken over.  $RESULT = "<op> <pid> <rc>" of the
+# last operation that finished, so a waiting `up` can return that result.
+LOCKBASE=${OLPC_WIFI_LOCKDIR:-/run/olpcboy}
+LOCK=$LOCKBASE/wifi.lock
+RESULT=$LOCKBASE/wifi.result
+LOCKHELD=0
 THUMBS=http://thumbnails.libretro.com
 NTP_HOST=pool.ntp.org
 
@@ -267,7 +276,7 @@ wait_assoc() {
 
 # ---------------------------------------------------------------- up
 
-do_up() {
+do_up_real() {
 	CFG=$(find_cfg) || { step "no WIFI.CFG found on $LOGMNT, nothing to do"; return 2; }
 	wl "using $CFG"
 	genconf "$CFG" "$CONF"
@@ -327,6 +336,108 @@ do_up() {
 		_cs; step "ntp: clock set from $NTP_HOST in $((CS - _t0)) cs, now $(date '+%Y-%m-%d %H:%M:%S')"
 	else
 		step "ntp: no answer from $NTP_HOST (ignored)"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- lock
+
+# lock_try: 0 = lock acquired; 1 = held by a live process (LOCK_HOLDER = its pid)
+lock_try() {
+	mkdir -p "$LOCKBASE" 2>/dev/null
+	if mkdir "$LOCK" 2>/dev/null; then
+		echo $$ >"$LOCK/pid"
+		LOCKHELD=1
+		return 0
+	fi
+	LOCK_HOLDER=$(cat "$LOCK/pid" 2>/dev/null)
+	if [ -z "$LOCK_HOLDER" ]; then
+		# owner is between mkdir and writing its pid: give it a moment
+		olpc_sleep 1
+		LOCK_HOLDER=$(cat "$LOCK/pid" 2>/dev/null)
+	fi
+	if [ -n "$LOCK_HOLDER" ] && kill -0 "$LOCK_HOLDER" 2>/dev/null; then
+		return 1
+	fi
+	[ -d "$LOCK" ] || return 1          # released meanwhile: caller retries
+	# Stale (owner dead, or never wrote its pid).  Take it over with an atomic
+	# rename so only one contender wins; verify what we moved was the stale
+	# lock, and put it back if a live one slipped in between.
+	mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null || return 1
+	_sp=$(cat "$LOCK.stale.$$/pid" 2>/dev/null)
+	if [ "$_sp" = "$LOCK_HOLDER" ]; then
+		rm -rf "$LOCK.stale.$$"
+		wl "stale lock of pid ${LOCK_HOLDER:-?} taken over"
+		LOCK_HOLDER=""
+	else
+		mv "$LOCK.stale.$$" "$LOCK" 2>/dev/null || rm -rf "$LOCK.stale.$$"
+	fi
+	return 1                            # caller retries the mkdir
+}
+
+lock_release() {
+	[ "$LOCKHELD" = 1 ] || return 0
+	LOCKHELD=0
+	[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
+	return 0
+}
+
+# lock_wait SECS OP: acquire the lock, waiting up to SECS.  Sets WAITED_FOR to
+# the last live holder we waited for (empty when we got the lock at once).
+lock_wait() {
+	WAITED_FOR=""
+	_cs; _lw_end=$((CS + $1 * 100))
+	while :; do
+		if lock_try; then
+			trap lock_release EXIT
+			trap 'lock_release; exit 1' INT TERM
+			return 0
+		fi
+		if [ -n "$LOCK_HOLDER" ] && [ "$LOCK_HOLDER" != "$WAITED_FOR" ]; then
+			step "$2: another olpc-wifi (pid $LOCK_HOLDER) is busy, waiting"
+			WAITED_FOR=$LOCK_HOLDER
+		fi
+		_cs; [ "$CS" -ge "$_lw_end" ] && return 1
+		olpc_sleep 1
+	done
+}
+
+is_connected() {
+	[ "$(wstat wpa_state)" = COMPLETED ] && [ -n "$(if_ip)" ]
+}
+
+# up: no-op when connected; serialised; a caller that had to wait for another
+# `up` returns that one's result without restarting anything.
+do_up() {
+	if is_connected; then step "up: already connected, nothing to do"; return 0; fi
+	if ! lock_wait 240 up; then step "FAIL: up: lock still busy after 240 s"; return 1; fi
+	if [ -n "$WAITED_FOR" ]; then
+		_rop=""; _rpid=""; _rrc=""
+		[ -r "$RESULT" ] && read -r _rop _rpid _rrc <"$RESULT"
+		if [ "$_rop" = up ] && [ "$_rpid" = "$WAITED_FOR" ]; then
+			lock_release
+			step "up: took the result of the concurrent up (pid $_rpid): rc=$_rrc"
+			return "${_rrc:-1}"
+		fi
+		if is_connected; then lock_release; step "up: already connected, nothing to do"; return 0; fi
+	fi
+	do_up_real
+	_rc=$?
+	echo "up $$ $_rc" >"$RESULT"
+	lock_release
+	return $_rc
+}
+
+# down never runs in the middle of an up; at shutdown it must not hang, so it
+# waits 60 s at most and then goes on without the lock.
+do_down() {
+	if lock_wait 60 down; then
+		do_down_real
+		echo "down $$ 0" >"$RESULT"
+		lock_release
+	else
+		step "down: lock still busy after 60 s, going on without it"
+		do_down_real
 	fi
 	return 0
 }
@@ -408,7 +519,7 @@ do_status() {
 	echo "signal: $(link_info)"
 }
 
-do_down() {
+do_down_real() {
 	stop_procs
 	ip addr flush dev "$IF" >/dev/null 2>&1
 	ip link set "$IF" down >/dev/null 2>&1

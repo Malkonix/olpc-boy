@@ -156,6 +156,7 @@ addsvc boot modules sysctl hostname hwclock bootmisc syslog root localmount
 # after REACHED_USERSPACE_OK.
 addsvc default olpc-powerbtn olpc-chordd olpc-bootdone
 addsvc default olpc-sd        # SD card at /mnt/sd (olpc-menu block)
+addsvc default olpc-usbdiag   # Sony pad diagnostics (no-op without a VID 054c device)
 addsvc shutdown mount-ro killprocs savecache
 # NOT enabled on purpose: networking wpa_supplicant dropbear acpid crond
 
