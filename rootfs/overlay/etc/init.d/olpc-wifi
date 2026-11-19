@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# WiFi client, fully in the background (nice 19) so it never delays boot or the
+# games.  Skipped (one timeline line) when WIFI.CFG is absent or the kernel
+# command line has olpcboy.nowifi; the script itself logs the reason.
+
+description="olpc-boy: WiFi client (WIFI.CFG on the FAT partition)"
+
+depend() {
+	need olpclog
+	after olpc-bootdone
+}
+
+start() {
+	ebegin "Starting WiFi in the background"
+	setsid nice -n 19 /usr/local/sbin/olpc-wifi run </dev/null >/dev/null 2>&1 &
+	eend 0
+}
+
+stop() {
+	/usr/local/sbin/olpc-wifi down >/dev/null 2>&1
+	return 0
+}

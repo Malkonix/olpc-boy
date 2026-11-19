@@ -50,6 +50,12 @@ mmd   -i "$FAT" ::boot ::logs ::roms
 # (it upper-cases lookups, so "\boot\bzImage" matches BZIMAGE).
 mcopy -i "$FAT" "$FTH"    ::boot/OLPC.FTH
 mcopy -i "$FAT" "$KERNEL" ::boot/BZIMAGE
+# Optional WiFi credentials (git-ignored, repo root): the device reads WIFI.CFG from the
+# FAT root; it can also be edited from any PC.  Never echo its contents.
+if [ -f wifi.cfg ]; then
+    mcopy -i "$FAT" wifi.cfg ::WIFI.CFG
+    echo "mkimage: wifi.cfg -> ::WIFI.CFG"
+fi
 
 # ---- 2. ext4 root partition -----------------------------------------------------
 echo "mkimage: extracting $ROOTFS"
