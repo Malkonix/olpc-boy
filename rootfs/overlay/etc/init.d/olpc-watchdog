@@ -1,6 +1,6 @@
 #!/sbin/openrc-run
 # Boot watchdog (software, does NOT touch /dev/watchdog and never reboots):
-# 90 s after start, if REACHED_USERSPACE_OK is missing, dump state.
+# 90 s after the initramfs started, if REACHED_USERSPACE_OK is missing, dump state.
 
 description="olpc-boy boot watchdog (dump state if boot does not finish)"
 command=/usr/local/sbin/olpc-watchdog

@@ -1,10 +1,24 @@
 #!/bin/sh
-# Interactive button capture on tty1.  Bounded: ends by itself after
-# OLPC_BUTTONS_SECS (default 60).  Skipped by cmdline olpcboy.nobuttons.
-# Records every event of every /dev/input/event* (evtest) into buttons.log and
-# echoes it on screen as feedback.
+# Button capture on tty1.  Bounded: ends by itself after OLPC_BUTTONS_SECS
+# (default 60).  Skipped by cmdline olpcboy.nobuttons.
+#
+# Capture: one `dd` per /dev/input/event* copies the raw struct input_event
+# records into a file on tmpfs (dd writes every 16-byte record at once: no
+# stdio buffering, no evtest, no pipe).  Every ~0.3 s the new records are
+# decoded (evdecode) into buttons.log and echoed on screen.  The screen is
+# drawn once and then updated IN PLACE (no clears, no scrolling) to stay calm.
+# Time is measured against /proc/uptime only (never timeout/long sleeps).
 . /usr/libexec/olpcboy/common.sh
 SECS=${OLPC_BUTTONS_SECS:-60}
+W=$STAGE/btn
+RAW=$W/raw
+LOGSTAGE=$W/buttons.log
+SCRFILE=$W/screen
+PRESSED=$W/pressed
+PRESSES=$W/presses     # one decoded press per line (drives the big display)
+PEND=$W/pend           # MSC_SCAN seen, KEY event not (yet) seen
+LASTUNK=$W/lastunk     # "scan sec" of the last UNKNOWN reported (autorepeat filter)
+KEYMAP=$W/keymap
 LOG=$BOOTDIR/buttons.log
 
 if cmdline_has olpcboy.nobuttons; then
@@ -13,23 +27,129 @@ if cmdline_has olpcboy.nobuttons; then
 	exit 0
 fi
 
+rm -rf "$W"; mkdir -p "$RAW"
+: >"$LOGSTAGE"; : >"$SCRFILE"; : >"$PRESSED"; : >"$PRESSES"; : >"$PEND"; : >"$LASTUNK"
+/usr/local/sbin/olpc-keymap table >"$KEYMAP" 2>/dev/null
+
+# key/switch names (sets KN); unknown codes keep an empty name
+keyname() {
+	case "$1" in
+	103) KN=UP ;; 108) KN=DOWN ;; 105) KN=LEFT ;; 106) KN=RIGHT ;;
+	28) KN=ENTER ;; 1) KN=ESC ;; 57) KN=SPACE ;; 116) KN=POWER ;;
+	71) KN=KP7 ;; 72) KN=KP8 ;; 73) KN=KP9 ;; 74) KN=KPMINUS ;;
+	75) KN=KP4 ;; 76) KN=KP5 ;; 77) KN=KP6 ;; 78) KN=KPPLUS ;;
+	79) KN=KP1 ;; 80) KN=KP2 ;; 81) KN=KP3 ;; 82) KN=KP0 ;; 83) KN=KPDOT ;;
+	102) KN=HOME ;; 107) KN=END ;; 104) KN=PGUP ;; 109) KN=PGDN ;;
+	304) KN=BTN_SOUTH ;; 305) KN=BTN_EAST ;; 306) KN=BTN_C ;; 307) KN=BTN_NORTH ;;
+	308) KN=BTN_WEST ;; 309) KN=BTN_Z ;;
+	256) KN=BTN_0 ;; 257) KN=BTN_1 ;; 258) KN=BTN_2 ;; 259) KN=BTN_3 ;;
+	*) KN= ;;
+	esac
+}
+swname() {
+	case "$1" in 0) KN=LID ;; 1) KN=TABLET_MODE ;; *) KN= ;; esac
+}
+
+# bigname CODE: name shown on screen (sets BN), from the olpc-keymap table
+bigname() {
+	BN=
+	[ "$1" = 116 ] && { BN=POWER; return; }
+	while read -r _sc _kc _nm; do
+		[ "$_kc" = "$1" ] && { BN=$_nm; return; }
+	done <"$KEYMAP"
+	BN="KEY $1"
+}
+
+# press DEV TEXT: record one decoded press (log line + big display)
+press() {
+	echo "# pressed $2 ($1)" >>"$LOGSTAGE"
+	echo "$2" >>"$PRESSES"
+}
+
+# at ROW TEXT: replace one screen row in place
+at() { printf '\033[%d;1H\033[K%s' "$1" "$2"; }
+
+# decode the not yet decoded records of one device: decode_dev evN name
+decode_dev() {
+	_f=$RAW/$1.raw
+	[ -f "$_f" ] || return 0
+	eval "_d=\${DONE_$1:-0}"
+	_sz=$(wc -c <"$_f" 2>/dev/null)
+	_n=$(( ${_sz:-0} / 16 ))
+	[ "$_n" -gt "$_d" ] || return 0
+	/usr/libexec/olpcboy/evdecode "$_f" "$_d" $((_n - _d)) | \
+	while read -r sec usec type code value; do
+		[ -n "$value" ] || continue
+		if [ "$type" = 0 ]; then               # EV_SYN: end of one report
+			read -r pend <"$PEND"
+			if [ -n "$pend" ]; then        # scancode without a KEY event
+				: >"$PEND"
+				read -r ls_scan ls_sec <"$LASTUNK"
+				# a held unknown key autorepeats: report once per ~2 s
+				if [ "$ls_scan" != "$pend" ] || [ $((sec - ${ls_sec:-0})) -ge 2 ]; then
+					echo "$pend $sec" >"$LASTUNK"
+					press "$1" "$(printf 'UNKNOWN scancode 0x%02X (%s, dec %s)' "$pend" "$1" "$pend")"
+				fi
+			fi
+			continue
+		fi
+		KN=
+		case "$type" in
+		1) tn=KEY; keyname "$code" ;;
+		5) tn=SW;  swname "$code" ;;
+		4) tn=MSC ;;
+		*) tn="T$type" ;;
+		esac
+		echo "T=$sec.$usec $1 [$2] $tn code=$code $KN value=$value" >>"$LOGSTAGE"
+		case "$tn" in
+		MSC) [ "$code" = 4 ] && echo "$value" >"$PEND" ;;
+		esac
+		case "$tn" in
+		KEY) : >"$PEND"; : >"$LASTUNK"
+			if [ "$value" = 1 ]; then      # PRESS only; repeat (2) and release stay quiet
+				bigname "$code"
+				press "$1" "$BN"
+			fi ;;
+		SW)
+			case "$code:$value" in
+			0:1) press "$1" "LID closed" ;; 0:0) press "$1" "LID open" ;;
+			1:1) press "$1" "EBOOK folded" ;; 1:0) press "$1" "EBOOK unfolded" ;;
+			*) press "$1" "SW $code=$value" ;;
+			esac ;;
+		esac
+		case "$tn" in
+		KEY|SW)
+			case "$value" in 0) vs=release ;; 1) vs=PRESS ;; *) vs=repeat ;; esac
+			echo "$1 $tn $code $KN $vs" >>"$SCRFILE"
+			[ "$value" = 1 ] && echo "$1 $tn $code $KN" >>"$PRESSED"
+			;;
+		esac
+	done
+	eval "DONE_$1=$_n"
+}
+
 tl "buttons begin (${SECS}s)"
 printf '\033[2J\033[H'
-printf '\033[1;37;44m%-75s\033[0m\n' " BUTTON TEST   ($SECS seconds)"
+printf '\033[1;37;44m%-75s\033[0m\n' " BUTTON TEST  -  $SECS SECONDS"
 cat <<'MSG'
 
-  Press each button ONCE:
+  Press EVERY button below, ONE at a time.
+  Hold each press for about half a second,
+  then press it a SECOND time a moment later.
 
-     UP  DOWN  LEFT  RIGHT
-     CIRCLE  CROSS  SQUARE  CHECK
-     ROTATE
+  D-PAD:       UP   DOWN   LEFT   RIGHT
+  GAME KEYS:   CIRCLE   CROSS   SQUARE   CHECK
+  ROTATE button (the one beside the screen)
+  Then fold the screen flat (e-book mode)
+  and open it back again.
 
-  Then flip to EBOOK mode and back.
-
+  Do NOT press POWER: it shuts the machine off.
 MSG
-echo "== buttons begin, uptime $(olpc_uptime), ${SECS}s" >>"$LOG"
 
-# one reader per device; each prints "<event> <name>: <line>" atomically
+echo "== buttons begin, uptime $(olpc_uptime), ${SECS}s" >"$LOGSTAGE"
+at 17 "  LAST KEY:"
+DEVS=""
+PIDS=""
 n=0
 for dev in /dev/input/event*; do
 	[ -c "$dev" ] || continue
@@ -37,39 +157,96 @@ for dev in /dev/input/event*; do
 	name=$(cat "/sys/class/input/$e/device/name" 2>/dev/null)
 	[ -z "$name" ] && name=unknown
 	n=$((n + 1))
-	echo "# device $dev name='$name'" >>"$LOG"
-	(
-		timeout "$SECS" evtest "$dev" 2>/dev/null | while IFS= read -r line; do
-			case "$line" in
-			"Event: time"*)
-				case "$line" in
-				*EV_SYN*) continue ;;
-				esac
-				ev=${line#Event: }
-				out="$e [$name] $ev"
-				echo "$out" >>"$LOG"
-				# on-screen: short form
-				printf '%s\n' "$(echo "$e $ev" | cut -c1-75)"
-				;;
-			esac
-		done
-	) &
+	echo "# device $dev name='$name'" >>"$LOGSTAGE"
+	DEVS="$DEVS $e"
+	eval "NAME_$e=\$(echo \"\$name\" | tr ' ' '_')"
+	dd if="$dev" of="$RAW/$e.raw" bs=16 2>/dev/null &
+	PIDS="$PIDS $!"
 done
 if [ "$n" -eq 0 ]; then
-	echo "NO INPUT DEVICES FOUND" | tee -a "$LOG"
+	at 15 "  NO INPUT DEVICES FOUND"
+	echo "NO INPUT DEVICES FOUND" >>"$LOGSTAGE"
 fi
 
-# periodic sync while capturing, then wait for readers (bounded by timeout)
-i=0
-while [ $i -lt $((SECS + 3)) ]; do
-	sleep 2
-	sync
-	i=$((i + 2))
+_cs; T0=$CS; END=$((T0 + SECS * 100)); NEXTSAVE=$((T0 + 1000))
+LASTREM=-1; SHOWN=0; SHOWNP=0
+while :; do
+	_cs
+	[ "$CS" -ge "$END" ] && break
+	rem=$(( (END - CS + 99) / 100 ))
+	if [ "$rem" -ne "$LASTREM" ]; then
+		LASTREM=$rem
+		filled=$(( (SECS - rem) * 30 / SECS ))
+		bar=""; i=0
+		while [ $i -lt 30 ]; do
+			if [ $i -lt $filled ]; then bar="$bar#"; else bar="$bar."; fi
+			i=$((i + 1))
+		done
+		at 15 "$(printf '  TIME LEFT: %2d s  [%s]' "$rem" "$bar")"
+	fi
+	for e in $DEVS; do
+		eval "nm=\$NAME_$e"
+		decode_dev "$e" "$nm"
+	done
+	cnt=$(wc -l <"$SCRFILE")
+	if [ "$cnt" -ne "$SHOWN" ]; then
+		SHOWN=$cnt
+		at 16 "$(printf '  events seen: %d' "$cnt")"
+		row=22
+		tail -n 6 "$SCRFILE" | while read -r d t c k s; do
+			at "$row" "$(printf '   %-6s %-4s %-4s %-10s %s' "$d" "$t" "$c" "$k" "$s")"
+			row=$((row + 1))
+		done
+	fi
+	np=$(wc -l <"$PRESSES")
+	if [ "$np" -ne "$SHOWNP" ]; then
+		SHOWNP=$np
+		# last press, spaced out on a 3-row colour band (the console font is small)
+		last=$(tail -n 1 "$PRESSES")
+		case "$last" in
+		UNKNOWN*) big=$last ;;
+		*) big=$(echo "$last" | sed 's/./& /g; s/ $//') ;;
+		esac
+		pad=$(( (75 - ${#big}) / 2 )); [ "$pad" -ge 0 ] || pad=0
+		at 18 "$(printf '\033[1;37;42m%-75s\033[0m' '')"
+		at 19 "$(printf '\033[1;37;42m%*s%-*s\033[0m' "$pad" '' $((75 - pad)) "$big")"
+		at 20 "$(printf '\033[1;37;42m%-75s\033[0m' '')"
+	fi
+	if [ "$CS" -ge "$NEXTSAVE" ]; then
+		NEXTSAVE=$((CS + 1000))
+		cp "$LOGSTAGE" "$LOG" 2>/dev/null
+	fi
+	olpc_sleep 0.3
 done
-wait
-echo "== buttons end, uptime $(olpc_uptime)" >>"$LOG"
-sync
-tl "buttons end"
-printf '\033[1;32m\n  Button test finished.\033[0m\n'
-sleep 2
+
+# stop the readers, decode what is left, save
+for p in $PIDS; do kill -9 "$p" 2>/dev/null; done
+for p in $PIDS; do wait "$p" 2>/dev/null; done
+for e in $DEVS; do
+	eval "nm=\$NAME_$e"
+	decode_dev "$e" "$nm"
+done
+total=$(grep -c ' value=' "$LOGSTAGE")
+{
+	echo "== buttons end, uptime $(olpc_uptime), $total events"
+	echo "== keys pressed (count, device, type, code, name):"
+	sort "$PRESSED" | uniq -c
+} >>"$LOGSTAGE"
+cp "$LOGSTAGE" "$LOG"
+for e in $DEVS; do cp "$RAW/$e.raw" "$BOOTDIR/buttons-$e.raw" 2>/dev/null; done
+olpc_sync
+tl "buttons end ($total events)"
+
+row=15
+while [ $row -le 26 ]; do at $row ""; row=$((row + 1)); done
+at 15 "$(printf '\033[1;32m  TEST FINISHED - thank you\033[0m')"
+at 16 "  $total events recorded"
+at 17 "  Keys seen:"
+row=18
+sort "$PRESSED" | uniq -c | head -n 9 | while read -r c d t code k; do
+	at "$row" "$(printf '   %3sx %-6s %-4s %-4s %s' "$c" "$d" "$t" "$code" "$k")"
+	row=$((row + 1))
+done
+printf '\033[27;1H'
+olpc_sleep 5
 exit 0

@@ -79,9 +79,11 @@ addsvc() {  # addsvc <runlevel> <svc...>
 		fi
 	done
 }
-addsvc sysinit olpclog devfs dmesg mdev hwdrivers sysfs procfs olpc-watchdog olpc-dcon
+addsvc sysinit olpclog devfs dmesg mdev hwdrivers sysfs procfs olpc-watchdog olpc-keymap olpc-dcon
 addsvc boot modules sysctl hostname hwclock bootmisc syslog root localmount
-addsvc default olpc-powerbtn olpc-inventory olpc-bootdone
+# olpc-inventory is NOT a service: olpc-bootdone starts it (background, nice 19)
+# after REACHED_USERSPACE_OK.
+addsvc default olpc-powerbtn olpc-bootdone
 addsvc shutdown mount-ro killprocs savecache
 # NOT enabled on purpose: networking wpa_supplicant dropbear acpid crond
 
@@ -131,6 +133,29 @@ for f in $(find "$R/usr/local/sbin" "$R/usr/libexec/olpcboy" "$R/etc/init.d" -ty
 	*openrc-run*|*/bin/sh*) busybox ash -n "$f" || { echo "ERROR: syntax $f" >&2; exit 1; } ;;
 	esac
 done
+
+echo "== normalise mtimes (OpenRC clock-skew)"
+# The XO-1 RTC says 2013 (or 1970), the build host says 2026.  Files newer than
+# the system clock make OpenRC print "clock skew detected" and rebuild its
+# dependency cache before EVERY service (~3 s each on the Geode: most of the
+# first boot's userland time).  Put every mtime in the distant past instead.
+find "$R" -xdev -exec touch -h -d '1970-01-02 12:00:00' {} + 2>/dev/null || true
+
+echo "== NAND policy checks"
+grep -q '^install cafe_nand /bin/false' "$R/etc/modprobe.d/olpcboy.conf" \
+	|| { echo "ERROR: cafe_nand install-guard missing from modprobe.d" >&2; exit 1; }
+# busybox ships NAND/flash applets: drop their links so nothing can run them by accident
+for a in nanddump nandwrite flash_eraseall flash_lock flash_unlock flashcp ubiattach ubidetach \
+	ubimkvol ubirmvol ubirsvol ubiupdatevol; do
+	find "$R/bin" "$R/sbin" "$R/usr/bin" "$R/usr/sbin" -maxdepth 1 -name "$a" -type l -delete 2>/dev/null
+done
+for f in usr/sbin/nanddump usr/sbin/nandwrite usr/sbin/flash_erase usr/sbin/nandtest; do
+	[ -e "$R/$f" ] && { echo "ERROR: $f present in the rootfs" >&2; exit 1; }
+done
+# no overlay script may reference an MTD device node outside comments
+if grep -rsnE '^[^#]*(/dev/mtd|mtdblock)' "$R/usr/local/sbin" "$R/usr/libexec/olpcboy" "$R/etc/init.d/olpc"* "$R/etc/init.d/olpclog" | grep .; then
+	echo "ERROR: an overlay script references /dev/mtd*" >&2; exit 1
+fi
 
 echo "== tar"
 rm -f "$ROOT/out/rootfs.tar"

@@ -1,8 +1,10 @@
 #!/bin/sh
 # Hardware self-test for the OLPC XO-1.  One PASS/FAIL/SKIP/INFO line per item,
-# written to $BOOTDIR/selftest.log AND to stdout (tty1).  Every external command
-# is wrapped in timeout; nothing here can block.  READ-ONLY on NAND, does not
-# arm the watchdog, does not suspend.
+# written to $BOOTDIR/selftest.log; PASS/FAIL/SKIP lines also go to stdout
+# (tty1), INFO lines only to the log (calm screen).  Every external command is
+# wrapped in `bounded` (uptime based, see common.sh); nothing here can block.
+# Never touches the NAND (policy: the driver is not loaded), never opens
+# /dev/watchdog, does not suspend.
 . /usr/libexec/olpcboy/common.sh
 LOG=$BOOTDIR/selftest.log
 SUMMARY=$BOOTDIR/selftest.summary
@@ -19,6 +21,7 @@ else
 fi
 
 # res <PASS|FAIL|SKIP|INFO> <name> <detail...>
+# Counters are updated here and ONLY here; the summary is built from them once.
 res() {
 	_st=$1; _nm=$2; shift 2
 	_line=$(printf '%-4s %-11s %s' "$_st" "$_nm" "$*" | cut -c1-75)
@@ -29,18 +32,14 @@ res() {
 	SKIP) NSKIP=$((NSKIP + 1)); _c=$C_S ;;
 	*) _c=$C_I ;;
 	esac
-	printf "${_c}%s${C_0}\n" "$_line"
-	sync
-}
-
-first_file() {  # first readable file among args
-	for _f in "$@"; do [ -r "$_f" ] && { echo "$_f"; return 0; }; done
-	return 1
+	[ "$_st" = INFO ] || printf "${_c}%s${C_0}\n" "$_line"
 }
 
 tl "selftest begin"
 echo "== selftest begin, uptime $(olpc_uptime), boot dir $BOOTDIR" >>"$LOG"
 printf '\033[1;37;44m %-73s \033[0m\n' "HARDWARE SELFTEST"
+
+bounded 8 dmesg >"$TMP/dmesg.txt" 2>&1
 
 # ------------------------------------------------------------------ CPU
 flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null)
@@ -62,10 +61,15 @@ if [ -n "$kb" ] && [ "$kb" -ge 200000 ]; then res PASS ram "$((kb / 1024)) MB"
 else res FAIL ram "MemTotal=${kb:-?} kB (<200000)"; fi
 
 # ------------------------------------------------------------------ framebuffer
+# (busybox fbset has no -i: plain fbset output + the sysfs nodes)
 if [ -d /sys/class/graphics/fb0 ]; then
 	vs=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)
 	bpp=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
 	name=$(cat /sys/class/graphics/fb0/name 2>/dev/null)
+	stride=$(cat /sys/class/graphics/fb0/stride 2>/dev/null)
+	modes=$(cat /sys/class/graphics/fb0/modes 2>/dev/null | tr '\n' ' ')
+	bounded 5 fbset -fb /dev/fb0 >"$BOOTDIR/selftest-fbset.txt" 2>&1
+	res INFO fb-info "stride=$stride modes=$modes"
 	if [ "$vs" = "1200,900" ]; then res PASS fb "1200x900 ${bpp}bpp ($name)"
 	else res FAIL fb "size=$vs bpp=$bpp ($name), want 1200,900"; fi
 else
@@ -101,27 +105,44 @@ fi
 mono=$(find /sys/devices -name monochrome 2>/dev/null | head -n1)
 if [ -n "$mono" ]; then res PASS dcon-mono "$mono = $(cat "$mono")"
 else
-	if ls -d /sys/devices/platform/dcon* >/dev/null 2>&1; then
-		res FAIL dcon-mono "dcon present, no monochrome node"
+	if ls -d /sys/devices/platform/dcon* >/dev/null 2>&1 || grep -q 'olpc_dcon' "$TMP/dmesg.txt"; then
+		res FAIL dcon-mono "dcon driver seen but no monochrome node (probe failed?)"
 	else res FAIL dcon-mono "no DCON device in sysfs"; fi
 fi
 
 # ------------------------------------------------------------------ audio
+# card detection: /proc/asound/cards (needs SND_PROC_FS), then /sys/class/sound,
+# then `aplay -l`
+card=""
 if [ -s /proc/asound/cards ] && ! grep -q 'no soundcards' /proc/asound/cards; then
-	res PASS audio-card "$(head -n1 /proc/asound/cards | sed 's/^ *//')"
+	card="$(head -n1 /proc/asound/cards | sed 's/^ *//')"
+fi
+if [ -z "$card" ]; then
+	for d in /sys/class/sound/card[0-9]*; do
+		[ -d "$d" ] || continue
+		card="sysfs $(basename "$d") id=$(cat "$d/id" 2>/dev/null)"
+		break
+	done
+fi
+if [ -z "$card" ]; then
+	bounded 8 aplay -l >"$TMP/aplay.txt" 2>&1
+	card=$(grep -m1 '^card' "$TMP/aplay.txt")
+fi
+if [ -n "$card" ]; then
+	res PASS audio-card "$card"
 	# unmute common AC97 controls (names differ; errors ignored)
 	for c in Master PCM Headphone Speaker Mic "Mic Boost" Capture "Capture Switch" "Mic Capture Switch"; do
-		timeout 3 amixer -q -c 0 sset "$c" 80% unmute cap >/dev/null 2>&1
+		bounded 3 amixer -q -c 0 sset "$c" 80% unmute cap >/dev/null 2>&1
 	done
-	timeout 4 speaker-test -c 2 -t sine -f 440 -l 1 >"$TMP/spk.txt" 2>&1
+	bounded 6 speaker-test -c 2 -t sine -f 440 -l 1 >"$TMP/spk.txt" 2>&1
 	rc=$?
-	# 124 = still playing when timeout stopped it: counts as played
+	# 124 = still playing when `bounded` stopped it: counts as played
 	if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then res PASS audio-play "speaker-test sine 440Hz rc=$rc"
 	else res FAIL audio-play "speaker-test rc=$rc: $(tail -n1 "$TMP/spk.txt")"; fi
 	rec=0
 	for ch in 1 2; do
 		rm -f "$TMP/mic.wav"
-		timeout 5 arecord -q -D default -f S16_LE -r 8000 -c $ch -d 1 "$TMP/mic.wav" >"$TMP/rec.txt" 2>&1
+		bounded 6 arecord -q -D default -f S16_LE -r 8000 -c $ch -d 1 "$TMP/mic.wav" >"$TMP/rec.txt" 2>&1
 		[ $? -eq 0 ] && [ -s "$TMP/mic.wav" ] && { rec=1; break; }
 	done
 	if [ $rec -eq 1 ]; then
@@ -133,7 +154,7 @@ if [ -s /proc/asound/cards ] && ! grep -q 'no soundcards' /proc/asound/cards; th
 		res FAIL audio-mic "arecord failed: $(tail -n1 "$TMP/rec.txt")"
 	fi
 else
-	res FAIL audio-card "no sound card in /proc/asound/cards"
+	res FAIL audio-card "no sound card (/proc/asound, /sys/class/sound, aplay -l)"
 	res SKIP audio-play "no card"
 	res SKIP audio-mic "no card"
 fi
@@ -171,10 +192,11 @@ if dev=$(any_cap sw 0); then res PASS in-lid "SW_LID on $dev"; else res FAIL in-
 if dev=$(any_cap sw 1); then res PASS in-ebook "SW_TABLET_MODE on $dev"; else res FAIL in-ebook "SW_TABLET_MODE missing"; fi
 
 # ------------------------------------------------------------------ power
-bat=""; ac=""
+bat=""; ac=""; supplies=""
 for d in /sys/class/power_supply/*; do
 	[ -d "$d" ] || continue
 	t=$(cat "$d/type" 2>/dev/null)
+	supplies="$supplies $(basename "$d")($t)"
 	[ "$t" = Battery ] && bat=$d
 	[ "$t" = Mains ] && ac=$d
 done
@@ -183,7 +205,7 @@ if [ -n "$bat" ]; then
 	if [ -n "$cap" ] && [ -n "$st" ]; then res PASS battery "$(basename "$bat") ${cap}% $st"
 	else res FAIL battery "$(basename "$bat") capacity='$cap' status='$st'"; fi
 else
-	res FAIL battery "no power_supply of type Battery"
+	res FAIL battery "no Battery supply; present:${supplies:- none}"
 fi
 if [ -n "$ac" ]; then
 	on=$(cat "$ac/online" 2>/dev/null)
@@ -192,18 +214,13 @@ else
 	res FAIL ac "no Mains supply"
 fi
 
-# ------------------------------------------------------------------ NAND (READ ONLY)
+# ------------------------------------------------------------------ NAND
+# POLICY: the cafe_nand driver is blacklisted and install-guarded (see
+# /etc/modprobe.d/olpcboy.conf); nothing here may probe or open an MTD device.
 if [ -s /proc/mtd ] && [ "$(wc -l </proc/mtd)" -gt 1 ]; then
-	m=/sys/class/mtd/mtd0
-	sz=$(cat $m/size 2>/dev/null); ty=$(cat $m/type 2>/dev/null)
-	bb=$(cat $m/bad_blocks 2>/dev/null)
-	nm=$(sed -n '2p' /proc/mtd | sed 's/.*"\(.*\)"/\1/')
-	res PASS nand "mtd0 '$nm' type=$ty size=$((${sz:-0} / 1048576))MB"
-	if [ -n "$bb" ]; then res INFO nand-bad "bad blocks (sysfs): $bb"
-	else res INFO nand-bad "bad_blocks sysfs node absent"; fi
-else
-	res FAIL nand "no MTD device in /proc/mtd"
+	res INFO nand-unexpected "/proc/mtd lists devices although the driver is policy-blocked"
 fi
+res SKIP nand "driver not loaded by policy"
 
 # ------------------------------------------------------------------ SD / USB
 mmc=$(ls -d /sys/class/mmc_host/mmc* 2>/dev/null | wc -l)
@@ -225,39 +242,46 @@ if [ "$hc" -gt 0 ]; then res PASS usb "$hc root hub(s), $ports ports; $(ls /sys/
 else res FAIL usb "no USB host controller"; fi
 
 # ------------------------------------------------------------------ wifi (explicit, then OFF again)
-if timeout 15 modprobe libertas_usb >"$TMP/wifi.txt" 2>&1; then
+# libertas USB is the module `usb8xxx` (it pulls in `libertas`); the older name
+# libertas_usb is kept as a fallback.
+wmod=""
+for m in usb8xxx libertas_usb; do
+	if bounded 20 modprobe "$m" >"$TMP/wifi.txt" 2>&1; then wmod=$m; break; fi
+done
+if [ -n "$wmod" ]; then
 	i=0; ifc=""
 	while [ $i -lt 10 ] && [ -z "$ifc" ]; do
 		for n in /sys/class/net/*; do
 			[ -d "$n/wireless" ] || [ -d "$n/phy80211" ] && { ifc=$(basename "$n"); break; }
 		done
-		[ -z "$ifc" ] && { sleep 1; i=$((i + 1)); }
+		[ -z "$ifc" ] && { olpc_sleep 1; i=$((i + 1)); }
 	done
 	if [ -n "$ifc" ]; then
 		ip link set "$ifc" up >/dev/null 2>&1
-		sleep 1
-		cnt=$(timeout 15 iwlist "$ifc" scan 2>/dev/null | grep -c ESSID)
+		olpc_sleep 1
+		cnt=$(bounded 15 iwlist "$ifc" scan 2>/dev/null | grep -c ESSID)
 		if [ "${cnt:-0}" -eq 0 ]; then
-			cnt=$(timeout 15 iw dev "$ifc" scan 2>/dev/null | grep -c SSID)
+			cnt=$(bounded 15 iw dev "$ifc" scan 2>/dev/null | grep -c SSID)
 		fi
-		res PASS wifi "$ifc appeared; scan saw ${cnt:-0} network(s)"
+		res PASS wifi "$ifc appeared ($wmod); scan saw ${cnt:-0} network(s)"
 		ip link set "$ifc" down >/dev/null 2>&1
 	else
-		res FAIL wifi "libertas_usb loaded, no wireless interface in 10s"
+		res FAIL wifi "$wmod loaded, no wireless interface in 10s"
 	fi
-	timeout 10 rmmod libertas_usb libertas >/dev/null 2>&1
-	timeout 5 rfkill block wifi >/dev/null 2>&1
+	bounded 10 rmmod usb8xxx libertas_usb libertas >/dev/null 2>&1
+	bounded 5 rfkill block wifi >/dev/null 2>&1
 else
-	res FAIL wifi "modprobe libertas_usb: $(tail -n1 "$TMP/wifi.txt")"
+	res FAIL wifi "modprobe usb8xxx/libertas_usb: $(tail -n1 "$TMP/wifi.txt")"
 fi
 
 # ------------------------------------------------------------------ camera
-timeout 15 modprobe cafe_ccic >/dev/null 2>&1
-timeout 15 modprobe ov7670 >/dev/null 2>&1
-i=0; while [ ! -c /dev/video0 ] && [ $i -lt 5 ]; do sleep 1; i=$((i + 1)); done
+bounded 15 modprobe cafe_ccic >/dev/null 2>&1
+bounded 15 modprobe ov7670 >/dev/null 2>&1
+i=0; while [ ! -c /dev/video0 ] && [ $i -lt 5 ]; do olpc_sleep 1; i=$((i + 1)); done
 if [ -c /dev/video0 ]; then
+	bounded 12 v4l2-ctl -d /dev/video0 --all >"$BOOTDIR/camera-v4l2-all.txt" 2>&1
 	rm -f "$TMP/frame.raw"
-	timeout 10 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to="$TMP/frame.raw" >"$TMP/cam.txt" 2>&1
+	bounded 12 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to="$TMP/frame.raw" >"$TMP/cam.txt" 2>&1
 	rc=$?
 	if [ -s "$TMP/frame.raw" ]; then
 		fsz=$(wc -c <"$TMP/frame.raw")
@@ -271,16 +295,35 @@ else
 fi
 
 # ------------------------------------------------------------------ misc
-if [ -r /sys/class/rtc/rtc0/date ] || [ -c /dev/rtc0 ]; then
-	res PASS rtc "$(cat /sys/class/rtc/rtc0/date 2>/dev/null) $(cat /sys/class/rtc/rtc0/time 2>/dev/null)"
+# rtc: sysfs/devnode need RTC_INTF_SYSFS/RTC_INTF_DEV; the kernel log line alone
+# proves registration
+if [ -d /sys/class/rtc/rtc0 ]; then
+	res PASS rtc "rtc0 $(cat /sys/class/rtc/rtc0/name 2>/dev/null) $(cat /sys/class/rtc/rtc0/date 2>/dev/null) $(cat /sys/class/rtc/rtc0/time 2>/dev/null)"
+elif [ -c /dev/rtc0 ] || [ -c /dev/rtc ]; then
+	res PASS rtc "/dev/rtc0 present (no sysfs class)"
+elif grep -q 'registered as rtc0' "$TMP/dmesg.txt"; then
+	res FAIL rtc "registered as rtc0 in kernel log, but no /sys/class/rtc, no /dev/rtc0"
 else res FAIL rtc "no rtc0"; fi
-if [ -c /dev/watchdog ] || [ -d /sys/class/watchdog/watchdog0 ]; then
-	res PASS watchdog "present (not armed)"
-else res FAIL watchdog "no watchdog device"; fi
+# watchdog: load the driver (module geodewdt) and look at the class; the device
+# node is NEVER opened (opening it would arm the timer)
+wdmod=""
+for m in geodewdt geode_wdt; do
+	if bounded 10 modprobe "$m" >"$TMP/wdt.txt" 2>&1; then wdmod=$m; break; fi
+done
+wd=""
+for d in /sys/class/watchdog/watchdog[0-9]*; do [ -d "$d" ] && { wd=$d; break; }; done
+if [ -n "$wd" ]; then
+	res PASS watchdog "$(basename "$wd") $(cat "$wd/identity" 2>/dev/null) (not armed, never opened)"
+elif [ -c /dev/watchdog ] || [ -c /dev/watchdog0 ]; then
+	res PASS watchdog "device node present (not armed, never opened)"
+else
+	res FAIL watchdog "no watchdog (modprobe: ${wdmod:-$(tail -n1 "$TMP/wdt.txt")})"
+fi
+[ -n "$wdmod" ] && bounded 10 rmmod "$wdmod" >/dev/null 2>&1
 if [ -c /dev/hwrng ] || [ -r /sys/class/misc/hw_random/rng_available ]; then
 	cur=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null)
 	if [ -c /dev/hwrng ]; then
-		n=$(timeout 3 dd if=/dev/hwrng bs=16 count=1 2>/dev/null | wc -c)
+		n=$(bounded 3 dd if=/dev/hwrng bs=16 count=1 2>/dev/null | wc -c)
 	else n=0; fi
 	res PASS hwrng "current=$cur read ${n}B"
 else res FAIL hwrng "no hw_random"; fi
@@ -288,17 +331,19 @@ if [ -r /sys/power/state ]; then res INFO suspend "/sys/power/state: $(cat /sys/
 else res FAIL suspend "/sys/power/state missing"; fi
 
 # ------------------------------------------------------------------ summary
+# Built once, from the counters.  The copy in the log is prefixed with '# ' so
+# that counting PASS/FAIL lines of selftest.log never sees it.
 {
 	echo "PASS $NPASS   FAIL $NFAIL   SKIP $NSKIP"
 	[ -n "$FAILED" ] && echo "failed:$FAILED"
 	echo "uptime $(olpc_uptime)s"
 } >"$SUMMARY"
-cat "$SUMMARY" >>"$LOG"
+sed 's/^/# SUMMARY /' "$SUMMARY" >>"$LOG"
 echo
 if [ "$NFAIL" -eq 0 ]; then printf "${C_P}"; else printf "${C_F}"; fi
 cat "$SUMMARY"
 printf "${C_0}"
 rm -rf "$TMP"
-sync
+olpc_sync
 tl "selftest end pass=$NPASS fail=$NFAIL skip=$NSKIP"
 exit 0

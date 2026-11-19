@@ -18,19 +18,23 @@ start() {
 	tl "olpclog start (boot dir $BOOTDIR)"
 
 	# make sure the logging fs is writable; if the initramfs could not mount
-	# it, try once more (never fatal)
+	# it, try once more on the explicit device (never `mount LABEL=`: that
+	# would probe every block device, mtdblock included).  Never fatal.
 	if ! grep -q ' /mnt/olpclog ' /proc/mounts; then
-		tl "WARNING: /mnt/olpclog not mounted, trying LABEL=OLPCLOG"
-		mount /mnt/olpclog 2>>"$BOOTDIR/olpclog.err"
+		tl "WARNING: /mnt/olpclog not mounted, retrying"
+		for d in $(olpc_blockdevs); do
+			case "$(blkid "$d" 2>/dev/null)" in
+			*'LABEL="OLPCLOG"'*)
+				mount -t vfat -o rw,noatime,flush "$d" /mnt/olpclog 2>>"$BOOTDIR/olpclog.err"
+				break ;;
+			esac
+		done
 	fi
 
 	# core dumps into the boot dir: kernel.core_pattern, size-limited by the
 	# rc_ulimit in rc.conf (services) and ulimit -c in /etc/profile (shells)
 	echo "$BOOTDIR/core.%e.%p" >/proc/sys/kernel/core_pattern 2>/dev/null
 	echo 0 >/proc/sys/kernel/core_uses_pid 2>/dev/null
-
-	# console never blank
-	printf '\033[9;0]\033[14;0]' >/dev/tty0 2>/dev/null
 
 	cat /proc/uptime >"$BOOTDIR/uptime.at-olpclog" 2>/dev/null
 	start-stop-daemon --start --background --make-pidfile \

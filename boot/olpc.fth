@@ -12,15 +12,28 @@
 " last:\boot\bzImage" to boot-device
 
 \ Kernel command line, no root= : the embedded initramfs finds partitions by label
-\   console=tty0 + fbcon TER16x32 : readable text on the 1200x900 LCD
-\   ignore_loglevel printk.time=1 : full timestamped kernel log
+\   console=tty0                  : kernel/init console on the LCD framebuffer
+\   fbcon=font:TER16x32           : large readable font on the 1200x900 LCD
+\   loglevel=4                    : only warnings and worse are painted on the
+\                                   framebuffer console (less repainting); the log
+\                                   copier reads /dev/kmsg, which still gets everything
+\   printk.time=1                 : timestamp every kernel message
 \   panic=0                       : on panic stay on screen, do not reboot
 \   reboot=pci                    : the reboot method the XO-1 needs
 \   rootwait                      : USB stick may enumerate late
 \   olpcboy.debug=1               : enable the initramfs/userland debug logging
+\   vt.global_cursor_default=0    : no blinking text cursor (a constant repaint)
+\   consoleblank=0                : the screen must never blank or power down
 \ (no ramoops/memmap reservation: safe RAM addresses beside Open Firmware's own
 \  top-of-memory area on the 256 MB XO-1 could not be verified)
-" console=tty0 fbcon=font:TER16x32 ignore_loglevel printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1" to boot-file
+\   i8042.dumbkbd=1               : the keyboard module of this unit is unplugged,
+\                                   so atkbd's probe gets no answer and no input
+\                                   device appears; this makes atkbd bind without
+\                                   probing, so D-pad / game-key scancodes sent by
+\                                   the EC are delivered
+\   i8042.debug=1 i8042.unmask_kbd_data=1 : log every byte from the keyboard
+\                                   controller to the kernel log (debug image only)
+" console=tty0 fbcon=font:TER16x32 loglevel=4 printk.time=1 panic=0 reboot=pci rootwait olpcboy.debug=1 vt.global_cursor_default=0 consoleblank=0 i8042.dumbkbd=1 i8042.debug=1 i8042.unmask_kbd_data=1" to boot-file
 
 \ Load the kernel from boot-device with boot-file as its command line and run it
 boot

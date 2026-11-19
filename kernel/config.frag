@@ -181,7 +181,7 @@ CONFIG_NLS_UTF8=y
 CONFIG_MTD=y
 CONFIG_MTD_BLOCK=y
 CONFIG_MTD_RAW_NAND=y
-CONFIG_MTD_NAND_CAFE=y
+CONFIG_MTD_NAND_CAFE=m
 CONFIG_JFFS2_FS=y
 CONFIG_JFFS2_COMPRESSION_OPTIONS=y
 CONFIG_JFFS2_SUMMARY=y
@@ -217,3 +217,31 @@ CONFIG_MEDIA_PLATFORM_DRIVERS=y
 CONFIG_VIDEO_CAFE_CCIC=m
 CONFIG_VIDEO_CAMERA_SENSOR=y
 CONFIG_VIDEO_OV7670=m
+CONFIG_MTD_CMDLINE_PARTS=y
+CONFIG_LOG_BUF_SHIFT=19
+CONFIG_SND_PROC_FS=y
+CONFIG_SND_VERBOSE_PROCFS=y
+CONFIG_RTC_INTF_SYSFS=y
+CONFIG_RTC_INTF_PROC=y
+CONFIG_RTC_INTF_DEV=y
+CONFIG_CRYPTO_AES=y
+CONFIG_CRYPTO_CBC=y
+CONFIG_CRYPTO_ECB=y
+CONFIG_SCSI_SCAN_ASYNC=y
+CONFIG_CRYPTO_MANAGER_DISABLE_TESTS=y
+
+# musl on i386 still issues the 32-bit time syscalls (nanosleep, utimensat, ...)
+# when the value fits; without this they return ENOSYS and sleep/timeout/cp -p
+# silently misbehave (seen on the first hardware boot).
+CONFIG_COMPAT_32BIT_TIME=y
+# Raw access to the keyboard port: fallback way to read the game-key scancodes
+# when atkbd does not bind (this unit's keyboard module is unplugged).
+CONFIG_SERIO_RAW=m
+
+# Wired USB gamepads. Built in, not modules: nothing autoloads modules on
+# hotplug here, and hid-generic refuses any device that has a special driver
+# enabled (HID_QUIRK_HAVE_SPECIAL_DRIVER), so as modules these pads would get
+# no input device at all. Force feedback and LED options stay off.
+CONFIG_HID_SONY=y
+CONFIG_JOYSTICK_XPAD=y
+CONFIG_HID_NINTENDO=y

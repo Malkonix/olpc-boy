@@ -151,18 +151,32 @@ echo "flash: unmounting partitions of $DEV"
 while IFS= read -r m; do [ -n "$m" ] && sudo umount "$m"; done <<< "$F_MOUNTS"
 
 echo "flash: writing $IMG ($IMG_SIZE bytes) -> $DEV"
-sudo dd if="$IMG" of="$DEV" bs=4M conv=fsync status=progress
-sync
-sudo blockdev --flushbufs "$DEV" || true          # drop cached reads before verifying
-sudo blockdev --rereadpt "$DEV" || sudo partprobe "$DEV" || echo "flash: warning: could not re-read partition table"
-udevadm settle || true
-
-echo "flash: verifying first $IMG_SIZE bytes (sha256)"
+echo "flash: ############################################################"
+echo "flash: #   DO NOT REMOVE THE STICK until it says VERIFIED         #"
+echo "flash: ############################################################"
 WANT=$(sha256sum "$IMG" | cut -d' ' -f1)
-GOT=$(sudo dd if="$DEV" bs=4M iflag=count_bytes count="$IMG_SIZE" status=none | sha256sum | cut -d' ' -f1)
+# Write and read back inside ONE root shell that keeps the device open on fd 3.
+# Closing a written block device makes udev re-scan it and a desktop automounter
+# then mounts the partitions read-write, changing ext4/FAT metadata before the
+# read-back.  Holding fd 3 postpones that close until the hash has been taken.
+GOT=$(sudo sh -c '
+    exec 3<>"$1" || exit 1
+    dd if="$2" bs=4M conv=fsync status=progress >&3 || exit 1
+    sync
+    blockdev --flushbufs "$1"   # read back from the stick, not the page cache
+    dd if="$1" bs=4M iflag=count_bytes count="$3" status=none | sha256sum | cut -d" " -f1
+' sh "$DEV" "$IMG" "$IMG_SIZE")
+sudo blockdev --rereadpt "$DEV" 2>/dev/null || sudo partprobe "$DEV" 2>/dev/null || true
+udevadm settle || true
 if [ "$WANT" != "$GOT" ]; then
     echo "flash: VERIFY FAILED  image=$WANT  device=$GOT" >&2
     exit 1
 fi
 echo "flash: OK  sha256=$WANT"
+echo
+echo "flash: ############################################################"
+echo "flash: #                                                          #"
+echo "flash: #   VERIFIED - safe to remove the stick                    #"
+echo "flash: #                                                          #"
+echo "flash: ############################################################"
 echo "flash: now eject the stick, plug it into the XO-1 and power on (no keyboard needed)."

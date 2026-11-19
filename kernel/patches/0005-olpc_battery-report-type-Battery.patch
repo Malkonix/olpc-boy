@@ -1,0 +1,17 @@
+From: olpc-boy
+Subject: power: olpc_battery: set the power supply type to Battery
+
+olpc_bat_desc has no .type, so /sys/class/power_supply/olpc_battery/type
+reads "Unknown" (POWER_SUPPLY_TYPE_UNKNOWN is 0). Userspace that picks the
+battery by type does not find it.
+
+--- a/drivers/power/supply/olpc_battery.c
++++ b/drivers/power/supply/olpc_battery.c
+@@ -606,6 +606,7 @@
+ 
+ static struct power_supply_desc olpc_bat_desc = {
+ 	.name = "olpc_battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
+ 	.get_property = olpc_bat_get_property,
+ 	.use_for_apm = 1,
+ };

@@ -1,5 +1,6 @@
 #!/sbin/openrc-run
-# Last service of the default runlevel: marks the boot as complete.
+# Last service of the default runlevel: marks the boot as complete and starts
+# the (background, nice 19) hardware inventory.
 
 description="olpc-boy boot-complete marker"
 

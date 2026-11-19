@@ -1,0 +1,84 @@
+From: olpc-boy
+Subject: mtd: cafe_nand: read-only bad block table by default, ignore OOB markers
+
+- The CAFE controller stores its Reed-Solomon ECC in OOB bytes 0..13, so the
+  generic "OOB byte 0" bad block marker test sees every programmed block as
+  bad. Set NAND_BBT_NO_OOB_BBM: the flash BBT search no longer skips its
+  candidate blocks as "bad", and no OOB markers are written on markbad.
+- The stock descriptors carry NAND_BBT_CREATE | NAND_BBT_WRITE, so a probe
+  that does not find a table scans the device and erases/writes a new table
+  plus mirror in the last blocks of the NAND. Unless the new allow_bbt_write=1
+  module parameter is given, both flags are removed from the descriptors:
+  an existing flash table is still read, nothing is created or written.
+
+--- a/drivers/mtd/nand/raw/cafe_nand.c
++++ b/drivers/mtd/nand/raw/cafe_nand.c
+@@ -79,6 +79,18 @@
+ static int skipbbt = 0;
+ module_param(skipbbt, int, 0644);
+ 
++/*
++ * Safe by default: the BBT descriptors below carry NAND_BBT_CREATE and
++ * NAND_BBT_WRITE, so a probe on a chip whose flash table is not found scans
++ * every block and erases/writes a new table (and mirror) in the last blocks.
++ * Unless allow_bbt_write=1, both flags are removed before nand_scan(): an
++ * existing flash table is still read; nothing is created, scrubbed or written.
++ * If no table is found the in-RAM table stays empty (every block counts as good).
++ */
++static int allow_bbt_write = 0;
++module_param(allow_bbt_write, int, 0444);
++MODULE_PARM_DESC(allow_bbt_write, "Let the driver create/write the flash bad block table (default 0: never write)");
++
+ static int debug = 0;
+ module_param(debug, int, 0644);
+ 
+@@ -588,6 +600,14 @@
+ 	return gf4096_mul(x, 0xe01);
+ }
+ 
++static void cafe_bbt_set_mode(struct nand_bbt_descr *d)
++{
++	if (allow_bbt_write)
++		d->options |= NAND_BBT_CREATE | NAND_BBT_WRITE;
++	else
++		d->options &= ~(NAND_BBT_CREATE | NAND_BBT_WRITE);
++}
++
+ static int cafe_nand_attach_chip(struct nand_chip *chip)
+ {
+ 	struct mtd_info *mtd = nand_to_mtd(chip);
+@@ -628,6 +648,9 @@
+ 		err = -ENOTSUPP;
+ 		goto out_free_dma;
+ 	}
++	/* bbt_td/md are only known here; nand_scan_tail builds the BBT right after */
++	cafe_bbt_set_mode(cafe->nand.bbt_td);
++	cafe_bbt_set_mode(cafe->nand.bbt_md);
+ 
+ 	cafe->nand.ecc.engine_type = NAND_ECC_ENGINE_TYPE_ON_HOST;
+ 	cafe->nand.ecc.placement = NAND_ECC_PLACEMENT_INTERLEAVED;
+@@ -714,11 +737,23 @@
+ 	cafe->nand.legacy.chip_delay = 0;
+ 
+ 	/* Enable the following for a flash based bad block table */
+-	cafe->nand.bbt_options = NAND_BBT_USE_FLASH;
++	/*
++	 * CAFE keeps its Reed-Solomon ECC in OOB bytes 0..13, so the generic
++	 * "OOB byte 0 != 0xff" bad block marker test flags every programmed
++	 * page as bad. NO_OOB_BBM skips that test when looking for the flash
++	 * BBT (nand_bbt.c: bbt_block_checkbad) and never writes OOB markers
++	 * (nand_base.c: nand_block_markbad_lowlevel).
++	 */
++	cafe->nand.bbt_options = NAND_BBT_USE_FLASH | NAND_BBT_NO_OOB_BBM;
+ 
+ 	if (skipbbt)
+ 		cafe->nand.options |= NAND_SKIP_BBTSCAN | NAND_NO_BBM_QUIRK;
+ 
++	if (allow_bbt_write)
++		dev_warn(&pdev->dev, "allow_bbt_write=1: a missing bad block table WILL be created and written to the NAND\n");
++	else
++		dev_warn(&pdev->dev, "bad block table is READ-ONLY (allow_bbt_write=0): nothing is created or written; no table on flash => all blocks assumed good\n");
++
+ 	if (numtimings && numtimings != 3) {
+ 		dev_warn(&cafe->pdev->dev, "%d timing register values ignored; precisely three are required\n", numtimings);
+ 	}

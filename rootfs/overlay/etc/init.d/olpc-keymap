@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# Load the XO-1 game-button keymap (scancode -> keycode) early in sysinit.
+
+description="olpc-boy: load the game-button keymap"
+
+depend() {
+	need olpclog
+	after mdev hwdrivers
+	before olpc-dcon
+}
+
+start() {
+	ebegin "Loading game-button keymap"
+	/usr/local/sbin/olpc-keymap apply
+	# A failure must not fail the boot: the result is in timeline.log.
+	eend 0
+}

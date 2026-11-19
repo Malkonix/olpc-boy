@@ -1,17 +1,18 @@
 #!/bin/sh
 # Background supervisor for the log partition:
-#   every 1 s : sync
-#   every 5 s : make sure the kmsg reader is still alive
+#   every ~3 s : sync   (the log fs is mounted WITHOUT the sync option; this
+#                        loop bounds what a hard power-off can lose)
+#   every ~6 s : make sure the kmsg reader is still alive
 . /usr/libexec/olpcboy/common.sh
 i=0
 while :; do
 	sync
 	i=$((i + 1))
-	if [ $((i % 5)) -eq 0 ] && [ -c /dev/kmsg ]; then
+	if [ $((i % 2)) -eq 0 ] && [ -c /dev/kmsg ]; then
 		if ! pgrep -f 'cat /dev/kmsg' >/dev/null 2>&1; then
 			echo "--- kmsg reader restarted at uptime $(olpc_uptime) ---" >>"$BOOTDIR/kmsg.log"
 			cat /dev/kmsg >>"$BOOTDIR/kmsg.log" 2>/dev/null &
 		fi
 	fi
-	sleep 1
+	olpc_sleep 3
 done

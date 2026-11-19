@@ -1,6 +1,10 @@
 #!/bin/sh
-# tty1 driver (respawned by init): selftest -> button capture -> status screen.
-# Never waits for keyboard input.  Selftest/buttons run only once per boot.
+# tty1 driver (respawned by init): button capture -> selftest -> status screen.
+# The button capture comes first: it is the one thing that needs the user.
+# Never waits for keyboard input.  Runs only once per boot.
+# The screen is repainted as little as possible (the display flickered on the
+# first boot): one clear per phase, line-by-line output, status redrawn only
+# when its text changes.
 . /usr/libexec/olpcboy/common.sh
 exec </dev/null
 STATE=/run/olpcboy/tty1.state
@@ -8,41 +12,42 @@ mkdir -p /run/olpcboy
 
 if [ ! -e "$STATE" ]; then
 	: >"$STATE"
+	if ! cmdline_has olpcboy.nobuttons; then
+		tl "tty1: buttons start"
+		/usr/local/sbin/olpc-buttons
+		tl "tty1: buttons done"
+	fi
 	printf '\033[2J\033[H'
 	tl "tty1: selftest start"
 	/usr/local/sbin/olpc-selftest
 	tl "tty1: selftest done"
-	if ! cmdline_has olpcboy.nobuttons; then
-		/usr/local/sbin/olpc-buttons
-	fi
+	olpc_sync
 	tl "tty1: status screen"
 fi
 
-draw() {
-	printf '\033[2J\033[H'
-	printf '\033[1;37;44m%-75s\033[0m\n' " OLPC-BOY   boot $(basename "$(readlink -f "$BOOTDIR")")"
-	echo
+status_text() {
+	printf ' OLPC-BOY   boot %s\n\n' "$(basename "$(readlink -f "$BOOTDIR")")"
 	if [ -f "$BOOTDIR/REACHED_USERSPACE_OK" ]; then
-		printf '\033[1;32m  Userspace reached OK (uptime %ss)\033[0m\n' "$(cat "$BOOTDIR/REACHED_USERSPACE_OK")"
+		printf '  Userspace reached OK (uptime %ss)\n' "$(cat "$BOOTDIR/REACHED_USERSPACE_OK")"
 	else
-		printf '\033[1;31m  Userspace NOT confirmed yet\033[0m\n'
+		printf '  Userspace NOT confirmed yet\n'
 	fi
-	[ -f "$BOOTDIR/PREVIOUS_BOOT_INCOMPLETE" ] && \
-		printf '\033[1;33m  Previous boot was incomplete!\033[0m\n'
-	echo
-	echo "  Selftest:"
+	[ -f "$BOOTDIR/PREVIOUS_BOOT_INCOMPLETE" ] && printf '  Previous boot was incomplete!\n'
+	printf '\n  Selftest:\n'
 	if [ -f "$BOOTDIR/selftest.summary" ]; then
 		sed 's/^/    /' "$BOOTDIR/selftest.summary" | head -n 12
 	else
 		echo "    (no result)"
 	fi
-	echo
-	printf '\033[1;37;41m%-75s\033[0m\n' " Hold POWER to shut down, then move the USB stick to the PC"
-	echo
-	echo "  Logs: $BOOTDIR"
+	printf '\n  Hold POWER to shut down, then move the USB stick to the PC\n\n  Logs: %s\n' "$BOOTDIR"
 }
 
+LAST=""
 while :; do
-	draw
-	sleep 60
+	cur=$(status_text)
+	if [ "$cur" != "$LAST" ]; then
+		LAST=$cur
+		printf '\033[2J\033[H%s\n' "$cur"
+	fi
+	olpc_sleep 5
 done

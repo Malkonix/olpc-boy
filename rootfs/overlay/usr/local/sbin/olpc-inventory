@@ -1,57 +1,95 @@
 #!/bin/sh
-# One-shot hardware/software inventory into $BOOTDIR/inventory/.
-# Every external command is bounded by timeout; a failure is logged, never fatal.
+# One-shot hardware/software inventory.  Started by olpc-bootdone AFTER
+# REACHED_USERSPACE_OK, in the background, at nice 19.
+# Everything is written to RAM ($STAGE/inventory) and copied to
+# $BOOTDIR/inventory in one go every few commands and at the end.
+# Every external command is bounded (uptime based, see common.sh); a failure
+# is logged, never fatal.
+# NAND policy: no /dev/mtd*, no /dev/mtdblock*, no unrestricted blkid.
 . /usr/libexec/olpcboy/common.sh
-INV=$BOOTDIR/inventory
+INV=$STAGE/inventory
+DST=$BOOTDIR/inventory
+rm -rf "$INV"
 mkdir -p "$INV"
 tl "inventory start"
+NRUN=0
 
-# cp_proc <file>: copy a /proc or /sys file
+publish() { olpc_publish "$INV" "$DST"; }
+
+# cp_file <file>: copy a /proc or /sys file (plain cat: reading a proc file
+# cannot block)
 cp_file() {
-	timeout 5 cat "$1" >"$INV/$(echo "$1" | tr '/' '_' | sed 's/^_//').txt" 2>&1
+	cat "$1" >"$INV/$(echo "$1" | tr '/' '_' | sed 's/^_//').txt" 2>&1
 }
 
 # run <name> <timeout> <cmd...>: output -> inventory/<name>.txt (+ rc line)
 run() {
 	_n=$1; _t=$2; shift 2
-	timeout "$_t" "$@" >"$INV/$_n.txt" 2>&1
+	bounded "$_t" "$@" >"$INV/$_n.txt" 2>&1
 	_rc=$?
 	[ $_rc -ne 0 ] && echo "[rc=$_rc]" >>"$INV/$_n.txt"
+	NRUN=$((NRUN + 1))
+	[ $((NRUN % 12)) -eq 0 ] && publish
 	return 0
 }
 
+# ---- timer sanity: did sleep/timeout work on this boot? (first boot: no)
+{
+	_cs; a=$CS
+	sleep 1; _cs; b=$CS
+	echo "sleep 1 took $((b - a)) cs (want ~100)"
+	_cs; a=$CS
+	timeout 2 sleep 1; r=$?; _cs; b=$CS
+	echo "timeout 2 sleep 1: rc=$r took $((b - a)) cs (want rc=0, ~100)"
+	_cs; a=$CS
+	timeout 1 sleep 3; r=$?; _cs; b=$CS
+	echo "timeout 1 sleep 3: rc=$r took $((b - a)) cs (want rc=143, ~100)"
+	_cs; a=$CS
+	bounded 2 sleep 5; r=$?; _cs; b=$CS
+	echo "bounded 2 sleep 5: rc=$r took $((b - a)) cs (want rc=124, ~200)"
+	echo "sleepmode=$_SLEEPMODE"
+	cat /proc/uptime
+} >"$INV/timer-test.txt" 2>&1
+
 for f in /proc/cpuinfo /proc/meminfo /proc/interrupts /proc/iomem /proc/ioports \
 	/proc/cmdline /proc/modules /proc/devices /proc/mtd /proc/partitions \
-	/proc/mounts /proc/bus/input/devices /proc/asound/cards /proc/asound/devices \
-	/proc/version /proc/filesystems /proc/swaps /proc/loadavg /proc/misc \
-	/proc/fb /proc/tty/drivers /proc/sys/kernel/core_pattern /sys/power/state; do
+	/proc/mounts /proc/bus/input/devices /proc/version /proc/filesystems \
+	/proc/swaps /proc/loadavg /proc/misc /proc/fb /proc/tty/drivers \
+	/proc/sys/kernel/core_pattern /sys/power/state /proc/timer_list \
+	/proc/asound/cards /proc/asound/devices /proc/asound/pcm \
+	/proc/asound/version /proc/asound/modules /proc/asound/card0/id; do
 	[ -r "$f" ] && cp_file "$f"
 done
+publish
 
 run lspci-vnn 15 lspci -vnn
 run lsusb-v 20 lsusb -v          # bounded; also the plain tree below
 run lsusb-tree 10 lsusb -t
 run lsusb 10 lsusb
-run fbset-i 5 fbset -fb /dev/fb0 -i
+run fbset 5 fbset -fb /dev/fb0
 run dmesg 10 dmesg
 run rc-status 10 rc-status -a
 run free 5 free
 run df 5 df -h
 run ps 5 ps
 run uname 5 uname -a
-run blkid 10 blkid
+# blkid only over explicit non-MTD devices
+{
+	olpc_blkid
+} >"$INV/blkid.txt" 2>&1
 run lsmod 5 lsmod
 run aplay-l 10 aplay -l
 run arecord-l 10 arecord -l
 run amixer-contents 10 amixer -c 0 contents
 run amixer-scontrols 10 amixer -c 0 scontrols
-run mtd-list 5 cat /proc/mtd
 run v4l2-list 10 v4l2-ctl --list-devices
+run v4l2-all 15 v4l2-ctl -d /dev/video0 --all
 run ip-link 5 ip link
 run rfkill 5 rfkill list
 run sysctl 5 sysctl -a
+publish
 
-# sysfs trees, small files only
+# ---- sysfs trees, small files only
 {
 	for d in /sys/class/backlight/*; do
 		[ -d "$d" ] || continue
@@ -65,8 +103,18 @@ run sysctl 5 sysctl -a
 {
 	for d in /sys/class/power_supply/*; do
 		[ -d "$d" ] || continue
+		echo "== $d  (type=$(cat "$d/type" 2>/dev/null))"
+		cat "$d/uevent" 2>&1
+	done
+	echo "== /sys/class/power_supply/ listing"
+	ls -l /sys/class/power_supply/ 2>&1
+	for d in /sys/devices/platform/olpc*; do
+		[ -e "$d" ] || continue
 		echo "== $d"
-		timeout 3 cat "$d/uevent" 2>&1
+		ls -l "$d" 2>&1
+		for f in "$d"/*; do
+			[ -f "$f" ] && [ -r "$f" ] && echo "  $(basename "$f")=$(head -c 120 "$f" 2>/dev/null | tr '\n' ' ')"
+		done
 	done
 } >"$INV/power_supply.txt" 2>&1
 
@@ -74,6 +122,8 @@ run sysctl 5 sysctl -a
 	for d in /sys/class/input/event*; do
 		[ -d "$d" ] || continue
 		echo "== $d  name=$(cat "$d/device/name" 2>/dev/null)"
+		echo "  key=$(cat "$d/device/capabilities/key" 2>/dev/null)"
+		echo "  sw=$(cat "$d/device/capabilities/sw" 2>/dev/null)"
 		for c in "$d"/device/capabilities/*; do
 			[ -r "$c" ] && echo "  caps/$(basename "$c")=$(cat "$c")"
 		done
@@ -81,28 +131,65 @@ run sysctl 5 sysctl -a
 	done
 } >"$INV/input-capabilities.txt" 2>&1
 
-# any DCON / graphics / mtd / mmc / rtc / watchdog nodes that exist
 {
-	for d in /sys/class/graphics/fb* /sys/class/mtd/mtd[0-9]* /sys/class/mmc_host/* \
+	for d in /sys/class/input/*; do
+		[ -d "$d" ] || continue
+		echo "$(basename "$d"): name=$(cat "$d/name" 2>/dev/null)"
+	done
+	for d in /sys/bus/i2c/devices/*; do
+		[ -e "$d" ] || continue
+		echo "i2c $(basename "$d"): name=$(cat "$d/name" 2>/dev/null)"
+	done
+} >"$INV/i2c-and-input-names.txt" 2>&1
+
+# debugfs gpio (mount it if the kernel has debugfs)
+{
+	if ! grep -q ' /sys/kernel/debug ' /proc/mounts; then
+		mount -t debugfs none /sys/kernel/debug 2>&1 && echo "(mounted debugfs)"
+	fi
+	for f in gpio pinctrl/pinctrl-maps; do
+		[ -r "/sys/kernel/debug/$f" ] && { echo "== /sys/kernel/debug/$f"; cat "/sys/kernel/debug/$f" 2>&1; }
+	done
+	ls /sys/kernel/debug 2>&1
+} >"$INV/debugfs-gpio.txt" 2>&1
+
+{
+	echo "== monochrome nodes:"
+	find /sys/devices -name monochrome 2>/dev/null
+	echo "== dcon:"
+	ls -d /sys/devices/platform/dcon* /sys/devices/*/dcon* 2>/dev/null
+	for f in /sys/devices/platform/dcon/*; do
+		[ -f "$f" ] && [ -r "$f" ] && echo "  $(basename "$f")=$(head -c 100 "$f" 2>/dev/null | tr '\n' ' ')"
+	done
+	echo "== /sys/class/sound:"
+	ls -l /sys/class/sound 2>&1
+} >"$INV/dcon-and-sound.txt" 2>&1
+
+# graphics / mmc / rtc / watchdog / video / net / thermal class attributes.
+# (no /sys/class/mtd: the NAND is policy-blocked and not even looked at)
+{
+	for d in /sys/class/graphics/fb* /sys/class/mmc_host/* \
 		/sys/class/rtc/* /sys/class/watchdog/* /sys/class/video4linux/* \
 		/sys/class/net/* /sys/class/thermal/*; do
 		[ -e "$d" ] || continue
 		echo "== $d"
 		for f in "$d"/*; do
 			[ -f "$f" ] && [ -r "$f" ] && \
-				echo "  $(basename "$f")=$(timeout 2 head -c 200 "$f" 2>/dev/null | tr '\n' ' ')"
+				echo "  $(basename "$f")=$(head -c 200 "$f" 2>/dev/null | tr '\n' ' ')"
 		done
-	done
-	echo "== dcon"
-	ls -d /sys/devices/platform/dcon* /sys/devices/*/dcon* 2>/dev/null
-	for f in /sys/devices/platform/dcon/*; do
-		[ -f "$f" ] && [ -r "$f" ] && echo "  $(basename "$f")=$(timeout 2 head -c 100 "$f" 2>/dev/null | tr '\n' ' ')"
 	done
 } >"$INV/sysfs-classes.txt" 2>&1
 
 ls -lR /dev >"$INV/dev-listing.txt" 2>&1
 ls /sys/bus/*/devices >"$INV/sys-bus-devices.txt" 2>&1
+publish
 
-sync
+# final snapshots of this boot (after the selftest has had its chance)
+bounded 10 dmesg >"$INV/../dmesg.final.txt" 2>&1
+bounded 10 rc-status -a >"$INV/../rc-status.final.txt" 2>&1
+bounded 5 free >"$INV/../free.final.txt" 2>&1
+cp "$STAGE/dmesg.final.txt" "$STAGE/rc-status.final.txt" "$STAGE/free.final.txt" "$BOOTDIR/" 2>/dev/null
+publish
+olpc_sync
 tl "inventory done"
 exit 0

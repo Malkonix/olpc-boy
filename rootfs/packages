@@ -18,8 +18,8 @@ dosfstools
 # blkid/findfs/lsblk-style tools: busybox provides blkid + findfs, but
 # util-linux-misc adds the full blkid/wipefs/etc. for debugging.
 util-linux-misc
-# NAND (XO-1 has a CAFE NAND): nanddump, nandtest, flash_* ... (we only READ)
-mtd-utils
+# (mtd-utils is deliberately NOT installed: nothing in userland may touch the
+# internal NAND.)
 
 # --- hardware diagnostics ----------------------------------------------
 evtest

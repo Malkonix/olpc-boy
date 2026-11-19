@@ -1,6 +1,7 @@
-# root is mounted by the initramfs (LABEL=OLPCROOT or olpcboy.root=)
+# The initramfs REWRITES this file at every boot with the real devices it
+# mounted (device nodes instead of LABEL=: `mount LABEL=...` probes every block
+# device, mtdblock included).  This copy is only the fallback for a root that
+# was not entered through the initramfs.
 LABEL=OLPCROOT	/		ext4	rw,noatime	0 0
-# already mounted (and moved here) by the initramfs; noauto so localmount
-# never fights over it.  `mount /mnt/olpclog` works as a fallback.
 LABEL=OLPCLOG	/mnt/olpclog	vfat	rw,noatime,flush,noauto	0 0
 tmpfs		/tmp		tmpfs	nosuid,nodev,size=32m	0 0

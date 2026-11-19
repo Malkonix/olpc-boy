@@ -1,7 +1,11 @@
 #!/bin/sh
 # Power button -> sync logs -> clean poweroff.
-# Listens on every /dev/input/event* with evtest (no grab) and reacts to
-# "KEY_POWER ... value 1".  Re-scan once after 20 s: slow USB/SCI devices.
+# Listens on every /dev/input/event* that can emit KEY_POWER with evtest (no
+# grab) and reacts to "KEY_POWER ... value 1".  Re-scan once after ~20 s:
+# slow USB/SCI devices.
+# Sequence: marker + sync, orderly `poweroff` (init runs the shutdown runlevel:
+# killprocs, mount-ro flushes the log partition), and only if the machine is
+# still alive 25 s (uptime) later: sync again and `poweroff -f`.
 . /usr/libexec/olpcboy/common.sh
 FIFO=/run/olpcboy/powerbtn.fifo
 mkdir -p /run/olpcboy
@@ -26,20 +30,24 @@ STARTED=""
 start_listeners
 # keep the fifo open read/write so listeners never get SIGPIPE
 exec 3<>"$FIFO"
-( sleep 20; start_listeners ) 2>/dev/null &
+( olpc_sleep 20; start_listeners ) 2>/dev/null &
 
 while IFS= read -r line <&3; do
 	case "$line" in
 	*"KEY_POWER"*"value 1"*)
 		tl "POWER button pressed: syncing and powering off"
 		echo "$(olpc_uptime)" >"$BOOTDIR/POWEROFF_REQUESTED"
+		echo "olpc-boy: power button, orderly poweroff requested" >/dev/kmsg 2>/dev/null
 		sync
 		printf '\033[2J\033[H\n\n   POWERING OFF...\n   Wait for the screen to go dark,\n   then move the USB stick to the PC.\n' >/dev/tty1 2>/dev/null
-		poweroff &
-		# if the orderly path stalls, force it after 20 s (logs already synced)
-		sleep 20
+		tl "poweroff: orderly"
 		sync
-		tl "poweroff stalled, forcing"
+		poweroff &
+		# if the orderly path stalls, force it after 25 s of uptime
+		_cs; _end=$((CS + 2500))
+		while _cs; [ "$CS" -lt "$_end" ]; do olpc_sleep 1; done
+		tl "poweroff stalled after 25s, forcing"
+		echo "olpc-boy: orderly poweroff stalled, poweroff -f" >/dev/kmsg 2>/dev/null
 		sync
 		poweroff -f
 		;;

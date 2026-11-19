@@ -1,9 +1,43 @@
 #!/bin/sh
-# olpc-dcon mono|color|status
-# Switch the XO-1 display controller (DCON) between monochrome and colour mode.
-# The sysfs node lives under the DCON i2c device, so locate it instead of
-# hard-coding the path.
+# olpc-dcon mono|color|status|brightness up|down|N
+# Switch the XO-1 display controller (DCON) between monochrome and colour mode,
+# or change the backlight (brightness N is absolute, up/down move by ~1/8 of
+# max_brightness, clamped to 0..max; 0 = backlight off, reflective mode).
+# The sysfs nodes live under the DCON i2c device / backlight class, so they are
+# located instead of hard-coded.
 . /usr/libexec/olpcboy/common.sh
+
+brightness() {
+	bl=""
+	for d in /sys/class/backlight/*; do [ -d "$d" ] && { bl=$d; break; }; done
+	if [ -z "$bl" ]; then
+		tl "dcon: brightness: no /sys/class/backlight/* (DCON driver not bound?)"
+		echo "no backlight device" >&2
+		return 1
+	fi
+	max=$(cat "$bl/max_brightness" 2>/dev/null)
+	cur=$(cat "$bl/brightness" 2>/dev/null)
+	case "$max$cur" in ''|*[!0-9]*) tl "dcon: brightness: unreadable max='$max' cur='$cur'"; return 1 ;; esac
+	step=$((max / 8)); [ "$step" -lt 1 ] && step=1
+	case "$1" in
+	up)   new=$((cur + step)) ;;
+	down) new=$((cur - step)) ;;
+	''|*[!0-9]*) echo "usage: olpc-dcon brightness up|down|N" >&2; return 2 ;;
+	*)    new=$1 ;;
+	esac
+	[ "$new" -gt "$max" ] && new=$max
+	[ "$new" -lt 0 ] && new=0
+	echo "$new" >"$bl/brightness" 2>/dev/null
+	now=$(cat "$bl/brightness" 2>&1)
+	tl "dcon: brightness $(basename "$bl") $cur -> $new (max $max, step $step), read back $now"
+	echo "$now"
+}
+
+if [ "$1" = brightness ]; then
+	brightness "$2"
+	exit $?
+fi
+
 node=$(find /sys/devices -name monochrome 2>/dev/null | head -n1)
 if [ -z "$node" ]; then
 	tl "dcon: no monochrome node in sysfs (DCON driver not bound?)"

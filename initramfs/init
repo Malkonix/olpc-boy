@@ -43,6 +43,17 @@ fi
 # console must never blank/power down: nobody can press a key to wake it
 printf '\033[9;0]\033[14;0]' 2>/dev/null
 
+# Black on white: the display boots in DCON mono/reflective mode, where a white
+# background is the readable one.  Swap palette entries 0<->7 (and 8/15) in the
+# VT defaults so every console gets it, then reset tty1's palette to them.
+P=/sys/module/vt/parameters
+if [ -w $P/default_red ]; then
+	echo 0xff,0xaa,0x00,0xaa,0x00,0xaa,0x00,0x00,0xaa,0xff,0x55,0xff,0x55,0xff,0x55,0x00 >$P/default_red
+	echo 0xff,0x00,0xaa,0x55,0x00,0x00,0xaa,0x00,0xaa,0x55,0xff,0xff,0x55,0x55,0xff,0x00 >$P/default_grn
+	echo 0xff,0x00,0x00,0x00,0xaa,0xaa,0xaa,0x00,0xaa,0x55,0x55,0x55,0xff,0xff,0xff,0x00 >$P/default_blu
+	[ -c /dev/tty1 ] && printf '\033]R' >/dev/tty1 2>/dev/null
+fi
+
 CMDLINE=$(cat /proc/cmdline)
 
 cmdline_get() {   # cmdline_get key  -> value of key=value (empty if absent)
@@ -55,6 +66,9 @@ cmdline_get() {   # cmdline_get key  -> value of key=value (empty if absent)
 }
 
 uptime_s() { cut -d' ' -f1 /proc/uptime; }
+# whole seconds of uptime, no fork.  Waits are measured with it, not by counting
+# `sleep` calls: on the first real boot sleep returned at once.
+now_s() { read -r NOW _ </proc/uptime; NOW=${NOW%.*}; }
 
 # tl: timeline entry, to tmpfs and (if available) to the boot dir
 tl() {
@@ -65,20 +79,50 @@ tl() {
 say() { echo "[olpc-boy] $*"; tl "$*"; }
 
 # ---------------------------------------------------------------- helpers
+# NAND policy: busybox findfs/blkid/mount-by-LABEL open EVERY entry of
+# /proc/partitions, mtdblock0 included, and opening the NAND block device is
+# what the first real boot logged five times.  So devices are enumerated here
+# and only sd*/mmcblk*/vd*/hd*/nvme* are ever probed.
+safe_devs() {
+	while read -r _ma _mi _bl _nm; do
+		case "$_nm" in
+		sd[a-z]*|mmcblk[0-9]*|vd[a-z]*|hd[a-z]*|nvme[0-9]*) echo "/dev/$_nm" ;;
+		esac
+	done </proc/partitions
+}
+
+safe_blkid() {   # blkid over the safe devices only
+	for _d in $(safe_devs); do
+		[ -b "$_d" ] && blkid "$_d" 2>/dev/null
+	done
+}
+
+# find_key KEY VALUE  (KEY = LABEL or UUID) -> device path on stdout
+find_key() {
+	for _d in $(safe_devs); do
+		[ -b "$_d" ] || continue
+		_o="$(blkid "$_d" 2>/dev/null) "
+		case "$_o" in
+		*" $1=\"$2\" "*) echo "$_d"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
 find_label() {   # find_label LABEL -> device path on stdout
-	findfs "LABEL=$1" 2>/dev/null
+	find_key LABEL "$1"
 }
 
 # wait_label LABEL SECS -> prints device, returns 0/1
 wait_label() {
-	_i=0
-	while [ "$_i" -lt "$2" ]; do
+	now_s; _end=$((NOW + $2))
+	while :; do
 		_d=$(find_label "$1")
 		if [ -n "$_d" ] && [ -b "$_d" ]; then echo "$_d"; return 0; fi
+		now_s
+		[ "$NOW" -ge "$_end" ] && return 1
 		sleep 1
-		_i=$((_i + 1))
 	done
-	return 1
 }
 
 num_strip() { _n=$(echo "$1" | sed 's/^0*//'); echo "${_n:-0}"; }
@@ -151,9 +195,9 @@ start_kmsg_copier() {
 	fi
 }
 
-# 1s sync loop, only lives until switch_root (olpclog service takes over)
+# 3 s sync loop, only lives until switch_root (olpclog service takes over)
 start_syncer() {
-	( while :; do sync; sleep 1; done ) &
+	( while :; do sync; sleep 3; done ) &
 	SYNC_PID=$!
 }
 
@@ -171,7 +215,7 @@ dump_diag() {   # dump_diag file
 		echo "== uptime $(uptime_s)"
 		echo "== cmdline: $CMDLINE"
 		echo "== /proc/partitions"; cat /proc/partitions
-		echo "== blkid"; timeout 10 blkid
+		echo "== blkid (non-MTD devices only)"; safe_blkid
 		echo "== mounts"; cat /proc/mounts
 		echo "== /proc/filesystems"; cat /proc/filesystems
 		echo "== dmesg tail"; dmesg | tail -n 120
@@ -206,17 +250,18 @@ fail() {   # fail "reason line 1" ["reason line 2"]
 want_root() {   # sets ROOTDEV from olpcboy.root= or LABEL=OLPCROOT; $1 = wait secs
 	spec=$(cmdline_get olpcboy.root)
 	[ -z "$spec" ] && spec="LABEL=$ROOTLABEL"
-	_i=0
+	now_s; _end=$((NOW + $1))
 	while :; do
 		case "$spec" in
-		LABEL=*|UUID=*|PARTUUID=*) ROOTDEV=$(findfs "$spec" 2>/dev/null) ;;
+		LABEL=*|UUID=*) ROOTDEV=$(find_key "${spec%%=*}" "${spec#*=}") ;;
+		PARTUUID=*) ROOTDEV="" ;;     # would need findfs (probes mtd): unsupported
 		/dev/*) ROOTDEV=$spec ;;
-		*) ROOTDEV=$(findfs "LABEL=$spec" 2>/dev/null) ;;
+		*) ROOTDEV=$(find_label "$spec") ;;
 		esac
 		[ -n "$ROOTDEV" ] && [ -b "$ROOTDEV" ] && return 0
-		[ "$_i" -ge "$1" ] && return 1
+		now_s
+		[ "$NOW" -ge "$_end" ] && return 1
 		sleep 1
-		_i=$((_i + 1))
 	done
 }
 
@@ -250,6 +295,14 @@ handover() {
 	echo "$HAVE_LOG" >/run/olpcboy/haslog
 	[ -n "$KMSG_PID" ] && echo "$KMSG_PID" >/run/olpcboy/kmsg.pid
 	cp /run/olpcboy/timeline.log "$NEWROOT/run/olpcboy/" 2>/dev/null
+
+	# fstab with explicit devices: `mount LABEL=...` / remount at boot would
+	# probe every block device (mtdblock included).  The file is rewritten each boot.
+	{
+		echo "$ROOTDEV	/	ext4	rw,noatime	0 0"
+		[ "$HAVE_LOG" = 1 ] && echo "$LOGDEV	/mnt/olpclog	vfat	rw,noatime,flush,noauto	0 0"
+		echo "tmpfs	/tmp	tmpfs	nosuid,nodev,size=32m	0 0"
+	} >"$NEWROOT/etc/fstab"
 
 	tl "switching root (root=$ROOTDEV)"
 	[ "$HAVE_LOG" = 1 ] && { cp /proc/mounts "$BOOTDIR/initramfs-mounts.txt"; sync; }

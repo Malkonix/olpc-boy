@@ -1,0 +1,39 @@
+#!/bin/sh
+# olpc-keymap [apply|table]
+# Single source of the XO-1 game-button keymap.  The D-pad and rotate button
+# send scancodes the kernel does not know (atkbd: "Unknown key pressed"), and
+# the right-hand game keys carry default codes that are meaningless here.
+# KEYMAP lines: <setkeycodes scancode (hex)> <keycode (dec)> <name>
+#   table  prints the map (for other tools); apply loads it with busybox
+#   setkeycodes.  setkeycodes needs a console fd, hence stdin from /dev/tty0.
+. /usr/libexec/olpcboy/common.sh
+
+KEYMAP="65 103 UP
+66 108 DOWN
+67 105 LEFT
+68 106 RIGHT
+69 153 ROTATE
+e065 104 CIRCLE
+e066 109 CROSS
+e067 102 SQUARE
+e068 107 CHECK"
+
+apply() {
+	args=$(echo "$KEYMAP" | while read -r sc kc _; do printf '%s %s ' "$sc" "$kc"; done)
+	i=0
+	while [ $i -lt 3 ]; do
+		# shellcheck disable=SC2086
+		out=$(setkeycodes $args 2>&1 </dev/tty0) && {
+			tl "keymap: ok ($(echo "$KEYMAP" | wc -l) scancodes)"; return 0; }
+		i=$((i + 1))
+		olpc_sleep 1
+	done
+	tl "keymap: error: $(echo "$out" | tr '\n' ' ')"
+	return 1
+}
+
+case "${1:-apply}" in
+table) echo "$KEYMAP" ;;
+apply) apply ;;
+*) echo "usage: olpc-keymap [apply|table]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,10 @@
+#!/bin/sh
+# evdecode FILE FIRST_BLOCK COUNT
+# Decode COUNT raw struct input_event records (16 bytes each on i386: u32 sec,
+# u32 usec, u16 type, u16 code, s32 value) starting at record FIRST_BLOCK of a
+# regular file (a raw capture of /dev/input/eventN) to text, one event per line:
+#   <sec> <usec> <type> <code> <value>
+# hexdump writes to a pipe only when its input ends, which is fine here because
+# the input is a finished slice of a regular file, never the live device.
+dd if="$1" bs=16 skip="$2" count="$3" 2>/dev/null |
+	hexdump -v -e '1/4 "%u " 1/4 "%u " 1/2 "%u " 1/2 "%u " 1/4 "%d" "\n"'
