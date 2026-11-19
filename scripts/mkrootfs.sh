@@ -65,6 +65,42 @@ RC
 : >"$R/etc/securetty"
 sed -i 's/^tty/#tty/' "$R/etc/securetty" 2>/dev/null || true
 
+echo "== olpc-chordd"
+# Logic test first (host-independent, fast), then the static i386 build for the Geode.
+sh src/olpc-chordd/test.sh >"$WORK/chordd-test.log" 2>&1 \
+	|| { cat "$WORK/chordd-test.log" >&2; echo "ERROR: olpc-chordd logic test failed" >&2; exit 1; }
+tail -n1 "$WORK/chordd-test.log"
+make -C src/olpc-chordd OUT="$R/usr/local/sbin" CFLAGS="-Os -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/sbin/olpc-chordd"
+file "$R/usr/local/sbin/olpc-chordd" | sed "s/^/  /"
+
+echo "== olpc-fbbench"
+sh src/olpc-fbbench/test.sh >"$WORK/fbbench-test.log" 2>&1 \
+	|| { cat "$WORK/fbbench-test.log" >&2; echo "ERROR: olpc-fbbench scaling self-test failed" >&2; exit 1; }
+tail -n2 "$WORK/fbbench-test.log"
+make -C src/olpc-fbbench OUT="$R/usr/local/sbin" CFLAGS="-O2 -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/sbin/olpc-fbbench"
+file "$R/usr/local/sbin/olpc-fbbench" | sed "s/^/  /"
+
+# Emulator cores + headless speed test (built separately by src/cores/build.sh).
+# ROMs for the on-device speed test are optional and local only: they come from
+# out/cores/real-roms (user supplied) or out/cores/test-roms (free test ROMs).
+if [ -f out/cores/coretest ]; then
+	echo "== libretro cores"
+	mkdir -p "$R/usr/lib/libretro" "$R/usr/share/olpcboy/bench"
+	cp out/cores/*_libretro.so "$R/usr/lib/libretro/"
+	install -m 0755 out/cores/coretest "$R/usr/local/bin/coretest" 2>/dev/null \
+		|| { mkdir -p "$R/usr/local/bin"; install -m 0755 out/cores/coretest "$R/usr/local/bin/coretest"; }
+	for d in out/cores/real-roms out/cores/test-roms; do
+		[ -d "$d" ] || continue
+		find "$d" -type f \( -name '*.gb' -o -name '*.gbc' -o -name '*.nes' \) | while read -r f; do
+			case $f in *.gbc) n=gbc ;; *.gb) n=gb ;; *) n=nes ;; esac
+			[ -e "$R/usr/share/olpcboy/bench/rom.$n" ] || cp "$f" "$R/usr/share/olpcboy/bench/rom.$n"
+		done
+	done
+	ls -l "$R/usr/lib/libretro" "$R/usr/share/olpcboy/bench" | sed "s/^/  /"
+fi
+
 echo "== runlevels"
 RL=$R/etc/runlevels
 rm -rf "$RL"
@@ -83,7 +119,7 @@ addsvc sysinit olpclog devfs dmesg mdev hwdrivers sysfs procfs olpc-watchdog olp
 addsvc boot modules sysctl hostname hwclock bootmisc syslog root localmount
 # olpc-inventory is NOT a service: olpc-bootdone starts it (background, nice 19)
 # after REACHED_USERSPACE_OK.
-addsvc default olpc-powerbtn olpc-bootdone
+addsvc default olpc-powerbtn olpc-chordd olpc-bootdone
 addsvc shutdown mount-ro killprocs savecache
 # NOT enabled on purpose: networking wpa_supplicant dropbear acpid crond
 

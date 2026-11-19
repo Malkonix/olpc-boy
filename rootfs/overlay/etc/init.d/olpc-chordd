@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# Button chords (CIRCLE+CHECK: backlight, mono/colour; SQUARE+CROSS: volume, mute); see rootfs/README.md.
+
+description="olpc-boy: game-button chords (backlight, DCON mode)"
+command=/usr/local/sbin/olpc-chordd
+command_background=yes
+pidfile=/run/olpc-chordd.pid
+# stderr/stdout of the daemon; its actions also go to timeline.log
+output_log=/var/log/olpc-current/chordd.log
+error_log=/var/log/olpc-current/chordd.log
+
+depend() {
+	need olpclog
+	after olpc-keymap olpc-dcon mdev hwdrivers modules
+}
+
+start_pre() {
+	mkdir -p /run/olpcboy
+}

@@ -20,9 +20,9 @@ RUN_ROOT := $(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) $(BUILDER)
 # File-based prerequisites so a small change does not rebuild the world.
 INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs.sh
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
-ROOTFS_SRC    := $(shell find rootfs -type f 2>/dev/null) scripts/mkrootfs.sh
+ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
 
-.PHONY: all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: chordd-test fbbench-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -71,3 +71,11 @@ clean:
 
 distclean:
 	$(RUN_ROOT) sh -c 'rm -rf out/* out/.*.stamp'
+
+# Logic test of src/olpc-chordd in the builder container (no hardware).
+chordd-test:
+	$(RUN_USER) sh src/olpc-chordd/test.sh
+
+# Scaling-kernel self-test of src/olpc-fbbench in the builder container.
+fbbench-test:
+	$(RUN_USER) sh src/olpc-fbbench/test.sh

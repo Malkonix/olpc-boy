@@ -22,6 +22,44 @@ if [ ! -e "$STATE" ]; then
 	/usr/local/sbin/olpc-selftest
 	tl "tty1: selftest done"
 	olpc_sync
+	# audible tone so the volume chord can be tried by ear
+	if [ -c /dev/snd/controlC0 ] && ! cmdline_has olpcboy.nosoundtest; then
+		printf '\033[2J\033[H\n  SOUND TEST - 25 SECONDS\n\n'
+		printf '  A tone is playing. Hold SQUARE + CROSS and press:\n'
+		printf '    UP / DOWN    volume\n    LEFT         mute\n    RIGHT        unmute\n'
+		tl "tty1: soundtest start"
+		bounded 25 speaker-test -D hw:0,0 -t sine -f 660 -c 2 -r 48000 >"$BOOTDIR/soundtest.log" 2>&1
+		tl "tty1: soundtest done rc=$?"
+		amixer contents >"$BOOTDIR/soundtest-amixer.txt" 2>&1
+		olpc_sync
+	fi
+	# one-shot framebuffer/audio/timer benchmark; the tool restores the video
+	# mode itself and bounds itself with an alarm, `bounded` is the last resort
+	if ! cmdline_has olpcboy.nofbbench; then
+		printf '\n  Benchmark running, up to 60 s (do not power off)\n'
+		tl "tty1: fbbench start"
+		bounded 75 /usr/local/sbin/olpc-fbbench -o "$BOOTDIR/fbbench.log"
+		tl "tty1: fbbench done rc=$?"
+		olpc_sync
+		printf '\033[2J\033[H'
+	fi
+	# headless emulator speed: frames/s of each core with no video or audio
+	if [ -x /usr/local/bin/coretest ] && ! cmdline_has olpcboy.nocorebench; then
+		printf '\n  Emulator speed test, up to 3 min (do not power off)\n'
+		tl "tty1: corebench start"
+		B=/usr/share/olpcboy/bench
+		for t in gambatte:gb gambatte:gbc quicknes:nes fceumm:nes; do
+			c=${t%:*}; r=$B/rom.${t#*:}
+			[ -f "$r" ] || continue
+			printf '    %s %s\n' "$c" "${t#*:}"
+			echo "== $t" >>"$BOOTDIR/corebench.log"
+			bounded 45 /usr/local/bin/coretest "/usr/lib/libretro/${c}_libretro.so" "$r" 300 >>"$BOOTDIR/corebench.log" 2>&1
+			echo "rc=$?" >>"$BOOTDIR/corebench.log"
+			olpc_sync
+		done
+		tl "tty1: corebench done"
+		printf '\033[2J\033[H'
+	fi
 	tl "tty1: status screen"
 fi
 
