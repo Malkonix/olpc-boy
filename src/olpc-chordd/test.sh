@@ -122,7 +122,7 @@ vrun "CROSS re-sends press (value 1 and 2): one step per press" "21 1 21 1 23 1 
 	"0 SQUARE 1" "5 CROSS 1" "50 CROSS 2" "100 CROSS 1" "150 CROSS 2" "200 UP 1" "250 CROSS 1" "300 CROSS 2" "350 UP 0" "400 CROSS 0" "405 SQUARE 0"
 
 fake 0 0 0 0 0 0
-vrun "boot state (all off, all 0): init unmutes and sets Master 19, PCM 23, Master Mono 19" "19 1 19 1 23 1 5" \
+vrun "boot state (all off, all 0): init unmutes and sets Master 27, PCM 23, Master Mono 27" "27 1 27 1 23 1 5" \
 	"0 UP 1" "10 UP 0"
 
 # Only PCM present (no Master element): chord falls back to PCM.

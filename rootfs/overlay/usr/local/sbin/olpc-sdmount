@@ -1,0 +1,39 @@
+#!/bin/sh
+# olpc-sdmount -- mount the SD card's first partition at /mnt/sd (read-write, noatime), or clean up
+# after the card was removed.  Idempotent; run at boot (olpc-sd service) and by olpc-menu when
+# /dev/mmcblk* appears or disappears.  Only that one partition is ever touched.
+# Overridable for tests: SD_DEV, SD_MNT, SD_BLKID, SD_MOUNT, SD_UMOUNT, SD_MOUNTS.
+. "${OLPC_COMMON:-/usr/libexec/olpcboy/common.sh}"
+DEV=${SD_DEV:-/dev/mmcblk0p1}
+MNT=${SD_MNT:-/mnt/sd}
+BLKID=${SD_BLKID:-blkid}
+MOUNT=${SD_MOUNT:-mount}
+UMOUNT=${SD_UMOUNT:-umount}
+MOUNTS=${SD_MOUNTS:-/proc/mounts}
+
+mkdir -p "$MNT" 2>/dev/null
+if grep -q " $MNT " "$MOUNTS" 2>/dev/null; then
+	if [ ! -b "$DEV" ]; then
+		# the card is gone: lazy unmount so nothing keeps the stale mount alive
+		$UMOUNT -l "$MNT" 2>/dev/null
+		tl "sd: card removed, $MNT unmounted"
+	fi
+	exit 0
+fi
+[ -b "$DEV" ] || exit 0
+type=$($BLKID "$DEV" 2>/dev/null | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+case "$type" in
+vfat)
+	# long names as UTF-8 when the kernel has it, plain otherwise
+	opts="rw,noatime,flush,iocharset=utf8 rw,noatime,flush" ;;
+ext2|ext3|ext4|exfat) opts="rw,noatime" ;;
+*) tl "sd: $DEV has no supported filesystem (${type:-none}), not mounted"; exit 0 ;;
+esac
+for o in $opts; do
+	if $MOUNT -t "$type" -o "$o" "$DEV" "$MNT" 2>/dev/null; then
+		tl "sd: $DEV ($type) mounted at $MNT ($o)"
+		exit 0
+	fi
+done
+tl "sd: mounting $DEV ($type) failed"
+exit 0

@@ -1,5 +1,7 @@
 #!/bin/sh
-# tty1 driver (respawned by init): button capture -> selftest -> status screen.
+# tty1 driver (respawned by init): selftest -> game menu (olpc-menu, respawned here) -> status
+# screen as the fallback.  The timed emulator runs, the play session and the WiFi test are opt-in
+# (kernel command line olpcboy.tests).
 # The button capture and the sound test are opt-in (kernel command line
 # olpcboy.buttons / olpcboy.soundtest) so the games come up sooner.
 # Never waits for keyboard input.  Runs only once per boot.
@@ -65,10 +67,10 @@ if [ ! -e "$STATE" ]; then
 	fi
 	# real emulator runs with video and audio: 20 s per core, the built-in
 	# buttons are live, then an open-ended GB session until rotate is held 1 s.
-	# Skip all of it with olpcboy.norun.  Without the Geode framebuffer (QEMU)
+	# Only with olpcboy.tests on the command line; skip it again with olpcboy.norun.  Without the Geode framebuffer (QEMU)
 	# the runs use null sinks and a short frame count, and the session is skipped.
 	RUN=/usr/local/bin/olpc-run
-	if [ -x "$RUN" ] && ! cmdline_has olpcboy.norun; then
+	if [ -x "$RUN" ] && cmdline_has olpcboy.tests && ! cmdline_has olpcboy.norun; then
 		B=/usr/share/olpcboy/bench
 		HAVEFB=0
 		[ "$(cat /sys/class/graphics/fb0/name 2>/dev/null)" = "Geode LX" ] && HAVEFB=1
@@ -157,6 +159,25 @@ if [ ! -e "$STATE" ]; then
 		tl "tty1: olpc-run sequence done"
 	fi
 	tl "tty1: status screen"
+fi
+
+# Game menu: restarted when it exits or crashes (1 s pause); 5 quick failures in a row (it ran less
+# than 30 s each) or exit code 3 (no Geode framebuffer, e.g. QEMU) fall back to the status screen.
+MENU=/usr/local/bin/olpc-menu
+if [ -x "$MENU" ] && ! cmdline_has olpcboy.nomenu; then
+	crashes=0
+	while [ "$crashes" -lt 5 ]; do
+		_cs; m0=$CS
+		tl "tty1: olpc-menu start"
+		"$MENU" 2>>"$BOOTDIR/menu.log"
+		rc=$?
+		tl "tty1: olpc-menu exited rc=$rc"
+		[ "$rc" = 3 ] && break
+		_cs
+		if [ $((CS - m0)) -ge 3000 ]; then crashes=0; else crashes=$((crashes + 1)); fi
+		olpc_sleep 1
+	done
+	tl "tty1: olpc-menu not running (crashes=$crashes rc=$rc), status screen"
 fi
 
 status_text() {

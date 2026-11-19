@@ -57,6 +57,40 @@ if [ -f wifi.cfg ]; then
     echo "mkimage: wifi.cfg -> ::WIFI.CFG"
 fi
 
+# Games: the repo's ROMs/GB, ROMs/GBC, ROMs/NES (git-ignored user data) go to roms/gb|gbc|nes on the
+# FAT partition with their long names (VFAT LFN; only the files the firmware reads need 8.3 names).
+ROMS_COPIED=0
+for sysd in GB GBC NES; do
+    [ -d "ROMs/$sysd" ] || continue
+    low=$(echo "$sysd" | tr 'A-Z' 'a-z')
+    LIST=$WORK/roms-$low.list
+    find "ROMs/$sysd" -maxdepth 1 -type f \( -iname '*.gb' -o -iname '*.gbc' -o -iname '*.nes' -o -iname '*.zip' \) | sort >"$LIST"
+    [ -s "$LIST" ] || continue
+    ROMS_COPIED=1
+done
+if [ "$ROMS_COPIED" = 1 ]; then
+    NEED=0; NFILES=0
+    for l in "$WORK"/roms-*.list; do
+        while IFS= read -r f; do
+            sz=$(stat -c %s "$f")
+            NEED=$(( NEED + (sz + 2047) / 2048 * 2048 + 512 )); NFILES=$(( NFILES + 1 ))
+        done <"$l"
+    done
+    FREE=$(mdir -i "$FAT" :: | sed -n 's/^ *\([0-9][0-9 ,.]*\) bytes free.*/\1/p' | tr -d ' ,.')
+    [ -n "$FREE" ] || die "cannot read the free space of the FAT partition"
+    echo "mkimage: ROMs: $NFILES files need ~$(( NEED / 1048576 )) MiB, FAT has $(( FREE / 1048576 )) MiB free"
+    [ $(( NEED + 1048576 )) -le "$FREE" ] || die "ROMs do not fit on the ${FAT_MIB} MiB FAT partition ($(( NEED / 1048576 )) MiB needed, $(( FREE / 1048576 )) MiB free): remove some or raise FAT_MIB"
+    mmd -i "$FAT" ::roms/gb ::roms/gbc ::roms/nes
+    for l in "$WORK"/roms-*.list; do
+        low=$(basename "$l" .list); low=${low#roms-}
+        while IFS= read -r f; do
+            mcopy -i "$FAT" "$f" "::roms/$low/" || die "cannot copy $f to the FAT partition"
+        done <"$l"
+    done
+    echo "mkimage: roms/ on the FAT partition:"
+    for low in gb gbc nes; do mdir -b -i "$FAT" "::roms/$low" 2>/dev/null | sed 's/^/    /'; done
+fi
+
 # ---- 2. ext4 root partition -----------------------------------------------------
 echo "mkimage: extracting $ROOTFS"
 TREE=$WORK/tree

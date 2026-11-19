@@ -22,7 +22,7 @@ INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
 ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
 
-.PHONY: chordd-test fbbench-test olpc-run-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -83,3 +83,7 @@ olpc-run-test:
 # Scaling-kernel self-test of src/olpc-fbbench in the builder container.
 fbbench-test:
 	$(RUN_USER) sh src/olpc-fbbench/test.sh
+
+# Host tests of src/olpc-menu (unit checks, scripted UI against a fake framebuffer, stub launch).
+olpc-menu-test:
+	$(RUN_USER) sh src/olpc-menu/test.sh

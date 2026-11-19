@@ -313,7 +313,7 @@ static const struct mixer_ops real_ops = { real_get, real_put };
 static const struct mixer_ops fake_ops = { fake_get, fake_put };
 static const struct mixer_ops *mx = &real_ops;
 
-#define DEF_VOL_PCT 60		/* level applied at start if the codec comes up muted/zero */
+#define DEF_VOL_PCT 88		/* level applied at start if the codec comes up muted/zero */
 #define DEF_PCM_PCT 75		/* PCM is not user-adjusted: keep it near 0 dB */
 
 static int nocard_logged;	/* "no sound card" is logged once until a card shows up */

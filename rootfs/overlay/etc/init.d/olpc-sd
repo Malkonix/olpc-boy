@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+# Mounts the SD card (first partition) at /mnt/sd when one is present; later insertions are
+# handled by olpc-menu.  Never fails the boot.
+
+description="olpc-boy: mount the SD card at /mnt/sd"
+
+depend() {
+	need olpclog
+	after mdev hwdrivers modules localmount
+}
+
+start() {
+	ebegin "olpc-sd: SD card"
+	/usr/local/sbin/olpc-sdmount
+	eend 0
+}
+
+stop() {
+	ebegin "olpc-sd: unmount"
+	sync
+	umount /mnt/sd 2>/dev/null
+	eend 0
+}

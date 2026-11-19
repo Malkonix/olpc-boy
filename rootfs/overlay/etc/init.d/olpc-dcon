@@ -1,17 +1,18 @@
 #!/sbin/openrc-run
-# Boot the display in DCON monochrome mode (sharp 1200x900, readable in sunlight).
+# Boot the display in DCON colour mode with the backlight at 85 %.
+# Circle+check+D-pad (olpc-chordd) changes both at any time.
 
-description="olpc-boy: start in DCON monochrome mode, backlight off"
+description="olpc-boy: start in DCON colour mode, backlight 85 %"
 
 depend() {
 	need olpclog sysfs
 }
 
 start() {
-	ebegin "Switching display to DCON monochrome mode"
-	/usr/local/sbin/olpc-dcon mono
-	# Reflective mode: backlight off, readable by ambient light.
-	/usr/local/sbin/olpc-dcon brightness 0
+	ebegin "Setting display to DCON colour mode, backlight 85 %"
+	/usr/local/sbin/olpc-dcon color
+	# 85 % of the 0..15 range
+	/usr/local/sbin/olpc-dcon brightness 13
 	# A missing DCON must not fail the boot: the result is in timeline.log.
 	eend 0
 }

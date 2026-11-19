@@ -1,0 +1,354 @@
+/*
+ * olpc-covers-match -- map ROM names to entries of a libretro-thumbnails
+ * Apache directory index (Named_Boxarts/).
+ *
+ *   olpc-covers-match index.html "ROM name"   print the best entry (no .png), or nothing
+ *   olpc-covers-match -b index.html < names   one ROM name per line; prints
+ *                                             rom TAB entry TAB href  (entry/href empty on a miss)
+ *
+ * Exit status: 0 match found (single mode) / ok (batch), 1 no match, 2 error.
+ *
+ * The index is streamed line by line; only the ROM names are kept in memory
+ * (plus the best candidate per ROM), so the 4 MB NES index costs a few KB.
+ *
+ * Rules, in order; the first rule that finds anything wins, a later entry only
+ * replaces an earlier one of the same rule with a strictly better score:
+ *   1  exact, after replacing the characters  & * / : ` " < > ? \ |  by '_'
+ *   2  exact once revision/version/beta/proto tags are dropped from both sides
+ *      (Rev A, Rev 1, v1.1, Version x, Beta, Proto, Sample)
+ *   3  same base title (text before the first " (") -- best region score
+ *   4  same base title after normalisation (case, punctuation, spaces and a
+ *      leading article removed, ", The" moved to the front) -- best region score
+ * There is no fuzzy matching: every rule is an equality test.
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MAXN 1024
+
+struct rom {
+	char *name;          /* as given, extension removed */
+	char sub[MAXN];      /* after character substitution */
+	char strip[MAXN];    /* tags removed */
+	char base[MAXN];
+	char norm[MAXN];
+	char grp[MAXN];      /* first parenthetical group */
+	int rule, score;
+	char best[MAXN], href[MAXN * 3];
+};
+
+struct ent {
+	char name[MAXN], strip[MAXN], base[MAXN], norm[MAXN], grp[MAXN];
+	int ngroups, nremoved, beta;
+};
+
+static void subst(char *s)
+{
+	for (; *s; s++)
+		if (strchr("&*/:`\"<>?\\|", *s))
+			*s = '_';
+}
+
+static int startswith(const char *s, const char *p)
+{
+	return strncmp(s, p, strlen(p)) == 0;
+}
+
+/* Contents of a "(...)" group: is it a revision-like tag? *beta set for Beta/Proto/Sample. */
+static int revtag(const char *c, int *beta)
+{
+	*beta = 0;
+	if (startswith(c, "Beta") || startswith(c, "Proto") || startswith(c, "Sample")) {
+		*beta = 1;
+		return 1;
+	}
+	if (startswith(c, "Rev ") || startswith(c, "Version ")) return 1;
+	if (c[0] == 'v' && isdigit((unsigned char)c[1])) return 1;
+	return 0;
+}
+
+/* Copy s to out without revision tags (and the space before each one). */
+static void strip_tags(const char *s, char *out, int *nremoved, int *beta, int *ngroups)
+{
+	size_t o = 0;
+	*nremoved = 0; *beta = 0; *ngroups = 0;
+	while (*s && o < MAXN - 1) {
+		if (*s == '(') {
+			const char *e = strchr(s, ')');
+			if (e) {
+				char tag[MAXN];
+				size_t n = (size_t)(e - s - 1);
+				int b;
+				if (n >= MAXN) n = MAXN - 1;
+				memcpy(tag, s + 1, n);
+				tag[n] = 0;
+				(*ngroups)++;
+				if (revtag(tag, &b)) {
+					(*nremoved)++;
+					if (b) *beta = 1;
+					if (o && out[o - 1] == ' ') o--;
+					s = e + 1;
+					continue;
+				}
+			}
+		}
+		out[o++] = *s++;
+	}
+	out[o] = 0;
+}
+
+static void get_base(const char *s, char *out)
+{
+	const char *p = strstr(s, " (");
+	size_t n = p ? (size_t)(p - s) : strlen(s);
+	if (n >= MAXN) n = MAXN - 1;
+	memcpy(out, s, n);
+	out[n] = 0;
+}
+
+static void get_grp(const char *s, char *out)
+{
+	const char *p = strstr(s, " (");
+	out[0] = 0;
+	if (p) {
+		const char *e = strchr(p + 2, ')');
+		size_t n = e ? (size_t)(e - p - 2) : strlen(p + 2);
+		if (n >= MAXN) n = MAXN - 1;
+		memcpy(out, p + 2, n);
+		out[n] = 0;
+	}
+}
+
+/* ", The" / ", A" / ", An" (before end or a space) moves to the front. */
+static void normalise(const char *base, char *out)
+{
+	static const char *art[] = { ", The", ", An", ", A" };
+	char tmp[MAXN * 2], *p;
+	size_t i, o = 0;
+	int k;
+
+	strncpy(tmp, base, MAXN - 1);
+	tmp[MAXN - 1] = 0;
+	for (k = 0; k < 3; k++) {
+		size_t al = strlen(art[k]);
+		p = strstr(tmp, art[k]);
+		if (p && (p[al] == 0 || p[al] == ' ')) {
+			char head[MAXN * 2];
+			size_t pre = (size_t)(p - tmp);
+			snprintf(head, sizeof head, "%s %.*s%s", art[k] + 2, (int)pre, tmp, p + al);
+			strcpy(tmp, head);
+			break;
+		}
+	}
+	/* drop a leading article */
+	if (strncasecmp(tmp, "the ", 4) == 0) p = tmp + 4;
+	else if (strncasecmp(tmp, "an ", 3) == 0) p = tmp + 3;
+	else if (strncasecmp(tmp, "a ", 2) == 0) p = tmp + 2;
+	else p = tmp;
+	for (i = 0; p[i] && o < MAXN - 1; i++) {
+		unsigned char c = (unsigned char)p[i];
+		if (c >= 128) out[o++] = (char)c;
+		else if (isalnum(c)) out[o++] = (char)tolower(c);
+	}
+	out[o] = 0;
+}
+
+static int has_token(const char *grp, const char *tok)
+{
+	size_t tl = strlen(tok);
+	const char *p = grp;
+	while ((p = strstr(p, tok))) {
+		int l = (p == grp) || p[-1] == ' ' || p[-1] == ',';
+		int r = p[tl] == 0 || p[tl] == ',' || p[tl] == ' ';
+		if (l && r) return 1;
+		p += tl;
+	}
+	return 0;
+}
+
+/* How good is entry e's region for ROM r (higher is better). */
+static int region_score(const struct rom *r, const struct ent *e)
+{
+	static const char *pref[] = { "World", "USA", "Europe", "Japan" };
+	static const int val[] = { 80, 70, 60, 50 };
+	int s = 10, i;
+	char tok[MAXN], *t;
+
+	if (r->grp[0] && strcmp(r->grp, e->grp) == 0) s = 100;
+	else {
+		int shared = 0;
+		strcpy(tok, r->grp);
+		for (t = strtok(tok, ","); t; t = strtok(NULL, ",")) {
+			while (*t == ' ') t++;
+			if (*t && has_token(e->grp, t)) shared = 1;
+		}
+		if (shared) s = 90;
+		else
+			for (i = 0; i < 4; i++)
+				if (has_token(e->grp, pref[i])) { s = val[i]; break; }
+	}
+	if (e->beta) s -= 50;
+	return s - e->ngroups;
+}
+
+static void offer(struct rom *r, int rule, int score, const struct ent *e, const char *href)
+{
+	if (r->rule && (rule > r->rule || (rule == r->rule && score <= r->score)))
+		return;
+	r->rule = rule;
+	r->score = score;
+	strcpy(r->best, e->name);
+	strncpy(r->href, href, sizeof r->href - 1);
+	r->href[sizeof r->href - 1] = 0;
+}
+
+static void entry(struct rom *roms, int n, const char *name, const char *href)
+{
+	struct ent e;
+	int i, dummy;
+	size_t l = strlen(name);
+
+	if (l >= MAXN) return;
+	strcpy(e.name, name);
+	strip_tags(name, e.strip, &e.nremoved, &e.beta, &e.ngroups);
+	get_base(name, e.base);
+	get_grp(name, e.grp);
+	normalise(e.base, e.norm);
+	(void)dummy;
+	for (i = 0; i < n; i++) {
+		struct rom *r = &roms[i];
+		if (r->rule == 1) continue;
+		if (strcmp(e.name, r->sub) == 0) { offer(r, 1, 0, &e, href); continue; }
+		if (strcmp(e.strip, r->strip) == 0)
+			offer(r, 2, 100 - 10 * e.nremoved - (e.beta ? 50 : 0), &e, href);
+		else if (r->rule >= 2 || !r->rule) {
+			if (strcmp(e.base, r->base) == 0)
+				offer(r, 3, region_score(r, &e), &e, href);
+			else if (e.norm[0] && strcmp(e.norm, r->norm) == 0)
+				offer(r, 4, region_score(r, &e), &e, href);
+		}
+	}
+}
+
+static int hexv(int c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Parse one index line: every href="....png" becomes an entry. */
+static void parse_line(struct rom *roms, int n, char *line)
+{
+	char *p = line;
+	while ((p = strstr(p, "href=\""))) {
+		char *s = p + 6, *e = strchr(s, '"'), href[MAXN * 3], name[MAXN];
+		size_t hl, i, o = 0;
+
+		if (!e) break;
+		p = e + 1;
+		hl = (size_t)(e - s);
+		if (hl < 5 || hl >= sizeof href || s[0] == '?' || s[0] == '/' ||
+		    strncmp(s + hl - 4, ".png", 4) != 0)
+			continue;
+		/* HTML entities, keeping the %XX escapes: that is the usable URL path */
+		for (i = 0; i < hl;) {
+			if (s[i] == '&') {
+				if (!strncmp(s + i, "&amp;", 5)) { href[o++] = '&'; i += 5; continue; }
+				if (!strncmp(s + i, "&lt;", 4)) { href[o++] = '<'; i += 4; continue; }
+				if (!strncmp(s + i, "&gt;", 4)) { href[o++] = '>'; i += 4; continue; }
+				if (!strncmp(s + i, "&quot;", 6)) { href[o++] = '"'; i += 6; continue; }
+				if (!strncmp(s + i, "&#39;", 5)) { href[o++] = '\''; i += 5; continue; }
+			}
+			href[o++] = s[i++];
+		}
+		href[o] = 0;
+		/* percent-decode the name, drop ".png" */
+		for (i = 0, o = 0; href[i] && o < MAXN - 1; i++) {
+			if (href[i] == '%' && hexv(href[i + 1]) >= 0 && hexv(href[i + 2]) >= 0) {
+				name[o++] = (char)(hexv(href[i + 1]) * 16 + hexv(href[i + 2]));
+				i += 2;
+			} else
+				name[o++] = href[i];
+		}
+		name[o] = 0;
+		if (o > 4) name[o - 4] = 0;
+		entry(roms, n, name, href);
+	}
+}
+
+static void rom_init(struct rom *r, const char *raw)
+{
+	static const char *ext[] = { ".zip", ".gb", ".gbc", ".nes", ".7z" };
+	char tmp[MAXN];
+	size_t l, k;
+	int d1, d2, d3;
+
+	memset(r, 0, sizeof *r);
+	strncpy(tmp, raw, MAXN - 1);
+	tmp[MAXN - 1] = 0;
+	l = strlen(tmp);
+	while (l && (tmp[l - 1] == '\n' || tmp[l - 1] == '\r')) tmp[--l] = 0;
+	for (k = 0; k < sizeof ext / sizeof *ext; k++) {
+		size_t el = strlen(ext[k]);
+		if (l > el && strcasecmp(tmp + l - el, ext[k]) == 0) { tmp[l - el] = 0; break; }
+	}
+	r->name = strdup(tmp);
+	subst(tmp);
+	strcpy(r->sub, tmp);
+	strip_tags(tmp, r->strip, &d1, &d2, &d3);
+	get_base(tmp, r->base);
+	get_grp(tmp, r->grp);
+	normalise(r->base, r->norm);
+}
+
+int main(int argc, char **argv)
+{
+	int batch = argc > 1 && strcmp(argv[1], "-b") == 0;
+	const char *index = argc > 1 + batch ? argv[1 + batch] : NULL;
+	struct rom *roms = NULL;
+	int n = 0, cap = 0, i;
+	char *line = NULL;
+	size_t lcap = 0;
+	FILE *f;
+
+	if (!index || (!batch && argc != 3) || (batch && argc != 3)) {
+		fprintf(stderr, "usage: olpc-covers-match index.html \"ROM name\"\n"
+				"       olpc-covers-match -b index.html < names\n");
+		return 2;
+	}
+	if (batch) {
+		while (getline(&line, &lcap, stdin) > 0) {
+			if (line[0] == '\n' || line[0] == '\r') continue;
+			if (n == cap) {
+				cap = cap ? cap * 2 : 64;
+				roms = realloc(roms, (size_t)cap * sizeof *roms);
+				if (!roms) return 2;
+			}
+			rom_init(&roms[n++], line);
+		}
+	} else {
+		roms = malloc(sizeof *roms);
+		if (!roms) return 2;
+		rom_init(&roms[n++], argv[2]);
+	}
+	f = fopen(index, "r");
+	if (!f) { perror(index); return 2; }
+	while (getline(&line, &lcap, f) > 0)
+		parse_line(roms, n, line);
+	fclose(f);
+
+	if (batch) {
+		for (i = 0; i < n; i++)
+			printf("%s\t%s\t%s\n", roms[i].name, roms[i].rule ? roms[i].best : "",
+			       roms[i].rule ? roms[i].href : "");
+		return 0;
+	}
+	if (!roms[0].rule) return 1;
+	puts(roms[0].best);
+	return 0;
+}

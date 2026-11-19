@@ -113,6 +113,29 @@ chmod 0755 "$R/usr/local/bin/olpc-run"
 file "$R/usr/local/bin/olpc-run" | sed "s/^/  /"
 ls -l "$R/usr/local/bin/olpc-run" | sed "s/^/  /"
 
+# ---- olpc-covers (box art): png2obc + olpc-covers-match, static, no SSE (stb_image has STBI_NO_SIMD)
+echo "== olpc-covers"
+sh src/olpc-covers/test.sh >"$WORK/olpc-covers-test.log" 2>&1 \
+	|| { cat "$WORK/olpc-covers-test.log" >&2; echo "ERROR: olpc-covers tests failed" >&2; exit 1; }
+tail -n2 "$WORK/olpc-covers-test.log"
+make -C src/olpc-covers OUT="$R/usr/local/sbin" CFLAGS="-O2 -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/sbin/png2obc" "$R/usr/local/sbin/olpc-covers-match" "$R/usr/local/sbin/olpc-covers"
+busybox ash -n "$R/usr/local/sbin/olpc-covers" || { echo "ERROR: syntax olpc-covers" >&2; exit 1; }
+ls -l "$R/usr/local/sbin/png2obc" "$R/usr/local/sbin/olpc-covers-match" | sed "s/^/  /"
+# ---- end olpc-covers
+
+# ---- olpc-menu (game launcher): unit + scripted-UI tests on the host, then the dynamic i386 build
+echo "== olpc-menu"
+sh src/olpc-menu/test.sh >"$WORK/olpc-menu-test.log" 2>&1 \
+	|| { cat "$WORK/olpc-menu-test.log" >&2; echo "ERROR: olpc-menu tests failed" >&2; exit 1; }
+grep -E '^(== |[0-9]+ checks|olpc-menu tests)' "$WORK/olpc-menu-test.log" | tail -n 3
+make -C src/olpc-menu OUT="$R/usr/local/bin" CFLAGS="-O2 -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/bin/olpc-menu"
+file "$R/usr/local/bin/olpc-menu" | sed "s/^/  /"
+ls -l "$R/usr/local/bin/olpc-menu" | sed "s/^/  /"
+mkdir -p "$R/mnt/sd"      # SD card mount point (olpc-sd service / olpc-sdmount)
+# ---- end olpc-menu
+
 echo "== runlevels"
 RL=$R/etc/runlevels
 rm -rf "$RL"
@@ -132,6 +155,7 @@ addsvc boot modules sysctl hostname hwclock bootmisc syslog root localmount
 # olpc-inventory is NOT a service: olpc-bootdone starts it (background, nice 19)
 # after REACHED_USERSPACE_OK.
 addsvc default olpc-powerbtn olpc-chordd olpc-bootdone
+addsvc default olpc-sd        # SD card at /mnt/sd (olpc-menu block)
 addsvc shutdown mount-ro killprocs savecache
 # NOT enabled on purpose: networking wpa_supplicant dropbear acpid crond
 

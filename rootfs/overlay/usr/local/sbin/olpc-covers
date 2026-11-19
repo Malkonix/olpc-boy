@@ -1,0 +1,266 @@
+#!/bin/sh
+# olpc-covers -- download box art for the ROMs and convert it to .obc.
+#
+#   olpc-covers fetch [--system gb|gbc|nes] [--force]
+#   olpc-covers status
+#
+# For every roms directory (a top-level "roms" directory, any case, on a
+# filesystem mounted under /mnt or /media, holding gb/gbc/nes directories) each
+# ROM without <roms>/../covers/<sys>/<name>.obc gets its libretro box art:
+# the Apache index of the system is fetched once (cached 30 days under
+# covers/.index/), the ROM name is matched by olpc-covers-match (exact rules,
+# no guessing), the PNG goes to tmpfs, png2obc converts it, the PNG is deleted.
+# ROMs without a cover on the server are remembered in covers/<sys>/.missing
+# (retried after 30 days or with --force; --force also refreshes the index).
+#
+# Progress for the UI: /run/olpcboy/covers.status (one line, rewritten):
+#   fetching 3/27 NAME | done 21 ok 4 missing 2 failed | no network | game running
+# Exit: 0 finished, 2 usage, 3 already running, 4 game running, 5 no network.
+# POSIX sh / busybox ash.  Runs at nice 19.  Names and results only in the log.
+
+RUN=${OLPC_COVERS_RUN:-/run/olpcboy}
+STATUS=$RUN/covers.status
+LOCK=$RUN/covers.lock
+WORK=$RUN/covers.work
+LOG=${OLPC_COVERS_LOG:-/var/log/olpc-current/covers.log}
+BIN=${OLPC_COVERS_BIN:-/usr/local/sbin}
+THUMBS=${OLPC_COVERS_THUMBS:-http://thumbnails.libretro.com}
+WGET=${OLPC_COVERS_WGET:-wget}
+WIFI=${OLPC_COVERS_WIFI:-/usr/local/sbin/olpc-wifi}
+MAXAGE=2592000			# 30 days
+TAB=$(printf '\t')
+
+mkdir -p "$RUN" 2>/dev/null
+
+
+case "$1" in
+status)
+	[ -r "$STATUS" ] && cat "$STATUS" || echo idle
+	exit 0 ;;
+fetch) shift ;;
+*) echo "usage: olpc-covers fetch [--system gb|gbc|nes] [--force] | status" >&2; exit 2 ;;
+esac
+
+if [ -z "$OLPC_COVERS_TEST" ]; then
+	. /usr/libexec/olpcboy/common.sh
+else
+	bounded() { shift; "$@"; }
+	olpc_sleep() { sleep "$1"; }
+fi
+
+ONLY=""; FORCE=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--system) ONLY=$2; shift ;;
+	--force) FORCE=1 ;;
+	*) echo "olpc-covers: unknown option $1" >&2; exit 2 ;;
+	esac
+	shift
+done
+case "$ONLY" in ""|gb|gbc|nes) ;; *) echo "olpc-covers: bad --system" >&2; exit 2 ;; esac
+
+# background priority, once
+if [ -z "$OLPC_COVERS_NICED" ]; then
+	OLPC_COVERS_NICED=1; export OLPC_COVERS_NICED
+	exec nice -n 19 sh "$0" fetch ${ONLY:+--system "$ONLY"} $([ "$FORCE" = 1 ] && echo --force)
+fi
+
+up() { read -r _u _ </proc/uptime; echo "$_u"; }
+log() { echo "$(up) $*" >>"$LOG" 2>/dev/null; }
+status() { echo "$*" >"$STATUS" 2>/dev/null; }
+now() { date +%s; }
+
+game_running() {
+	[ -r "$RUN/running" ] || return 1
+	read -r _gp _ <"$RUN/running" || return 1
+	[ -n "$_gp" ] && [ -d "/proc/$_gp" ]
+}
+
+# ---- single instance
+if ! mkdir "$LOCK" 2>/dev/null; then
+	read -r _lp <"$LOCK/pid" 2>/dev/null
+	if [ -n "$_lp" ] && [ -d "/proc/$_lp" ]; then
+		log "already running (pid $_lp)"
+		exit 3
+	fi
+	rm -rf "$LOCK"
+	mkdir "$LOCK" 2>/dev/null || exit 3
+fi
+echo $$ >"$LOCK/pid"
+rm -rf "$WORK"; mkdir -p "$WORK"
+trap 'rm -rf "$LOCK" "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+if game_running; then
+	status "game running"
+	log "refused: a game is running"
+	exit 4
+fi
+
+# ---- discover roms dirs / systems / ROMs without a cover
+lc() { echo "$1" | tr 'A-Z' 'a-z'; }
+
+mountpoints() {
+	if [ -n "$OLPC_COVERS_MOUNTPOINTS" ]; then
+		for _m in $OLPC_COVERS_MOUNTPOINTS; do echo "$_m"; done
+		return
+	fi
+	while read -r _d _m _; do
+		_m=$(printf '%b' "$(echo "$_m" | sed 's/\\040/ /g')")
+		case "$_m" in /mnt/*|/media/*) echo "$_m" ;; esac
+	done </proc/mounts
+}
+
+sysdir_url() {
+	case "$1" in
+	gb) echo "Nintendo%20-%20Game%20Boy" ;;
+	gbc) echo "Nintendo%20-%20Game%20Boy%20Color" ;;
+	nes) echo "Nintendo%20-%20Nintendo%20Entertainment%20System" ;;
+	esac
+}
+
+# work list: sys TAB covers dir TAB ROM name (no extension), ordered by group
+: >"$WORK/list"
+for _sys in gb gbc nes; do
+	[ -n "$ONLY" ] && [ "$ONLY" != "$_sys" ] && continue
+	mountpoints | while read -r _mp; do
+		[ -d "$_mp" ] || continue
+		for _r in "$_mp"/*; do
+			[ -d "$_r" ] || continue
+			[ "$(lc "${_r##*/}")" = roms ] || continue
+			for _s in "$_r"/*; do
+				[ -d "$_s" ] || continue
+				[ "$(lc "${_s##*/}")" = "$_sys" ] || continue
+				_cov=$_mp/covers
+				: >"$WORK/miss"
+				if [ "$FORCE" != 1 ] && [ -r "$_cov/$_sys/.missing" ]; then
+					_n=$(now)
+					awk -F'\t' -v now="$_n" -v max="$MAXAGE" \
+					    'now < 1704067200 || $1 + max > now { print $3 }' \
+					    "$_cov/$_sys/.missing" >"$WORK/miss"
+				fi
+				for _f in "$_s"/*; do
+					[ -f "$_f" ] || continue
+					_b=${_f##*/}
+					case "$_b" in .*) continue ;; esac
+					case "$(lc "$_b")" in
+					*.zip|*.gb|*.gbc|*.nes|*.7z) _n=${_b%.*} ;;
+					*) continue ;;
+					esac
+					[ -s "$_cov/$_sys/$_n.obc" ] && continue
+					grep -qxF -- "$_n" "$WORK/miss" 2>/dev/null && continue
+					printf '%s\t%s\t%s\n' "$_sys" "$_cov" "$_n" >>"$WORK/list"
+				done
+			done
+		done
+	done
+done
+TOTAL=$(wc -l <"$WORK/list")
+OK=0; MISS=0; FAIL=0
+
+finish() {
+	status "done $OK ok $MISS missing $FAIL failed"
+	log "done $OK ok $MISS missing $FAIL failed"
+	exit 0
+}
+[ "$TOTAL" -eq 0 ] && finish
+
+# ---- network
+has_route() { [ -n "$(${OLPC_COVERS_ROUTE:-ip -4 route show default} 2>/dev/null | grep default)" ]; }
+if ! has_route; then
+	status "connecting"
+	log "no default route, trying olpc-wifi up"
+	[ -x "$WIFI" ] && bounded 150 "$WIFI" up >/dev/null 2>&1 </dev/null
+fi
+if ! has_route; then
+	status "no network"
+	log "no network"
+	exit 5
+fi
+
+# fetch URL DEST SECS: one retry, no partial file left behind
+get() {
+	bounded "$3" $WGET -q -T 20 -O "$2" "$1" >/dev/null 2>&1 </dev/null && [ -s "$2" ] && return 0
+	rm -f "$2"
+	olpc_sleep 2
+	bounded "$3" $WGET -q -T 20 -O "$2" "$1" >/dev/null 2>&1 </dev/null && [ -s "$2" ] && return 0
+	rm -f "$2"
+	return 1
+}
+
+# ensure_index SYS COVDIR: sets IDX, empty when none is available
+ensure_index() {
+	IDX=$2/.index/$1.html
+	_fresh=0
+	if [ -s "$IDX" ] && [ "$FORCE" != 1 ]; then
+		_n=$(now); _m=$(stat -c %Y "$IDX" 2>/dev/null || echo 0)
+		if [ "$_n" -lt 1704067200 ] || [ $((_n - _m)) -lt "$MAXAGE" ]; then _fresh=1; fi
+	fi
+	[ "$_fresh" = 1 ] && return 0
+	status "fetching index $1"
+	log "index $1: downloading"
+	mkdir -p "$2/.index" 2>/dev/null
+	if get "$THUMBS/$(sysdir_url "$1")/Named_Boxarts/" "$WORK/index.html" 240 &&
+	   grep -q '</table>' "$WORK/index.html"; then
+		cp "$WORK/index.html" "$IDX.part" && mv "$IDX.part" "$IDX"
+		rm -f "$WORK/index.html" "$IDX.part"
+		log "index $1: ok"
+		return 0
+	fi
+	rm -f "$WORK/index.html" "$IDX.part"
+	log "index $1: download failed"
+	[ -s "$IDX" ] || IDX=""
+}
+
+miss_forget() { # COVDIR SYS NAME
+	[ -f "$1/$2/.missing" ] || return 0
+	N=$3 awk -F'\t' '$3 != ENVIRON["N"]' "$1/$2/.missing" >"$1/$2/.missing.new" 2>/dev/null &&
+		mv "$1/$2/.missing.new" "$1/$2/.missing"
+}
+
+I=0
+STOP=0
+# iterate groups
+cut -f1,2 "$WORK/list" | uniq >"$WORK/groups"
+while IFS="$TAB" read -r GSYS GCOV; do
+	[ "$STOP" = 1 ] && break
+	awk -F'\t' -v s="$GSYS" -v c="$GCOV" '$1 == s && $2 == c { print $3 }' "$WORK/list" >"$WORK/names"
+	ensure_index "$GSYS" "$GCOV"
+	if [ -z "$IDX" ]; then
+		_k=$(wc -l <"$WORK/names")
+		FAIL=$((FAIL + _k)); I=$((I + _k))
+		log "$GSYS: no index, $_k ROMs skipped"
+		continue
+	fi
+	"$BIN/olpc-covers-match" -b "$IDX" <"$WORK/names" >"$WORK/matches" 2>/dev/null
+	mkdir -p "$GCOV/$GSYS" 2>/dev/null
+	rm -f "$GCOV/$GSYS"/.*.obc.tmp.* 2>/dev/null
+	while IFS="$TAB" read -r NAME ENTRY HREF; do
+		if game_running; then
+			STOP=1; status "game running"; log "stopped: a game started"
+			break
+		fi
+		I=$((I + 1))
+		status "fetching $I/$TOTAL $NAME"
+		if [ -z "$ENTRY" ]; then
+			miss_forget "$GCOV" "$GSYS" "$NAME"
+			printf '%s\t%s\t%s\n' "$(now)" "$(date +%F)" "$NAME" >>"$GCOV/$GSYS/.missing"
+			MISS=$((MISS + 1)); log "$GSYS $NAME: missing"
+			continue
+		fi
+		if ! get "$THUMBS/$(sysdir_url "$GSYS")/Named_Boxarts/$HREF" "$WORK/cover.png" 90; then
+			FAIL=$((FAIL + 1)); log "$GSYS $NAME: download failed"
+			continue
+		fi
+		if "$BIN/png2obc" "$WORK/cover.png" "$GCOV/$GSYS/$NAME.obc" >/dev/null 2>&1 </dev/null; then
+			miss_forget "$GCOV" "$GSYS" "$NAME"
+			OK=$((OK + 1)); log "$GSYS $NAME: ok"
+		else
+			FAIL=$((FAIL + 1)); log "$GSYS $NAME: convert failed"
+		fi
+		rm -f "$WORK/cover.png"
+	done <"$WORK/matches"
+done <"$WORK/groups"
+
+if [ "$STOP" = 1 ]; then exit 4; fi
+finish
