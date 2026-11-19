@@ -15,6 +15,11 @@
 #   priority.  Blank lines and lines starting with '#' are ignored, CRLF is fine.
 #   SSID and key may contain spaces.  OPEN needs no key (leave the field empty).
 #
+# State for the launcher: /run/olpcboy/wifi.status, replaced atomically on every
+# transition (up start, success, failure, down):
+#   state=off | state=connecting | state=connected ssid=<ssid> ip=<ipv4>
+# It never holds the key.
+#
 # The key is never logged, never echoed and never written outside the 0600
 # wpa_supplicant config on tmpfs (/run/olpc-wifi).  Every step logs one line to
 # the timeline ("wifi: ...") and details to $BOOTDIR/wifi.log.
@@ -37,6 +42,7 @@ COVER_NAME=${OLPC_WIFI_COVER:-Super Mario Land (World).png}
 LOCKBASE=${OLPC_WIFI_LOCKDIR:-/run/olpcboy}
 LOCK=$LOCKBASE/wifi.lock
 RESULT=$LOCKBASE/wifi.result
+WSTATUS=$LOCKBASE/wifi.status
 LOCKHELD=0
 THUMBS=http://thumbnails.libretro.com
 NTP_HOST=pool.ntp.org
@@ -55,6 +61,15 @@ CR=$(printf '\r')
 
 wl() { echo "$(olpc_uptime) $*" >>"$BOOTDIR/wifi.log"; }
 step() { wl "$*"; tl "wifi: $*"; }
+
+# wstatus STATE [SSID IP]: publish the state (STATE = off | connecting | connected).  Written to a
+# temporary name and renamed, so a watcher sees one complete file.  The SSID loses control characters.
+wstatus() {
+	_wl="state=$1"
+	[ "$1" = connected ] && _wl="state=connected ssid=$(printf %s "$2" | tr -d '\001-\037\177') ip=$3"
+	mkdir -p "$LOCKBASE" 2>/dev/null
+	printf '%s\n' "$_wl" >"$WSTATUS.tmp" && chmod 644 "$WSTATUS.tmp" && mv "$WSTATUS.tmp" "$WSTATUS"
+}
 
 # ---------------------------------------------------------------- WIFI.CFG
 
@@ -277,6 +292,7 @@ wait_assoc() {
 # ---------------------------------------------------------------- up
 
 do_up_real() {
+	wstatus connecting
 	CFG=$(find_cfg) || { step "no WIFI.CFG found on $LOGMNT, nothing to do"; return 2; }
 	wl "using $CFG"
 	genconf "$CFG" "$CONF"
@@ -329,6 +345,7 @@ do_up_real() {
 	if [ -z "$_ip" ]; then step "FAIL: DHCP gave no address (rc=$_rc)"; return 1; fi
 	step "dhcp: ip=$_ip gw=$(if_gw) dns=$(dns_list)"
 	echo "$_ssid" >"$WDIR/connected"
+	wstatus connected "$_ssid" "$_ip"
 
 	# the XO-1 RTC may be far off: one-shot NTP, failure is not an error
 	_cs; _t0=$CS
@@ -409,7 +426,10 @@ is_connected() {
 # up: no-op when connected; serialised; a caller that had to wait for another
 # `up` returns that one's result without restarting anything.
 do_up() {
-	if is_connected; then step "up: already connected, nothing to do"; return 0; fi
+	if is_connected; then
+		wstatus connected "$(wstat ssid)" "$(if_ip)"
+		step "up: already connected, nothing to do"; return 0
+	fi
 	if ! lock_wait 240 up; then step "FAIL: up: lock still busy after 240 s"; return 1; fi
 	if [ -n "$WAITED_FOR" ]; then
 		_rop=""; _rpid=""; _rrc=""
@@ -419,10 +439,14 @@ do_up() {
 			step "up: took the result of the concurrent up (pid $_rpid): rc=$_rrc"
 			return "${_rrc:-1}"
 		fi
-		if is_connected; then lock_release; step "up: already connected, nothing to do"; return 0; fi
+		if is_connected; then
+			wstatus connected "$(wstat ssid)" "$(if_ip)"
+			lock_release; step "up: already connected, nothing to do"; return 0
+		fi
 	fi
 	do_up_real
 	_rc=$?
+	[ "$_rc" -eq 0 ] || wstatus off
 	echo "up $$ $_rc" >"$RESULT"
 	lock_release
 	return $_rc
@@ -524,6 +548,7 @@ do_down_real() {
 	ip addr flush dev "$IF" >/dev/null 2>&1
 	ip link set "$IF" down >/dev/null 2>&1
 	rm -f "$CONF" "$WDIR/connected"
+	wstatus off
 	step "down"
 }
 

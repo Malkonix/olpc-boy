@@ -9,16 +9,17 @@ root=$(cd "$here/../.." && pwd)
 cores=$root/out/cores
 CC=${CC:-gcc}
 tmp=$(mktemp -d)
+mkdir -p "$tmp/ovl"
 trap 'rm -rf "$tmp"' EXIT
 fail=0
 bad() { echo "  FAIL: $*"; fail=1; }
 
 # The container CPU is not a Geode: build the host copies for a plain i586.
 HCF="-O2 -march=i586 -Wall -Wextra"
-$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/scale.c" "$here/resample.c" "$here/input.c" "$here/audio.c" "$here/diag.c" "$here/saver.c" -lm -pthread || exit 1
+$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/scale.c" "$here/resample.c" "$here/input.c" "$here/audio.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/../common/status.c" "$here/../common/gfx.c" -lm -pthread || exit 1
 $CC $HCF -o "$tmp/fbcheck" "$here/fbcheck.c" || exit 1
 $CC $HCF -o "$tmp/mkzip" "$here/mkzip.c" || exit 1
-$CC $HCF -o "$tmp/olpc-run" "$here/olpc-run.c" "$here/scale.c" "$here/audio.c" "$here/input.c" "$here/resample.c" "$here/diag.c" "$here/saver.c" -ldl -pthread || exit 1
+$CC $HCF -o "$tmp/olpc-run" "$here/olpc-run.c" "$here/scale.c" "$here/audio.c" "$here/input.c" "$here/resample.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/../common/status.c" "$here/../common/gfx.c" -ldl -pthread || exit 1
 
 echo "== self-test (scaler, resampler, input mapping, audio plan, diagnostics)"
 "$tmp/selftest" || exit 1
@@ -39,19 +40,36 @@ run_core() {
 	[ $rc = 0 ] || { bad "null-sink run rc=$rc"; tail -n 5 "$tmp/log"; }
 	[ "$(stat_get "$tmp/s.txt" frames_run)" = 600 ] || bad "frames_run != 600"
 	printf '  null sinks:  rc=%s frames=%s core_ms_avg=%s (host speed)\n' $rc "$(stat_get "$tmp/s.txt" frames_run)" "$(stat_get "$tmp/s.txt" core_ms_avg)"
-	# b) fake framebuffer: the whole video path
+	# b) fake framebuffer: the whole video path.  The in-game strip (right border) is on by default; its
+	# rectangle is computed here, independently of the frontend: 96x368 at y=16, centred in the border.
+	border=$((1200 - x0 - w)); sarg=""; sx=0
+	if [ $border -ge 104 ]; then sx=$((x0 + w + (border - 96) / 2)); sarg="$sx 16 96 368"; fi
 	rm -f "$tmp/fb.raw"
 	OLPC_RUN_FAKEFB="$tmp/fb.raw" "$tmp/olpc-run" --libdir "$cores" --core "$core" --max-scale "$cap" --no-audio --frames 600 \
+		--status-file "$tmp/ovl/status" --wifi-file "$tmp/ovl/wifi.status" --wireless-file "$tmp/ovl/none" \
 		--stats "$tmp/s.txt" --savedir "$tmp/saves" --input-dir "$tmp/noinput" "$sys" "$rom" >"$tmp/log" 2>&1
 	rc=$?
 	[ $rc = 0 ] || { bad "fake-fb run rc=$rc"; tail -n 5 "$tmp/log"; }
 	grep 'olpc-run: video: source' "$tmp/log" | sed 's/^/  /'
-	res=$("$tmp/fbcheck" "$tmp/fb.raw" "$x0" "$y0" "$w" "$h")
-	inside=${res#inside=}; inside=${inside%% *}; outside=${res##*outside=}
-	echo "  fake fb: $res expected rect ${w}x${h}+${x0}+${y0} (of $((w*h)) pixels)"
+	res=$("$tmp/fbcheck" "$tmp/fb.raw" "$x0" "$y0" "$w" "$h" $sarg)
+	inside=${res#inside=}; inside=${inside%% *}; outside=${res##*outside=}; outside=${outside%% *}; strip=${res##*strip=}
+	echo "  fake fb: $res expected rect ${w}x${h}+${x0}+${y0} (of $((w*h)) pixels), strip rect: ${sarg:-none (border $border px)}"
 	[ "${inside:-0}" -gt 0 ] || bad "no non-black pixel inside the rectangle"
-	[ "${outside:-1}" = 0 ] || bad "$outside non-black pixels outside the rectangle"
+	[ "${outside:-1}" = 0 ] || bad "$outside non-black pixels outside the rectangle and the strip"
+	if [ -n "$sarg" ]; then [ "${strip:-0}" -gt 500 ] || bad "strip empty (strip=$strip)"; else [ "$(stat_get "$tmp/s.txt" overlay)" = 0 ] || bad "overlay reported on without room"; fi
 	grep -q "at $x0,$y0\$" "$tmp/log" || bad "log does not report the expected position $x0,$y0"
+	# same run with --no-overlay: the game rectangle is identical, the border stays black
+	cp "$tmp/fb.raw" "$tmp/fb-ovl.raw"; cp "$tmp/s.txt" "$tmp/s-ovl.txt"
+	rm -f "$tmp/fb.raw"
+	OLPC_RUN_FAKEFB="$tmp/fb.raw" "$tmp/olpc-run" --libdir "$cores" --core "$core" --max-scale "$cap" --no-audio --no-overlay --frames 600 \
+		--stats "$tmp/s.txt" --savedir "$tmp/saves" --input-dir "$tmp/noinput" "$sys" "$rom" >"$tmp/log" 2>&1 || bad "--no-overlay run failed"
+	res2=$("$tmp/fbcheck" "$tmp/fb.raw" "$x0" "$y0" "$w" "$h")
+	[ "${res2##*outside=}" = 0 ] || bad "--no-overlay: pixels outside the rectangle ($res2)"
+	[ "$(stat_get "$tmp/s.txt" overlay)" = 0 ] && [ "$(stat_get "$tmp/s.txt" overlay_redraws)" = 0 ] || bad "--no-overlay: statistics report an overlay"
+	d=$("$tmp/fbcheck" --diff "$tmp/fb-ovl.raw" "$tmp/fb.raw" "$x0" "$y0" "$w" "$h" $sarg)
+	echo "  --no-overlay: $res2; pixels that differ with the overlay on: $d"
+	case $d in "rect=0 other=0"*) ;; *) bad "the overlay changed pixels outside its strip: $d";; esac
+	[ -n "$sarg" ] && [ "$(stat_get "$tmp/s-ovl.txt" overlay_redraws)" -ge 5 ] 2>/dev/null || [ -z "$sarg" ] || bad "overlay redraws missing in the statistics"
 	echo "  stats: drawn=$(stat_get "$tmp/s.txt" frames_drawn) skipped=$(stat_get "$tmp/s.txt" frames_skipped) dupe=$(stat_get "$tmp/s.txt" frames_dupe) rows_drawn_pct=$(stat_get "$tmp/s.txt" rows_drawn_pct) blit_ms_avg=$(stat_get "$tmp/s.txt" blit_ms_avg) (host speed)"
 	cp "$tmp/fb.raw" "$tmp/fb-$label.raw"
 }
@@ -89,6 +107,73 @@ if [ $found = 1 ]; then
 	nes=$(firstfile "$cores/test-roms" '*.nes'); [ -n "$nes" ] || nes=$(firstfile "$cores/real-roms" '*.nes')
 	[ -n "$gb" ] && zip_case gb "$gb" gambatte
 	[ -n "$nes" ] && zip_case nes "$nes" quicknes
+
+	if [ -n "$gb" ] && [ -f "$cores/gambatte_libretro.so" ]; then
+		echo "== in-game strip: states, 12/24 h clock, changes while playing, statistics (gambatte 6x: strip at 1092,16)"
+		mkdir -p "$tmp/cfg24" "$tmp/cfg12"; echo "AST4 24" >"$tmp/cfg24/TZ.CFG"
+		printf 'wlan0: 0000   70.  -50.  -256 0 0 0 0 0 0\n' >"$tmp/ovl/w4"
+		printf 'wlan0: 0000   30.  -80.  -256 0 0 0 0 0 0\n' >"$tmp/ovl/w1"
+		SR="1092 16 96 368"; GR="120 18 960 864"
+		# ovl_shot <name> <status> <wifi> <wireless file> <cfgdir> : one run, fake clock 15:07:10 AST
+		ovl_shot() {
+			printf '%s\n' "$2" >"$tmp/ovl/status"; printf '%s\n' "$3" >"$tmp/ovl/wifi.status"
+			rm -f "$tmp/ovl-$1.raw"
+			env -u TZ OLPC_RUN_FAKEFB="$tmp/ovl-$1.raw" OLPC_RUN_CFGDIR="$5" OLPC_RUN_TZFILE=/nonexistent OLPC_RUN_FAKETIME=1717268830 \
+				"$tmp/olpc-run" --libdir "$cores" --core gambatte --no-audio --frames 300 --status-file "$tmp/ovl/status" \
+				--wifi-file "$tmp/ovl/wifi.status" --wireless-file "$4" --stats "$tmp/ovl-$1.txt" --savedir "$tmp/saves" \
+				--input-dir "$tmp/noinput" gb "$gb" >"$tmp/ovl-$1.log" 2>&1 || bad "ovl_shot $1 failed"
+			[ -n "$FRAMES_DIR" ] && { mkdir -p "$FRAMES_DIR"; cp "$tmp/ovl-$1.raw" "$FRAMES_DIR/ovl-$1.raw"; }
+		}
+		ovl_vs() {   # <name> <base>: strips differ, nothing else does
+			d=$("$tmp/fbcheck" --diff "$tmp/ovl-$2.raw" "$tmp/ovl-$1.raw" $GR $SR)
+			case $d in "rect=0 other=0 strip=0") bad "$1 looks the same as $2 (strip unchanged)";; "rect=0 other=0 strip="*) echo "  $1 vs $2: $d";; *) bad "$1 vs $2 changed pixels outside the strip: $d";; esac
+		}
+		ST="vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=0"; WF="state=connected ssid=Casa ip=10.0.0.2"
+		ovl_shot base "$ST" "$WF" "$tmp/ovl/w4" "$tmp/cfg24"
+		grep -q 'overlay: strip 96x368 at 1092,16' "$tmp/ovl-base.log" || bad "no strip placement in the log"
+		grep -q 'overlay: time zone AST4, 24-hour clock' "$tmp/ovl-base.log" || bad "TZ.CFG not applied to the clock"
+		ovl_shot h12 "$ST" "$WF" "$tmp/ovl/w4" "$tmp/cfg12";                                                  ovl_vs h12 base
+		ovl_shot wifi1 "$ST" "$WF" "$tmp/ovl/w1" "$tmp/cfg24";                                                ovl_vs wifi1 base
+		ovl_shot wifioff "$ST" "state=off" "$tmp/ovl/w4" "$tmp/cfg24";                                        ovl_vs wifioff base
+		ovl_shot wifiwait "$ST" "state=connecting" "$tmp/ovl/w4" "$tmp/cfg24";                                ovl_vs wifiwait wifioff
+		ovl_shot mute "vol=27 volmax=31 mute=1 bri=13 brimax=15 mono=0" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";   ovl_vs mute base
+		ovl_shot vol0 "vol=0 volmax=31 mute=0 bri=13 brimax=15 mono=0" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";    ovl_vs vol0 base
+		ovl_shot bri3 "vol=27 volmax=31 mute=0 bri=3 brimax=15 mono=0" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";    ovl_vs bri3 base
+		ovl_shot mono "vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=1" "$WF" "$tmp/ovl/w4" "$tmp/cfg24";   ovl_vs mono base
+		ovl_shot none "" "" "$tmp/ovl/w4" "$tmp/cfg24";                                                       ovl_vs none base
+		grep -q '^overlay=1' "$tmp/ovl-base.txt" && grep -q '^overlay_rect=96x368+1092+16' "$tmp/ovl-base.txt" || bad "overlay statistics missing"
+		for k in overlay_full_paints overlay_redraws overlay_redraw_us_total overlay_redraw_us_max overlay_ticks overlay_tick_us_total overlay_tick_us_max overlay_period; do
+			grep -q "^$k=" "$tmp/ovl-base.txt" || bad "stats lack $k"
+		done
+		echo "  base run: redraws=$(stat_get "$tmp/ovl-base.txt" overlay_redraws) total_us=$(stat_get "$tmp/ovl-base.txt" overlay_redraw_us_total) max_us=$(stat_get "$tmp/ovl-base.txt" overlay_redraw_us_max) ticks=$(stat_get "$tmp/ovl-base.txt" overlay_ticks) (host speed)"
+		[ "$(stat_get "$tmp/ovl-base.txt" overlay_redraws)" = 5 ] || bad "a run with constant values must redraw each of the 5 slots once (got $(stat_get "$tmp/ovl-base.txt" overlay_redraws))"
+
+		# values change while playing: only the strip is repainted, the result equals a run that had the final values all along
+		printf '%s\n' "$ST" >"$tmp/ovl/status"; printf '%s\n' "$WF" >"$tmp/ovl/wifi.status"
+		rm -f "$tmp/ovl-live.raw"
+		( sleep 0.7
+		  printf '%s\n' "vol=27 volmax=31 mute=1 bri=13 brimax=15 mono=1" >"$tmp/ovl/status.new"; mv "$tmp/ovl/status.new" "$tmp/ovl/status"
+		  printf 'state=off\n' >"$tmp/ovl/wifi.status.new"; mv "$tmp/ovl/wifi.status.new" "$tmp/ovl/wifi.status" ) &
+		env -u TZ OLPC_RUN_FAKEFB="$tmp/ovl-live.raw" OLPC_RUN_CFGDIR="$tmp/cfg24" OLPC_RUN_TZFILE=/nonexistent OLPC_RUN_FAKETIME=1717268830 \
+			"$tmp/olpc-run" --libdir "$cores" --core gambatte --audio-dev /nonexistent/pcm --frames 120 --overlay-period 6 \
+			--status-file "$tmp/ovl/status" --wifi-file "$tmp/ovl/wifi.status" --wireless-file "$tmp/ovl/w4" --stats "$tmp/ovl-live.txt" \
+			--savedir "$tmp/saves" --input-dir "$tmp/noinput" gb "$gb" >"$tmp/ovl-live.log" 2>&1 || bad "live run failed"
+		wait
+		printf '%s\n' "vol=27 volmax=31 mute=1 bri=13 brimax=15 mono=1" >"$tmp/ovl/status"; printf 'state=off\n' >"$tmp/ovl/wifi.status"
+		rm -f "$tmp/ovl-ref.raw"
+		env -u TZ OLPC_RUN_FAKEFB="$tmp/ovl-ref.raw" OLPC_RUN_CFGDIR="$tmp/cfg24" OLPC_RUN_TZFILE=/nonexistent OLPC_RUN_FAKETIME=1717268830 \
+			"$tmp/olpc-run" --libdir "$cores" --core gambatte --audio-dev /nonexistent/pcm --frames 120 --overlay-period 6 \
+			--status-file "$tmp/ovl/status" --wifi-file "$tmp/ovl/wifi.status" --wireless-file "$tmp/ovl/w4" --stats "$tmp/ovl-ref.txt" \
+			--savedir "$tmp/saves" --input-dir "$tmp/noinput" gb "$gb" >"$tmp/ovl-ref.log" 2>&1 || bad "reference run failed"
+		rd=$(stat_get "$tmp/ovl-live.txt" overlay_redraws)
+		d=$("$tmp/fbcheck" --diff "$tmp/ovl-live.raw" "$tmp/ovl-ref.raw" $GR $SR)
+		echo "  live changes: redraws=$rd (5 initial + 3 changed slots), final screen vs a run that had the final values all along: $d"
+		[ "$rd" = 8 ] || bad "expected 8 slot redraws, got $rd"
+		[ "$d" = "rect=0 other=0 strip=0" ] || bad "the strip after the change differs from the reference: $d"
+		grep -q '^overlay_ticks=[1-9]' "$tmp/ovl-live.txt" || bad "no polls recorded"
+		echo "  1 s polling default: overlay_period=$(stat_get "$tmp/ovl-base.txt" overlay_period)"
+		[ "$(stat_get "$tmp/ovl-base.txt" overlay_period)" = 60 ] || bad "default poll period is not 60 frames"
+	fi
 
 	if [ -n "$gb" ]; then
 		echo "== clock pacing fallback (no sound card): 120 frames must take about 2 s"

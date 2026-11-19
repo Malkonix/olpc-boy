@@ -49,6 +49,10 @@ int  rep_timeout(const struct rep *r, uint64_t now_ms);
 /* ---- remembered selection ---------------------------------------------------------------- */
 int  state_write(const char *path, int sys, const char *file);   /* atomic (tmp + rename) */
 int  state_read(const char *path, int *sys, char *file, size_t cap);
+/* Same, plus the "In-game indicators" switch (a line "overlay=0" or "overlay=1", absent in older files):
+ * overlay = 0 or 1 to write the line, -1 to leave it out; *overlay is -1 when the file has no valid line. */
+int  state_write_opt(const char *path, int sys, const char *file, int overlay);
+int  state_read_opt(const char *path, int *sys, char *file, size_t cap, int *overlay);
 
 /* ---- text -------------------------------------------------------------------------------- */
 /* UTF-8 (invalid bytes taken as Latin-1) to Latin-1 bytes; characters beyond U+00FF are folded
@@ -59,4 +63,7 @@ void   fit_text(unsigned char *s, int maxch);
 /* Word-wraps s into lines of at most maxch characters (the last line is cut with "..." when
  * more than maxlines would be needed).  Lines are written to out[i] (each cap bytes); returns n. */
 int    wrap_text(const unsigned char *s, int maxch, char out[][96], int maxlines);
+
+/* status parsers (status_parse, wifi_status_parse, wireless_level, clock_text, tzcfg_parse...) live in ../common/status.h */
+#include "../common/status.h"
 #endif

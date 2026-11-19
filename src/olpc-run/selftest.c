@@ -11,6 +11,7 @@
 #include "audio.h"
 #include "diag.h"
 #include "saver.h"
+#include "overlay.h"
 #include <sys/stat.h>
 #include <time.h>
 
@@ -687,6 +688,140 @@ static void diag_tests(void)
 	printf("diag: done\n");
 }
 
+
+/* ------------------------------------------------------------------ in-game indicator strip */
+
+static void put_file(const char *path, const char *text)
+{
+	char tmp[600];
+	FILE *f;
+
+	snprintf(tmp, sizeof tmp, "%s.new", path);
+	f = fopen(tmp, "w");
+	if (f) { fputs(text, f); fclose(f); rename(tmp, path); }          /* replaced atomically, like olpc-wifi */
+}
+
+static long count_changed(const uint16_t *a, const uint16_t *b, int x0, int y0, int w, int h, int inside)
+{
+	long n = 0;
+	int x, y;
+
+	for (y = 0; y < 900; y++)
+		for (x = 0; x < 1200; x++) {
+			int in = x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
+			if (in == inside && a[y * 1200 + x] != b[y * 1200 + x]) n++;
+		}
+	return n;
+}
+
+static void overlay_tests(void)
+{
+	static struct overlay o;
+	static uint16_t fb[1200 * 900], ref[1200 * 900];
+	static uint32_t fb32[1200 * 900], ref32[1200 * 900];
+	struct pixtab t16, t32;
+	char dir[] = "/tmp/olpc-ovl-XXXXXX", pst[300], pwf[300], l1[16], l2[16];
+	int x = -1, i;
+	long before;
+
+	/* geometry: the strip lives in the right border only */
+	CHECK(ovl_fits(1200, 900, 120, 18, 960, 864, &x) == 1 && x == 1080 + (120 - OVL_W) / 2, "GB 6x fits at x=%d", x);
+	CHECK(ovl_fits(1200, 900, 120, 2, 960, 896, &x) == 1 && x == 1092, "NES 4x fits");
+	CHECK(ovl_fits(1200, 900, 216, 90, 768, 720, &x) == 1 && x == 984 + (216 - OVL_W) / 2, "NES 3x (wide border) fits at x=%d", x);
+	CHECK(ovl_fits(1200, 900, 0, 0, 1200 - (OVL_W + 2 * OVL_MARGIN) + 1, 900, &x) == 0, "border one pixel short: nothing");
+	CHECK(ovl_fits(1200, 900, 0, 0, 1200 - (OVL_W + 2 * OVL_MARGIN), 900, &x) == 1 && x == 1200 - OVL_W - OVL_MARGIN, "border exactly enough: x=%d", x);
+	CHECK(ovl_fits(1200, 900, 0, 0, 1200, 900, &x) == 0, "full-screen game: nothing");
+	CHECK(ovl_fits(1200, OVL_Y + OVL_H - 1, 120, 0, 960, 100, &x) == 0, "screen too short: nothing");
+	CHECK(ovl_fits(800, 600, 80, 0, 640, 480, &x) == 0, "800x600 with 80 px border: nothing");
+
+	ovl_clock_lines("3:07 PM", l1, l2, sizeof l1);
+	CHECK(!strcmp(l1, "3:07") && !strcmp(l2, "PM"), "12 h clock in two lines: %s / %s", l1, l2);
+	ovl_clock_lines("15:07", l1, l2, sizeof l1);
+	CHECK(!strcmp(l1, "15:07") && !l2[0], "24 h clock in one line");
+	ovl_clock_lines("--:--", l1, l2, sizeof l1);
+	CHECK(!strcmp(l1, "--:--") && !l2[0], "unset clock in one line");
+
+	pixtab_init(&t16, 16, 11, 5, 5, 6, 0, 5);
+	pixtab_init(&t32, 32, 16, 8, 8, 8, 0, 8);
+	if (!mkdtemp(dir)) { CHECK(0, "mkdtemp"); return; }
+	snprintf(pst, sizeof pst, "%s/status", dir);
+	snprintf(pwf, sizeof pwf, "%s/wifi.status", dir);
+	put_file(pst, "vol=20 volmax=31 mute=0 bri=7 brimax=15 mono=0\n");
+	put_file(pwf, "state=connected ssid=Casa ip=10.0.0.2\n");
+
+	/* paint: only the strip rectangle may change (16-bit fb) */
+	for (i = 0; i < 1200 * 900; i++) fb[i] = ref[i] = 0x1234;
+	ovl_init(&o);
+	o.status_path = pst; o.wifi_path = pwf; o.wireless_path = "/nonexistent"; o.period = 5; o.fake_base = 1717268830; o.fake_t0 = 0;
+	CHECK(ovl_place(&o, 1200, 900, 120, 18, 960, 864, (uint8_t *)fb, 2400, &t16) == 1, "place GB 6x");
+	CHECK(o.x == 1092 && o.y == OVL_Y && o.redraws == OS_N && o.full_paints == 1, "first paint draws every slot: redraws=%lu", o.redraws);
+	CHECK(count_changed(fb, ref, 1092, OVL_Y, OVL_W, OVL_H, 1) > 1000, "strip has pixels");
+	CHECK(count_changed(fb, ref, 1092, OVL_Y, OVL_W, OVL_H, 0) == 0, "nothing outside the strip rectangle changed");
+
+	/* quiet frames: a counter compare, nothing redrawn, nothing read */
+	for (i = 0; i < 4; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(o.redraws == OS_N && o.ticks == 0, "4 frames of a 5-frame period: no tick (ticks=%lu)", o.ticks);
+	ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(o.ticks == 1 && o.redraws == OS_N, "5th frame polls; nothing changed: no redraw (redraws=%lu)", o.redraws);
+	/* a skipped blit defers the poll to the next frame */
+	for (i = 0; i < 4; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 1);
+	CHECK(o.ticks == 1, "deferred while a blit is skipped");
+	ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(o.ticks == 2, "polled on the next frame");
+
+	/* a value changes: exactly that slot is redrawn, replaced file noticed, nothing outside the strip */
+	memcpy(ref, fb, sizeof fb);
+	before = (long)o.redraws;
+	put_file(pst, "vol=20 volmax=31 mute=1 bri=7 brimax=15 mono=0\n");
+	for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK((long)o.redraws == before + 1, "mute flips: one slot redrawn (%ld)", (long)o.redraws - before);
+	CHECK(count_changed(fb, ref, 1092, OVL_Y, OVL_W, OVL_H, 1) > 0 && count_changed(fb, ref, 1092, OVL_Y, OVL_W, OVL_H, 0) == 0, "only the strip changed");
+	memcpy(ref, fb, sizeof fb);
+	before = (long)o.redraws;
+	put_file(pst, "vol=20 volmax=31 mute=1 bri=3 brimax=15 mono=1\n");
+	put_file(pwf, "state=off\n");
+	for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK((long)o.redraws == before + 3, "brightness + mode + wifi: three slots (%ld)", (long)o.redraws - before);
+	unlink(pst);
+	for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(o.st.vol == -1 && o.st.mono == -1, "status file gone: values unknown");
+	put_file(pst, "vol=1 volmax=31 mute=0 bri=15 brimax=15 mono=0\n");
+	for (i = 0; i < 5; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(o.st.vol == 1 && o.st.bri == 15, "status file back: re-opened");
+	CHECK(o.redraw_ns_max > 0 && o.redraw_ns >= o.redraw_ns_max, "redraw time is accounted");
+	ovl_close(&o);
+
+	/* the same into a 32-bit framebuffer */
+	for (i = 0; i < 1200 * 900; i++) fb32[i] = ref32[i] = 0x12345678u;
+	ovl_init(&o);
+	o.status_path = pst; o.wifi_path = pwf; o.wireless_path = "/nonexistent"; o.period = 5;
+	CHECK(ovl_place(&o, 1200, 900, 216, 90, 768, 720, (uint8_t *)fb32, 4800, &t32) == 1 && o.x == 984 + (216 - OVL_W) / 2, "place NES 3x, 32 bpp");
+	{
+		long outside = 0, in = 0;
+		int xx, yy;
+		for (yy = 0; yy < 900; yy++)
+			for (xx = 0; xx < 1200; xx++) {
+				int ins = xx >= o.x && xx < o.x + OVL_W && yy >= o.y && yy < o.y + OVL_H;
+				if (fb32[yy * 1200 + xx] != ref32[yy * 1200 + xx]) { if (ins) in++; else outside++; }
+			}
+		CHECK(in > 1000 && outside == 0, "32 bpp: strip %ld pixels, outside %ld", in, outside);
+	}
+	ovl_close(&o);
+
+	/* a border that is too narrow: nothing drawn, nothing touched */
+	for (i = 0; i < 1200 * 900; i++) fb[i] = ref[i] = 0x1234;
+	ovl_init(&o);
+	o.status_path = pst; o.wifi_path = pwf; o.period = 5;
+	CHECK(ovl_place(&o, 1200, 900, 100, 0, 1000, 900, (uint8_t *)fb, 2400, &t16) == 0 && !o.on, "100 px border: not placed");
+	for (i = 0; i < 20; i++) ovl_frame(&o, (uint8_t *)fb, 2400, &t16, 0);
+	CHECK(!memcmp(fb, ref, sizeof fb), "narrow border: the framebuffer is untouched");
+	ovl_close(&o);
+	unlink(pst); unlink(pwf);
+	rmdir(dir);
+	printf("overlay: done\n");
+}
+
 int main(void)
 {
 	audio_tests();
@@ -696,6 +831,7 @@ int main(void)
 	input_tests();
 	chord_tests();
 	saver_tests();
+	overlay_tests();
 	printf("%d checks, %d failures\n%s\n", g_checks, g_fail, g_fail ? "FAILED" : "ALL OK");
 	return g_fail ? 1 : 0;
 }

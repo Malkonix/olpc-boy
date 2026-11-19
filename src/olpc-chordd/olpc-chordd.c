@@ -20,7 +20,11 @@
  * for the repeat timer while UP/DOWN is held inside a chord.
  *
  * The chord state is exported as "1\n"/"0\n" in $CHORDD_STATE
- * (default /run/olpcboy/chord).
+ * (default /run/olpcboy/chord).  The device state is published as one line,
+ * "vol=15 volmax=31 mute=0 bri=07 brimax=15 mono=0" (-1 = unknown; vol is
+ * relative to the mixer minimum), in $CHORDD_STATUS (default: "status" next to
+ * the chord file).  It is rewritten in place with a single write at start and
+ * after every change chordd makes, so a reader can watch it with inotify.
  *
  * Test mode (no devices, no root): see usage().  Paths are overridable by
  * environment variables, see the table below.
@@ -98,6 +102,8 @@ struct ev16 { uint32_t sec, usec; uint16_t type, code; int32_t value; };
 
 /* ---- configuration (environment overrides) ----------------------------- */
 static const char *p_input, *p_bl_glob, *p_mono, *p_state, *p_timeline, *p_snd, *p_fake;
+static char p_status[300];
+static void publish_status(void);
 static int test_mode;
 static const char *log_src;	/* "pad: <name>" while a gamepad chord acts, else NULL */
 
@@ -207,6 +213,7 @@ static void do_brightness(int dir, int edge)
 	back = -1;
 	read_int(p, &back);
 	logf_("brightness %ld -> %ld (max %ld, step %ld), read back %ld", cur, nw, max, step, back);
+	publish_status();
 }
 
 static void do_mono(int mono)
@@ -219,6 +226,7 @@ static void do_mono(int mono)
 	}
 	read_int(p_mono, &back);
 	logf_("%s mode, read back %ld", mono ? "mono" : "color", back);
+	publish_status();
 }
 
 /* ---- mixer backend ------------------------------------------------------------
@@ -440,6 +448,7 @@ static int do_volume(int dir, int edge)
 	mirror_mono(base, "Volume", nw);
 	if (mx->get(n, &e) == 0) back = e.v[0];
 	logf_("volume %s %ld -> %ld (max %ld), read back %ld", base, cur, nw, e.max, back);
+	publish_status();
 	return 0;
 }
 
@@ -460,6 +469,47 @@ static void do_mute(int mute)
 	mirror_mono(base, "Switch", e.v[0]);
 	if (mx->get(n, &e) == 0) back = e.v[0];
 	logf_("volume %s %s, read back switch %ld", base, mute ? "muted" : "unmuted", back);
+	publish_status();
+}
+
+/* ---- status file ------------------------------------------------------------------ */
+static int status_fd = -1;
+static char status_last[128];
+
+static void publish_status(void)
+{
+	char line[128], bl[256], p[300], n[64];
+	long bri = -1, brimax = -1, mono = -1, vol = -1, volmax = -1, mute = 0, t;
+	struct mx_elem e;
+	const char *base;
+	int len;
+
+	if (status_fd < 0) return;
+	if (find_backlight(bl, sizeof bl) == 0) {
+		snprintf(p, sizeof p, "%s/max_brightness", bl);
+		if (read_int(p, &t) == 0 && t > 0) {
+			brimax = t;
+			snprintf(p, sizeof p, "%s/brightness", bl);
+			if (read_int(p, &t) == 0) bri = t;
+		}
+	}
+	if (read_int(p_mono, &t) == 0) mono = t ? 1 : 0;
+	if ((base = vol_base(&e)) && e.max > e.min) {
+		vol = e.v[0] - e.min;
+		volmax = e.max - e.min;
+		snprintf(n, sizeof n, "%s Playback Switch", base);
+		if (mx->get(n, &e) == 0) mute = e.v[0] ? 0 : 1;
+	}
+	len = snprintf(line, sizeof line, "vol=%02ld volmax=%02ld mute=%ld bri=%02ld brimax=%02ld mono=%ld\n",
+		       vol, volmax, mute, bri, brimax, mono);
+	if (!strcmp(line, status_last)) return;
+	if (pwrite(status_fd, line, len, 0) != len) {
+		fprintf(stderr, "olpc-chordd: status write: %s\n", strerror(errno));
+		return;
+	}
+	if ((size_t)len < strlen(status_last) && ftruncate(status_fd, len) < 0) { /* stale tail is harmless: readers stop at the newline */ }
+	snprintf(status_last, sizeof status_last, "%s", line);
+	if (test_mode) fprintf(stderr, "olpc-chordd: status: %s", line);
 }
 
 /* ---- chord state machine ---------------------------------------------------- */
@@ -849,6 +899,7 @@ static void usage(void)
 	      "       olpc-chordd --replay      replay raw 16-byte input_event records from stdin\n"
 	      "environment: CHORDD_INPUT_DIR (/dev/input), CHORDD_BACKLIGHT_GLOB (/sys/class/backlight/*),\n"
 	      "  CHORDD_MONO (/sys/devices/platform/dcon/monochrome), CHORDD_STATE (/run/olpcboy/chord),\n"
+	      "  CHORDD_STATUS (status next to CHORDD_STATE),\n"
 	      "  CHORDD_TIMELINE (/var/log/olpc-current/timeline.log; unset in test mode = not written),\n"
 	      "  CHORDD_TAIL_MS (test: keep the clock running after the last event),\n"
 	      "  CHORDD_SND_CTL (/dev/snd/controlC0), CHORDD_FAKE_MIXER (test: file-backed fake mixer)\n", stderr);
@@ -900,11 +951,27 @@ int main(int argc, char **argv)
 		snprintf(dir, sizeof dir, "%s", p_state);
 		if ((s = strrchr(dir, '/')) && s != dir) { *s = 0; mkdir(dir, 0755); }
 	}
+	{
+		const char *sp = getenv("CHORDD_STATUS");
+		char dir[300], *s;
+		if (sp && *sp) snprintf(p_status, sizeof p_status, "%s", sp);
+		else {
+			snprintf(p_status, sizeof p_status, "%s", p_state);
+			s = strrchr(p_status, '/');
+			if (s) snprintf(s + 1, sizeof p_status - (size_t)(s + 1 - p_status), "status");
+			else snprintf(p_status, sizeof p_status, "status");
+		}
+		snprintf(dir, sizeof dir, "%s", p_status);
+		if ((s = strrchr(dir, '/')) && s != dir) { *s = 0; mkdir(dir, 0755); }
+	}
+	status_fd = open(p_status, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+	if (status_fd < 0) fprintf(stderr, "olpc-chordd: %s: %s (status not published)\n", p_status, strerror(errno));
 	state_fd = open(p_state, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
 	if (state_fd < 0) fprintf(stderr, "olpc-chordd: %s: %s (state not exported)\n", p_state, strerror(errno));
 	export_state();
 
 	mixer_ready();		/* card may be absent (QEMU): logged once, retried on use */
+	publish_status();
 	if (test_mode)
 		return replay(stdin, !strcmp(argv[1], "--test"));
 

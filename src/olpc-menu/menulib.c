@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #pragma GCC diagnostic ignored "-Wformat-truncation"
+#include <time.h>
 #include "menulib.h"
 
 const char *const SYS_DIR[NSYS] = { "gb", "gbc", "nes" };
@@ -241,7 +242,7 @@ int rep_timeout(const struct rep *r, uint64_t now)
 
 /* -------------------------------------------------------------------- state */
 
-int state_write(const char *path, int sys, const char *file)
+int state_write_opt(const char *path, int sys, const char *file, int overlay)
 {
 	char tmp[4200];
 	FILE *f;
@@ -251,12 +252,15 @@ int state_write(const char *path, int sys, const char *file)
 	f = fopen(tmp, "w");
 	if (!f) return -1;
 	fprintf(f, "system=%s\nfile=%s\n", SYS_DIR[sys], file ? file : "");
+	if (overlay == 0 || overlay == 1) fprintf(f, "overlay=%d\n", overlay);
 	if (fclose(f) != 0) { unlink(tmp); return -1; }
 	if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
 	return 0;
 }
 
-int state_read(const char *path, int *sys, char *file, size_t cap)
+int state_write(const char *path, int sys, const char *file) { return state_write_opt(path, sys, file, -1); }
+
+int state_read_opt(const char *path, int *sys, char *file, size_t cap, int *overlay)
 {
 	char line[4200];
 	FILE *f = fopen(path, "r");
@@ -265,6 +269,7 @@ int state_read(const char *path, int *sys, char *file, size_t cap)
 	if (!f) return -1;
 	file[0] = 0;
 	*sys = -1;
+	if (overlay) *overlay = -1;
 	while (fgets(line, sizeof line, f)) {
 		line[strcspn(line, "\r\n")] = 0;
 		if (!strncmp(line, "system=", 7)) {
@@ -272,11 +277,15 @@ int state_read(const char *path, int *sys, char *file, size_t cap)
 		} else if (!strncmp(line, "file=", 5)) {
 			snprintf(file, cap, "%s", line + 5);
 			got |= 2;
+		} else if (overlay && (!strcmp(line, "overlay=0") || !strcmp(line, "overlay=1"))) {
+			*overlay = line[8] - '0';
 		}
 	}
 	fclose(f);
 	return got == 3 ? 0 : -1;
 }
+
+int state_read(const char *path, int *sys, char *file, size_t cap) { return state_read_opt(path, sys, file, cap, NULL); }
 
 /* --------------------------------------------------------------------- text */
 

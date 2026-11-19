@@ -1,12 +1,14 @@
 # olpc-menu build.  Inside the builder container:  make -C src/olpc-menu
-# Dynamically linked (musl) like olpc-run; it shares the evdev code of olpc-run.
+# Dynamically linked (musl) like olpc-run; it shares the evdev code of olpc-run and the status parsers,
+# icon drawing and font in ../common with olpc-run's in-game strip.
 CC      ?= gcc
 CFLAGS  ?= -O2 -march=geode -mtune=geode -Wall -Wextra
 OUT     ?= .
 RUN     := ../olpc-run
-SRCS    := olpc-menu.c menulib.c $(RUN)/input.c $(RUN)/diag.c
+COM     := ../common
+SRCS    := olpc-menu.c menulib.c $(COM)/status.c $(COM)/gfx.c $(RUN)/input.c $(RUN)/diag.c
 
-$(OUT)/olpc-menu: $(SRCS) menulib.h font8x16.h $(RUN)/input.h $(RUN)/diag.h
+$(OUT)/olpc-menu: $(SRCS) menulib.h $(COM)/status.h $(COM)/gfx.h $(COM)/font8x16.h $(RUN)/input.h $(RUN)/diag.h
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 	strip $@
 

@@ -1,4 +1,4 @@
-Terminus Font 16 is embedded in olpc-menu (font8x16.h).
+Terminus Font 16 is embedded in olpc-menu and olpc-run (font8x16.h, shared in src/common).
 
 Terminus Font is licensed under the SIL Open Font License, Version 1.1.
 

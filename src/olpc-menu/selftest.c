@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "menulib.h"
 
 static int fails, checks;
@@ -133,6 +134,13 @@ static void test_state(const char *t)
 		CHECK(state_read(p, &sys, f, sizeof f) < 0);
 	}
 	CHECK(state_write(p, 9, "a") < 0);
+	{	/* the In-game indicators switch rides along in the state file */
+		int ov = 5;
+		CHECK(state_write_opt(p, 1, "g.gbc", 0) == 0 && state_read_opt(p, &sys, f, sizeof f, &ov) == 0 && sys == 1 && !strcmp(f, "g.gbc") && ov == 0);
+		CHECK(state_write_opt(p, 1, "g.gbc", 1) == 0 && state_read_opt(p, &sys, f, sizeof f, &ov) == 0 && ov == 1);
+		CHECK(state_write(p, 1, "g.gbc") == 0 && state_read_opt(p, &sys, f, sizeof f, &ov) == 0 && ov == -1);
+		CHECK(state_write_opt(p, 1, "g.gbc", 1) == 0 && state_read(p, &sys, f, sizeof f) == 0 && sys == 1);
+	}
 }
 
 static void test_text(void)
@@ -202,6 +210,91 @@ static int mkcover(const char *path, int w, int h)
 	return 0;
 }
 
+static void test_indicators(void)
+{
+	struct sysstat s;
+	struct wifistat w;
+	struct tm tm;
+	char tz[64], b[32];
+	int h24, dbm;
+	static const char wl[] =
+		"Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n"
+		" face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n"
+		"    lo: 0000    0.    0.    0.        0      0      0      0      0        0\n"
+		" wlan0: 0000   70.  -52.  -256        0      0      0      0      0        0\n";
+
+	/* status file */
+	CHECK(status_parse("vol=27 volmax=31 mute=0 bri=13 brimax=15 mono=1\n", &s) == 6);
+	CHECK(s.vol == 27 && s.volmax == 31 && s.mute == 0 && s.bri == 13 && s.brimax == 15 && s.mono == 1);
+	CHECK(pct_of_max(s.vol, s.volmax) == 87 && pct_of_max(0, 15) == 0 && pct_of_max(15, 15) == 100 && pct_of_max(-1, 15) == -1);
+	CHECK(status_parse("", &s) == 0 && s.vol == -1 && s.bri == -1);
+	CHECK(status_parse("vol=27 volmax=31 mute=0 bri=1", &s) == 3 && s.bri == -1 && s.volmax == 31);   /* truncated: last token dropped */
+	CHECK(status_parse("vol=27 volmax=3", &s) == 0 && s.vol == -1);                                  /* no newline, no consistent pair */
+	CHECK(status_parse("vol=-1 volmax=0 mute=0 bri=7 brimax=15 mono=0\n", &s) == 4 && s.vol == -1 && s.volmax == -1 && s.bri == 7);
+	CHECK(status_parse("vol=40 volmax=31 mute=7 bri=3 brimax=15\n", &s) == 3 && s.vol == -1 && s.mute == -1 && s.bri == 3);
+	CHECK(status_parse("garbage\x01\xff=== vol=abc volmax=,, \n", &s) == 0 && s.vol == -1);
+	CHECK(status_parse("vol=5x volmax=31\n", &s) == 1 && s.vol == -1);
+	CHECK(status_parse("\n\n", &s) == 0);
+
+	/* wifi status */
+	CHECK(wifi_status_parse("state=off\n", &w) == WS_OFF);
+	CHECK(wifi_status_parse("state=connecting\n", &w) == WS_CONNECTING);
+	CHECK(wifi_status_parse("state=connected ssid=Casa 5G ip=192.168.1.20\n", &w) == WS_CONNECTED);
+	CHECK(!strcmp(w.ssid, "Casa 5G") && !strcmp(w.ip, "192.168.1.20"));
+	CHECK(wifi_status_parse("state=connected ssid=a ip=b ssid=c ip=10.0.0.2\n", &w) == WS_CONNECTED && !strcmp(w.ssid, "a ip=b ssid=c") && !strcmp(w.ip, "10.0.0.2"));
+	CHECK(wifi_status_parse("state=connected\n", &w) == WS_CONNECTED && !w.ssid[0] && !w.ip[0]);
+	CHECK(wifi_status_parse("", &w) == WS_UNKNOWN);
+	CHECK(wifi_status_parse("state=conn", &w) == WS_UNKNOWN);
+	CHECK(wifi_status_parse("state=offline\n", &w) == WS_UNKNOWN);
+	CHECK(wifi_status_parse("\x01\x02 junk", &w) == WS_UNKNOWN);
+
+	/* /proc/net/wireless */
+	CHECK(wireless_level(wl, "wlan0", &dbm) == 0 && dbm == -52);
+	CHECK(wireless_level(wl, "wlan1", &dbm) == -1);
+	CHECK(wireless_level("Inter-| x\n face | y\n", "wlan0", &dbm) == -1);
+	CHECK(wireless_level(" wlan0: 0000   70.   180.  -256\n", "wlan0", &dbm) == -1);          /* not dBm */
+	CHECK(wireless_level(" wlan0: 0000   70.  -80  -256", "wlan0", &dbm) == 0 && dbm == -80);  /* no dot, no newline */
+	CHECK(wireless_level(" wlan0:", "wlan0", &dbm) == -1);
+	CHECK(wireless_level("", "wlan0", &dbm) == -1);
+	CHECK(signal_bars(-40) == 4 && signal_bars(-55) == 4 && signal_bars(-56) == 3 && signal_bars(-65) == 3 && signal_bars(-66) == 2 &&
+	      signal_bars(-75) == 2 && signal_bars(-76) == 1 && signal_bars(-95) == 1);
+
+	/* minute boundary */
+	CHECK(ms_to_next_minute(0, 0) == 60030);
+	CHECK(ms_to_next_minute(59, 0) == 1030);
+	CHECK(ms_to_next_minute(59, 999) == 31);
+	CHECK(ms_to_next_minute(1700000010LL, 250) == (60 - 1700000010LL % 60) * 1000 - 250 + 30);
+	CHECK(ms_to_next_minute(61, 500) == 58530);
+
+	/* clock text */
+	memset(&tm, 0, sizeof tm);
+	tm.tm_year = 2026 - 1900; tm.tm_hour = 15; tm.tm_min = 7;
+	clock_text(&tm, 0, b, sizeof b); CHECK(!strcmp(b, "3:07 PM"));
+	clock_text(&tm, 1, b, sizeof b); CHECK(!strcmp(b, "15:07"));
+	tm.tm_hour = 0; clock_text(&tm, 0, b, sizeof b); CHECK(!strcmp(b, "12:07 AM"));
+	tm.tm_hour = 12; clock_text(&tm, 0, b, sizeof b); CHECK(!strcmp(b, "12:07 PM"));
+	tm.tm_hour = 9; tm.tm_min = 5; clock_text(&tm, 0, b, sizeof b); CHECK(!strcmp(b, "9:05 AM"));
+	tm.tm_hour = 9; clock_text(&tm, 1, b, sizeof b); CHECK(!strcmp(b, "09:05"));
+	tm.tm_year = 1970 - 1900; clock_text(&tm, 0, b, sizeof b); CHECK(!strcmp(b, "--:--"));
+	tm.tm_year = 2023 - 1900; clock_text(&tm, 1, b, sizeof b); CHECK(!strcmp(b, "--:--"));
+
+	/* TZ.CFG */
+	h24 = 0;
+	CHECK(tzcfg_parse("AST4\n", tz, sizeof tz, &h24) == 0 && !strcmp(tz, "AST4") && h24 == 0);
+	CHECK(tzcfg_parse("# my zone\r\n\r\n  EST5EDT,M3.2.0,M11.1.0   24  \r\nignored\n", tz, sizeof tz, &h24) == 0 &&
+	      !strcmp(tz, "EST5EDT,M3.2.0,M11.1.0") && h24 == 1);
+	CHECK(tzcfg_parse("AST4 12\n", tz, sizeof tz, &h24) == 0 && h24 == 0);
+	CHECK(tzcfg_parse("<-03>3 24", tz, sizeof tz, &h24) == 0 && !strcmp(tz, "<-03>3") && h24 == 1);
+	h24 = 1;
+	CHECK(tzcfg_parse("CET-1CEST\n", tz, sizeof tz, &h24) == 0 && h24 == 1);          /* no token: unchanged */
+	CHECK(tzcfg_parse("AST4 bogus\n", tz, sizeof tz, &h24) == 0 && h24 == 1);
+	CHECK(tzcfg_parse("", tz, sizeof tz, &h24) == -1);
+	CHECK(tzcfg_parse("# only a comment\n\n", tz, sizeof tz, &h24) == -1);
+	CHECK(tzcfg_parse("24\n", tz, sizeof tz, &h24) == -1);
+	CHECK(tzcfg_parse("AST\x01" "4\n", tz, sizeof tz, &h24) == -1);
+	CHECK(tzcfg_parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4\n", tz, sizeof tz, &h24) == -1);
+}
+
 int main(int argc, char **argv)
 {
 	char t[] = "/tmp/olpcmenu-test-XXXXXX", cmd[1100];
@@ -215,6 +308,7 @@ int main(int argc, char **argv)
 	test_state(t);
 	test_text();
 	test_cover(t);
+	test_indicators();
 	printf("%d checks, %d failed\n", checks, fails);
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", t);
 	if (system(cmd)) {}

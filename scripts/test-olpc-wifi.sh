@@ -165,4 +165,80 @@ kill -KILL "$holder"
 wait
 [ "$(cat "$T/rc.b" 2>/dev/null)" = 0 ] && [ "$(nstart)" -eq 2 ] && ok "waiter took over from a killed holder and did the work" || bad "killed holder: rc.b=$(cat "$T/rc.b" 2>/dev/null) starts=$(nstart)"
 
+
+# ---------------------------------------------------------------- wifi.status transitions
+# The real do_up_real / do_down_real run against stubbed commands.  Each stub records what
+# wifi.status says at that moment: rfkill is the first command after "connecting" is written,
+# udhcpc is the DHCP step, ntpd the first command after "connected".  The key must never appear.
+SECRET='SuperSecretKey123'
+printf 'Casa 5G\t%s\tWPA2\n' "$SECRET" >"$T/st.cfg"
+cat >"$T/stat-runner.sh" <<'STUBS'
+#!/bin/sh
+export OLPC_WIFI_TEST=1 OLPC_WIFI_IF=lo OLPC_WIFI_CFG=${CFGFILE:-$T/st.cfg}
+olpc_uptime() { echo 0.00; }
+tl() { :; }
+olpc_sleep() { :; }
+_cs() { CS=$(( $(date +%s) * 100 )); }
+. "$WIFI"
+WDIR=$T/wdir; CONF=$WDIR/wpa.conf; WPALOG=$WDIR/wpa.log; WPAPID=$WDIR/wpa.pid; DHCPID=$WDIR/dhcp.pid; CTRL=$WDIR/ctrl
+mkdir -p "$WDIR" "$LOCKBASE"
+snap() { echo "$1: $(cat "$WSTATUS" 2>/dev/null || echo MISSING)" >>"$T/hist"; }
+bounded() { shift; "$@"; }
+wait_selftest() { :; }
+start_wpa() { echo $$ >"$WPAPID"; return 0; }
+wait_assoc() { return 0; }
+stop_procs() { :; }
+rfkill() { snap after-start; }
+modprobe() { :; }
+wpa_cli() { case "$*" in *status*) echo "wpa_state=COMPLETED"; printf 'ssid=%s\n' "${FAKE_SSID:-Casa 5G}";; esac; }
+iw() { echo "	signal: -52 dBm"; }
+ip() { case "$*" in *"addr show"*) [ -n "$FAKE_NOIP" ] || echo "    inet 10.1.2.3/24 brd 10.1.2.255 scope global wlan0";; esac; return 0; }
+udhcpc() { snap dhcp; return 0; }
+ntpd() { snap ntp; return 0; }
+"$@"
+STUBS
+export T WIFI OLPC_WIFI_LOCKDIR=$T/run
+ws_reset() { rm -rf "${T:?}/run" "${T:?}/hist" "${T:?}/wdir"; mkdir -p "$T/run"; : >"$T/hist"; }
+sr() { sh "$T/stat-runner.sh" "$@"; }
+snapfile() { cat "$T/run/wifi.status" 2>/dev/null; }
+
+ws_reset
+sr do_up_real; rc=$?
+[ "$rc" = 0 ] && ok "stubbed up succeeds" || bad "stubbed up rc=$rc"
+grep -qx 'after-start: state=connecting' "$T/hist" && ok "status is 'connecting' while the connection is being made" || bad "no connecting state: $(cat "$T/hist")"
+grep -qx 'dhcp: state=connecting' "$T/hist" && ok "still 'connecting' during DHCP" || bad "DHCP phase status: $(grep '^dhcp' "$T/hist")"
+grep -qx 'ntp: state=connected ssid=Casa 5G ip=10.1.2.3' "$T/hist" && ok "connected with ssid and ip, before the NTP step" || bad "connected line: $(grep '^ntp' "$T/hist")"
+[ "$(snapfile)" = 'state=connected ssid=Casa 5G ip=10.1.2.3' ] && ok "final file: $(snapfile)" || bad "final file: $(snapfile)"
+ls "$T/run" | grep -q 'wifi.status.tmp' && bad "temporary status file left behind" || ok "no temporary file left (atomic replace)"
+
+ws_reset
+FAKE_NOIP=1 sr do_up; rc=$?
+[ "$rc" = 1 ] && [ "$(snapfile)" = 'state=off' ] && ok "DHCP failure: up fails, status off" || bad "DHCP failure rc=$rc status=$(snapfile)"
+grep -qx 'after-start: state=connecting' "$T/hist" && ok "failure path went through connecting first" || bad "failure path history: $(cat "$T/hist")"
+
+ws_reset
+printf '# nothing usable\n' >"$T/st-empty.cfg"
+FAKE_NOIP=1 CFGFILE=$T/st-empty.cfg sr do_up; rc=$?
+[ "$rc" = 2 ] && [ "$(snapfile)" = 'state=off' ] && ok "no usable network: status off" || bad "empty cfg rc=$rc status=$(snapfile)"
+
+ws_reset
+sr do_up >/dev/null; sr do_down; rc=$?
+[ "$rc" = 0 ] && [ "$(snapfile)" = 'state=off' ] && ok "down: status off" || bad "down status: $(snapfile)"
+
+ws_reset
+FAKE_SSID="$(printf 'We\001ird ip=9.9.9.9 net')" sr do_up_real >/dev/null
+l=$(snapfile)
+[ "$(wc -l <"$T/run/wifi.status")" = 1 ] && ok "SSID with control characters / 'ip=' text: still one line" || bad "weird ssid broke the line: $l"
+case "$l" in *"ssid=Weird ip=9.9.9.9 net ip=10.1.2.3") ok "control characters dropped, real ip is the last field";; *) bad "weird ssid line: $l";; esac
+
+# already connected: the no-op `up` still republishes the state
+ws_reset
+rm -f "$T/run/wifi.status"
+sr do_up >/dev/null
+[ "$(snapfile)" = 'state=connected ssid=Casa 5G ip=10.1.2.3' ] && ok "up while already connected republishes the state" || bad "already-connected status: $(snapfile)"
+
+# the key: in no status file, no snapshot, no wifi.log
+cat "$T/hist" "$T/run/wifi.status" 2>/dev/null | grep -qF "$SECRET" && bad "KEY LEAKED INTO THE STATUS FILE" || ok "key never in wifi.status or its snapshots"
+grep -qF "$SECRET" "$BOOTDIR/wifi.log" && bad "KEY LEAKED INTO wifi.log" || ok "key not in wifi.log"
+
 [ $fail -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }

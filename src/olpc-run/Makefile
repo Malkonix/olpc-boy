@@ -3,9 +3,11 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -march=geode -mtune=geode -Wall -Wextra
 OUT     ?= .
-SRCS    := olpc-run.c scale.c audio.c input.c resample.c diag.c saver.c
+# ../common: status parsers, icon drawing and the font, shared with olpc-menu
+COM     := ../common
+SRCS    := olpc-run.c scale.c audio.c input.c resample.c diag.c saver.c overlay.c $(COM)/status.c $(COM)/gfx.c
 
-$(OUT)/olpc-run: $(SRCS) scale.h audio.h input.h resample.h diag.h saver.h libretro.h
+$(OUT)/olpc-run: $(SRCS) scale.h audio.h input.h resample.h diag.h saver.h overlay.h libretro.h $(COM)/status.h $(COM)/gfx.h $(COM)/font8x16.h
 	$(CC) $(CFLAGS) -o $@ $(SRCS) -ldl -pthread
 	strip $@
 

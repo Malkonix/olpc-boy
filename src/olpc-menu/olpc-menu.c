@@ -5,11 +5,22 @@
  * Test hooks (all optional): OLPC_MENU_FAKEFB (file standing in for /dev/fb0), OLPC_MENU_SCAN (base
  * dirs, default /mnt:/media), OLPC_MENU_RUNDIR (default /run/olpcboy), OLPC_MENU_CHORD, OLPC_MENU_RUN,
  * OLPC_MENU_COVERS_BIN, OLPC_MENU_WIFI_BIN, OLPC_MENU_SDMOUNT, OLPC_MENU_POWEROFF, OLPC_MENU_REBOOT,
- * OLPC_MENU_INPUTDIR, OLPC_MENU_DEVDIR and --script FILE (timed key events, see test.sh).
+ * OLPC_MENU_INPUTDIR, OLPC_MENU_DEVDIR, OLPC_MENU_BACKLIGHT (glob pattern, default the backlight class dir plus a star),
+ * OLPC_MENU_WIRELESS (default /proc/net/wireless), OLPC_MENU_CFGDIR (where TZ.CFG lives, default
+ * /mnt/olpclog), OLPC_MENU_TZFILE (default /etc/TZ), OLPC_MENU_FAKETIME (epoch seconds standing in
+ * for the wall clock, advancing with the monotonic clock), OLPC_MENU_DIRTYLOG (file: every flushed
+ * rectangle) and --script FILE (timed key events, see test.sh).
+ *
+ * Title-bar indicators (WiFi, volume, brightness, clock) read /run/olpcboy/status (olpc-chordd) and
+ * /run/olpcboy/wifi.status (olpc-wifi) when inotify reports them, /proc/net/wireless every 30 s while
+ * connected, and wake the loop only at minute boundaries.  The time zone comes from TZ.CFG, else
+ * /etc/TZ, else AST4 (musl honours only $TZ, so it is set here).
  * Exit codes: 0 ok, 2 usage, 3 no usable framebuffer. */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -28,14 +39,14 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include "menulib.h"
-#include "font8x16.h"
+#include "../common/gfx.h"
 #include "../olpc-run/input.h"
 
 /* ------------------------------------------------------------------ config */
 
 static const char *e_scan, *e_rundir, *e_chord, *e_run, *e_covers, *e_wifi, *e_sd, *e_poweroff, *e_reboot,
-		  *e_inputdir, *e_devdir;
-static char p_state[300], p_runerr[300], p_covstat[300], p_jobout[300];
+		  *e_inputdir, *e_devdir, *e_backlight, *e_wireless, *e_cfgdir, *e_tzfile;
+static char p_state[300], p_runerr[300], p_covstat[300], p_jobout[300], p_status[300], p_wifist[300];
 
 static const char *envd(const char *n, const char *d) { const char *v = getenv(n); return v && *v ? v : d; }
 
@@ -73,6 +84,7 @@ static uint64_t now_ms(void)
 
 static int FBW = 1200, FBH = 900;
 static uint16_t *bb;                       /* back buffer: what the screen shows; never read the fb */
+static struct gfx G;                       /* the back buffer as a drawing surface */
 static uint8_t *fbmap;
 static size_t fbstride, fbmaplen;
 static int fbfd = -1, g_fake, g_tty = -1;
@@ -138,6 +150,7 @@ static int fb_open(void)
 	if (fbmap == MAP_FAILED) { logf_("mmap: %s", strerror(errno)); fbmap = NULL; close(fbfd); fbfd = -1; return -1; }
 	bb = calloc((size_t)FBW * FBH, 2);
 	if (!bb) return -1;
+	G.px = bb; G.stride = FBW; G.w = FBW; G.h = FBH;
 	if (!g_fake) {
 		g_tty = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
 		if (g_tty < 0) g_tty = open("/dev/tty1", O_RDWR | O_NOCTTY | O_CLOEXEC);
@@ -198,12 +211,15 @@ static void dirty_add(int x, int y, int w, int h)
 	dirty[ndirty++] = r;
 }
 
+static FILE *dirtylog;
+
 static void flush(void)
 {
 	int i, y;
 
 	for (i = 0; i < ndirty; i++) {
 		const struct rect *d = &dirty[i];
+		if (dirtylog) { fprintf(dirtylog, "D %d %d %d %d\n", d->x0, d->y0, d->x1, d->y1); fflush(dirtylog); }
 		for (y = d->y0; y < d->y1; y++)
 			memcpy(fbmap + (size_t)y * fbstride + (size_t)d->x0 * 2, bb + (size_t)y * FBW + d->x0,
 			       (size_t)(d->x1 - d->x0) * 2);
@@ -223,17 +239,14 @@ static const uint16_t C_SEL[NSYS] = { RGB(88, 128, 44), RGB(110, 70, 180), RGB(1
 
 static void fill(int x, int y, int w, int h, uint16_t c)
 {
-	int xx, yy, x1 = x + w, y1 = y + h;
+	int x1 = x + w, y1 = y + h;
 
 	if (x < 0) x = 0;
 	if (y < 0) y = 0;
 	if (x1 > FBW) x1 = FBW;
 	if (y1 > FBH) y1 = FBH;
 	if (x1 <= x || y1 <= y) return;
-	for (yy = y; yy < y1; yy++) {
-		uint16_t *p = bb + (size_t)yy * FBW;
-		for (xx = x; xx < x1; xx++) p[xx] = c;
-	}
+	gfx_fill(&G, x, y, x1 - x, y1 - y, c);
 	dirty_add(x, y, x1 - x, y1 - y);
 }
 
@@ -243,33 +256,13 @@ static void frame(int x, int y, int w, int h, int t, uint16_t c)
 	fill(x, y, t, h, c); fill(x + w - t, y, t, h, c);
 }
 
-static int text_w(const unsigned char *s, int sc) { return (int)strlen((const char *)s) * 8 * sc; }
+static int text_w(const unsigned char *s, int sc) { return gfx_text_w(s, sc); }
 
 /* Latin-1 text, glyph pixels only (the caller painted the background). */
 static void text(int x, int y, int sc, uint16_t fg, const unsigned char *s)
 {
-	int x0 = x;
-
-	for (; *s; s++, x += 8 * sc) {
-		const unsigned char *g;
-		int row, col, sx, sy;
-		unsigned c = *s;
-
-		if (c < 0x20) c = '?';
-		g = font8x16[c - 0x20];
-		if (x < 0 || x + 8 * sc > FBW || y < 0 || y + 16 * sc > FBH) continue;
-		for (row = 0; row < 16; row++) {
-			unsigned bits = g[row];
-			if (!bits) continue;
-			for (sy = 0; sy < sc; sy++) {
-				uint16_t *d = bb + (size_t)(y + row * sc + sy) * FBW + x;
-				for (col = 0; col < 8; col++)
-					if (bits & (0x80u >> col))
-						for (sx = 0; sx < sc; sx++) d[col * sc + sx] = fg;
-			}
-		}
-	}
-	dirty_add(x0, y, x - x0, 16 * sc);
+	gfx_text(&G, x, y, sc, fg, s);
+	dirty_add(x, y, gfx_text_w(s, sc), 16 * sc);
 }
 
 /* UTF-8 in, fitted to maxch characters, drawn; returns the pixel width */
@@ -328,17 +321,205 @@ static struct rom *cur_rom(void)
 	return l->n ? &l->v[sel[cur_sys]] : NULL;
 }
 
+/* ------------------------------------------------------------ title-bar indicators */
+
+/* Right-aligned slots, left to right: WiFi, volume, brightness, clock.  Fixed widths, so a value
+ * change repaints only its own slot. */
+#define IND_Y 4
+#define IND_H (TITLE_H - 8)           /* = IND_SLOT_H */
+#define IND_GAP 28
+#define W_WIFI IND_W_WIFI
+#define W_VOL IND_W_VOL
+#define W_BRI IND_W_BRI
+#define W_CLOCK 192
+static int ix_clock(void) { return FBW - 24 - W_CLOCK; }
+static int ix_bri(void) { return ix_clock() - IND_GAP - W_BRI; }
+static int ix_vol(void) { return ix_bri() - IND_GAP - W_VOL; }
+static int ix_wifi(void) { return ix_vol() - IND_GAP - W_WIFI; }
+
+static struct sysstat g_st = { -1, -1, -1, -1, -1, -1 };      /* /run/olpcboy/status */
+static struct wifistat g_wifi = { WS_OFF, "", "" };           /* /run/olpcboy/wifi.status */
+static int g_bars = 4, g_sys_bri = -1, g_sys_brimax = -1, g_h24;
+static uint64_t sig_due, sysfs_due;
+static int fake_on;
+static time_t fake_base;
+static uint64_t fake_t0;
+static struct { int wifi, vol, mute, bri; char clk[16]; } shown;
+
+static ssize_t slurp(const char *path, char *b, size_t cap)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0) return -1;
+	n = read(fd, b, cap - 1);
+	close(fd);
+	if (n < 0) n = 0;
+	b[n] = 0;
+	return n;
+}
+
+static void read_status(void)
+{
+	char b[256];
+	struct sysstat s;
+
+	if (slurp(p_status, b, sizeof b) < 0) { memset(&g_st, 0xff, sizeof g_st); return; }    /* chordd not running: unknown */
+	if (status_parse(b, &s) > 0) g_st = s;               /* empty or garbage (caught mid-write): keep what we had */
+}
+
+static void read_wifi(void)
+{
+	char b[256];
+	struct wifistat w;
+
+	if (slurp(p_wifist, b, sizeof b) < 0) { memset(&g_wifi, 0, sizeof g_wifi); g_wifi.state = WS_OFF; return; }
+	if (wifi_status_parse(b, &w) == WS_UNKNOWN) return;
+	if (w.state == WS_CONNECTED && g_wifi.state != WS_CONNECTED) sig_due = 0;
+	g_wifi = w;
+}
+
+static void read_signal(uint64_t now)
+{
+	char b[2048];
+	int dbm;
+
+	g_bars = slurp(e_wireless, b, sizeof b) > 0 && wireless_level(b, "wlan0", &dbm) == 0 ? signal_bars(dbm) : 4;
+	sig_due = now + 30000;
+}
+
+static void read_sysfs_bri(uint64_t now)
+{
+	glob_t g;
+	size_t i;
+	char p[400], b[32];
+
+	sysfs_due = now + 30000;
+	g_sys_bri = g_sys_brimax = -1;
+	if (glob(e_backlight, GLOB_NOSORT, NULL, &g) == 0) {
+		for (i = 0; i < g.gl_pathc && g_sys_brimax < 0; i++) {
+			snprintf(p, sizeof p, "%s/max_brightness", g.gl_pathv[i]);
+			if (slurp(p, b, sizeof b) <= 0 || atoi(b) <= 0) continue;
+			g_sys_brimax = atoi(b);
+			snprintf(p, sizeof p, "%s/brightness", g.gl_pathv[i]);
+			g_sys_bri = slurp(p, b, sizeof b) > 0 ? atoi(b) : -1;
+		}
+	}
+	globfree(&g);
+}
+
+static void wall_now(time_t *t, int *msec)
+{
+	if (fake_on) {
+		uint64_t d = now_ms() - fake_t0;
+		*t = fake_base + (time_t)(d / 1000); *msec = (int)(d % 1000);
+	} else {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		*t = ts.tv_sec; *msec = (int)(ts.tv_nsec / 1000000);
+	}
+}
+
+static void clock_now(char *out, size_t cap)
+{
+	time_t t;
+	int ms;
+	struct tm tm;
+
+	wall_now(&t, &ms);
+	localtime_r(&t, &tm);
+	clock_text(&tm, g_h24, out, cap);
+}
+
+/* The zone must be set here: musl reads only $TZ (no /etc/TZ), and the image has no tzdata.  The rule
+ * (TZ.CFG, then /etc/TZ, then AST4) is shared with olpc-run. */
+static void tz_setup(void)
+{
+	char tz[64];
+	int h24 = 0;
+
+	tz_apply(e_cfgdir, e_tzfile, 0, tz, sizeof tz, &h24);
+	g_h24 = h24;
+	logf_("time zone %s, %s-hour clock", tz, h24 ? "24" : "12");
+}
+
+static uint16_t faint(void) { return gfx_blend(C_TITLE[cur_sys], C_TEXT, 70); }
+
+static int bri_pct(void)
+{
+	if (g_st.bri >= 0 && g_st.brimax > 0) return pct_of_max(g_st.bri, g_st.brimax);
+	return pct_of_max(g_sys_bri, g_sys_brimax);
+}
+
+static struct ind_pal ind_pal(uint16_t bg)
+{
+	struct ind_pal p = { bg, C_TEXT, C_DIM, faint(), C_TEXT };
+
+	return p;
+}
+
+static void ind_wifi_(int x, uint16_t bg)
+{
+	struct ind_pal p = ind_pal(bg);
+
+	ind_wifi(&G, x, IND_Y, &p, g_wifi.state, g_bars);
+	dirty_add(x, IND_Y, IND_W_WIFI, IND_SLOT_H);
+}
+
+static void ind_vol_(int x, uint16_t bg)
+{
+	struct ind_pal p = ind_pal(bg);
+
+	ind_vol(&G, x, IND_Y, &p, pct_of_max(g_st.vol, g_st.volmax), g_st.mute == 1);
+	dirty_add(x, IND_Y, IND_W_VOL, IND_SLOT_H);
+}
+
+static void ind_bri_(int x, uint16_t bg)
+{
+	struct ind_pal p = ind_pal(bg);
+
+	ind_bri(&G, x, IND_Y, &p, bri_pct());
+	dirty_add(x, IND_Y, IND_W_BRI, IND_SLOT_H);
+}
+
+static void ind_clock(int x, uint16_t bg)
+{
+	unsigned char l1[16];
+
+	fill(x, IND_Y, W_CLOCK, IND_H, bg);
+	utf8_to_l1(shown.clk, l1, sizeof l1);
+	text(x + W_CLOCK - text_w(l1, 3), 12, 3, shown.clk[0] == '-' ? C_DIM : C_TEXT, l1);
+}
+
+/* repaint only the slots whose value changed since they were last drawn */
+static void ind_update(int force)
+{
+	int w = g_wifi.state * 16 + (g_wifi.state == WS_CONNECTED ? g_bars : 0);
+	int v = pct_of_max(g_st.vol, g_st.volmax), m = g_st.mute == 1, b = bri_pct();
+	char clk[16];
+	uint16_t bg = C_TITLE[cur_sys];
+
+	clock_now(clk, sizeof clk);
+	if (force || w != shown.wifi) { shown.wifi = w; ind_wifi_(ix_wifi(), bg); }
+	if (force || v != shown.vol || m != shown.mute) { shown.vol = v; shown.mute = m; ind_vol_(ix_vol(), bg); }
+	if (force || b != shown.bri) { shown.bri = b; ind_bri_(ix_bri(), bg); }
+	if (force || strcmp(clk, shown.clk)) { snprintf(shown.clk, sizeof shown.clk, "%s", clk); ind_clock(ix_clock(), bg); }
+}
+
 static void draw_title(void)
 {
 	char b[64];
 	unsigned char l1[96];
+	int nx;
 
 	fill(0, 0, FBW, TITLE_H, C_TITLE[cur_sys]);
 	snprintf(b, sizeof b, "< %s >", SYS_TITLE[cur_sys]);
 	text(24, 12, 3, C_TEXT, (const unsigned char *)b);
+	nx = 24 + (int)strlen(b) * 24 + 24;
 	snprintf(b, sizeof b, "%d game%s", L[cur_sys].n, L[cur_sys].n == 1 ? "" : "s");
 	utf8_to_l1(b, l1, sizeof l1);
-	text(FBW - 24 - text_w(l1, 3), 12, 3, C_TEXT, l1);
+	if (nx + text_w(l1, 2) <= ix_wifi() - 20) text(nx, 25, 2, C_DIM, l1);
+	ind_update(1);
 }
 
 static void draw_hint(const char *s)
@@ -528,10 +709,9 @@ static void switch_sys(int dir, uint64_t now)
 /* -------------------------------------------------------------------- jobs */
 
 enum { JOB_SD, JOB_NET, JOB_COVERS, NJOB };
-enum { NET_STATUS, NET_UP, NET_DOWN };
+enum { NET_UP, NET_DOWN };
 static struct { pid_t pid; int what; } jobs[NJOB];
-static int wifi_on = -1;             /* -1 unknown */
-static char wifi_ip[48], opt_msg[96], cov_line[96];
+static char opt_msg[96], cov_line[96];
 static int opt_cur, opt_confirm = -1;    /* confirm: item index awaiting a second A */
 
 static pid_t spawn(const char *out, const char *bin, const char *a1)
@@ -574,27 +754,6 @@ static void read_first_line(const char *path, char *out, size_t cap, int last)
 	if (line) snprintf(out, cap, "%s", line);
 }
 
-static void net_status_parse(void)
-{
-	char buf[512], *p;
-	FILE *f = fopen(p_jobout, "r");
-	size_t n;
-
-	wifi_ip[0] = 0;
-	if (!f) return;
-	n = fread(buf, 1, sizeof buf - 1, f);
-	fclose(f);
-	buf[n] = 0;
-	wifi_on = !strncmp(buf, "connected", 9);
-	p = strstr(buf, "ip:");
-	if (p && wifi_on) {
-		p += 3;
-		while (*p == ' ') p++;
-		snprintf(wifi_ip, sizeof wifi_ip, "%.*s", (int)strcspn(p, "\r\n"), p);
-		if (!strcmp(wifi_ip, "none")) wifi_ip[0] = 0;
-	}
-}
-
 static void do_rescan(void);
 static void draw_options(void);
 
@@ -606,8 +765,7 @@ static void job_done(int k, int status)
 		do_rescan();
 		if (screen == SC_LIST) draw_main(now_ms());
 	} else if (k == JOB_NET) {
-		if (jobs[k].what == NET_STATUS) net_status_parse();
-		else { jobs[k].pid = spawn(p_jobout, e_wifi, "status"); jobs[k].what = NET_STATUS; }
+		read_wifi();                 /* olpc-wifi wrote its final state; the inotify event may not be served yet */
 	} else if (k == JOB_COVERS) {
 		read_first_line(p_covstat, cov_line, sizeof cov_line, 1);
 		if (!cov_line[0]) snprintf(cov_line, sizeof cov_line, "download finished");
@@ -629,7 +787,9 @@ static void reap_jobs(void)
 
 /* ------------------------------------------------------------------ options */
 
-#define NOPT 5
+#define NOPT 6
+static int g_overlay = 1;       /* "In-game indicators": passed to olpc-run as --no-overlay when 0; kept in the state file */
+static void save_state(int best_effort_copy);
 static void opt_label(int i, char *b, size_t cap)
 {
 	switch (i) {
@@ -640,18 +800,19 @@ static void opt_label(int i, char *b, size_t cap)
 		else snprintf(b, cap, "Download covers");
 		break;
 	case 2:
-		if (jobs[JOB_NET].pid) snprintf(b, cap, "WiFi: working...");
-		else if (wifi_on == 1) snprintf(b, cap, "WiFi: ON  - turn off");
+		if (jobs[JOB_NET].pid || g_wifi.state == WS_CONNECTING) snprintf(b, cap, "WiFi: working...");
+		else if (g_wifi.state == WS_CONNECTED) snprintf(b, cap, "WiFi: ON  - turn off");
 		else snprintf(b, cap, "WiFi: OFF - turn on");
 		break;
 	case 3: snprintf(b, cap, opt_confirm == 3 ? "Power off: press A again" : "Power off"); break;
-	default: snprintf(b, cap, opt_confirm == 4 ? "Reboot: press A again" : "Reboot"); break;
+	case 4: snprintf(b, cap, opt_confirm == 4 ? "Reboot: press A again" : "Reboot"); break;
+	default: snprintf(b, cap, "In-game indicators: %s", g_overlay ? "ON" : "OFF"); break;
 	}
 }
 
 static void draw_options(void)
 {
-	int bw = 760, bh = 500, bx = (FBW - bw) / 2, by = (FBH - bh) / 2, i, y;
+	int bw = 760, bh = 540, bx = (FBW - bw) / 2, by = (FBH - bh) / 2, i, y;
 	char b[160];
 
 	fill(bx - 4, by - 4, bw + 8, bh + 8, C_BORDER);
@@ -666,8 +827,8 @@ static void draw_options(void)
 	y = by + 74 + NOPT * 52 + 8;
 	snprintf(b, sizeof b, "Covers: %s", cov_line[0] ? cov_line : "-");
 	utext(bx + 30, y, 2, C_DIM, b, (bw - 60) / 16);
-	if (wifi_on == 1) snprintf(b, sizeof b, "WiFi: connected %s", wifi_ip);
-	else snprintf(b, sizeof b, "WiFi: %s", wifi_on == 0 ? "not connected" : "unknown");
+	if (g_wifi.state == WS_CONNECTED) snprintf(b, sizeof b, "WiFi: connected %s %s", g_wifi.ssid, g_wifi.ip);
+	else snprintf(b, sizeof b, "WiFi: %s", g_wifi.state == WS_CONNECTING ? "connecting..." : "not connected");
 	utext(bx + 30, y + 34, 2, C_DIM, b, (bw - 60) / 16);
 	if (opt_msg[0]) utext(bx + 30, y + 68, 2, C_OK, opt_msg, (bw - 60) / 16);
 }
@@ -679,7 +840,7 @@ static void open_options(void)
 	screen = SC_OPTIONS;
 	opt_cur = 0; opt_confirm = -1; opt_msg[0] = 0;
 	read_covers_status();
-	if (!jobs[JOB_NET].pid) { jobs[JOB_NET].pid = spawn(p_jobout, e_wifi, "status"); jobs[JOB_NET].what = NET_STATUS; }
+	read_wifi();
 	draw_hint("UP/DOWN choose   A select   B back");
 	draw_options();
 }
@@ -723,10 +884,18 @@ static void opt_activate(void)
 		}
 		break;
 	case 2:
-		if (jobs[JOB_NET].pid) { snprintf(opt_msg, sizeof opt_msg, "Please wait"); break; }
-		jobs[JOB_NET].what = wifi_on == 1 ? NET_DOWN : NET_UP;
-		jobs[JOB_NET].pid = spawn(p_jobout, e_wifi, wifi_on == 1 ? "down" : "up");
-		snprintf(opt_msg, sizeof opt_msg, wifi_on == 1 ? "Turning WiFi off" : "Connecting (can take a minute)");
+		if (jobs[JOB_NET].pid || g_wifi.state == WS_CONNECTING) { snprintf(opt_msg, sizeof opt_msg, "Please wait"); break; }
+		{
+			int on = g_wifi.state == WS_CONNECTED;
+			jobs[JOB_NET].what = on ? NET_DOWN : NET_UP;
+			jobs[JOB_NET].pid = spawn(p_jobout, e_wifi, on ? "down" : "up");
+			snprintf(opt_msg, sizeof opt_msg, on ? "Turning WiFi off" : "Connecting (can take a minute)");
+		}
+		break;
+	case 5:
+		g_overlay = !g_overlay;
+		save_state(1);
+		snprintf(opt_msg, sizeof opt_msg, g_overlay ? "Indicators shown during games" : "Indicators hidden during games");
 		break;
 	default:
 		if (opt_confirm != i) { opt_confirm = i; break; }
@@ -788,14 +957,14 @@ static void save_state(int best_effort_copy)
 {
 	struct rom *r = cur_rom();
 
-	if (!r) return;
-	state_write(p_state, cur_sys, r->file);
+	if (!r) { state_write_opt(p_state, cur_sys, st_file, g_overlay); return; }
+	state_write_opt(p_state, cur_sys, r->file, g_overlay);
 	if (best_effort_copy) {
 		pid_t p = fork();           /* the stick can be slow: never in the UI process */
 		if (p == 0) {
 			char path[4700];
 			snprintf(path, sizeof path, "%s/../olpc-menu.state", r->romsdir);
-			state_write(path, cur_sys, r->file);
+			state_write_opt(path, cur_sys, r->file, g_overlay);
 			_exit(0);
 		}
 	}
@@ -804,13 +973,13 @@ static void save_state(int best_effort_copy)
 static void load_state(void)
 {
 	char file[512], path[4700];
-	int sys, i, j;
+	int sys, i, j, ov;
 
-	if (state_read(p_state, &sys, file, sizeof file) == 0) { st_sys = sys; snprintf(st_file, sizeof st_file, "%s", file); return; }
+	if (state_read_opt(p_state, &sys, file, sizeof file, &ov) == 0) { st_sys = sys; snprintf(st_file, sizeof st_file, "%s", file); if (ov >= 0) g_overlay = ov; return; }
 	for (i = 0; i < NSYS; i++)
 		for (j = 0; j < L[i].n; j++) {
 			snprintf(path, sizeof path, "%s/../olpc-menu.state", L[i].v[j].romsdir);
-			if (state_read(path, &sys, file, sizeof file) == 0) { st_sys = sys; snprintf(st_file, sizeof st_file, "%s", file); return; }
+			if (state_read_opt(path, &sys, file, sizeof file, &ov) == 0) { st_sys = sys; snprintf(st_file, sizeof st_file, "%s", file); if (ov >= 0) g_overlay = ov; return; }
 			break;      /* one probe per system */
 		}
 }
@@ -1030,7 +1199,8 @@ static void launch(void)
 		sigprocmask(SIG_SETMASK, &none, NULL);
 		if (z >= 0) dup2(z, 0);
 		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
-		execl(e_run, e_run, SYS_DIR[cur_sys], r->path, (char *)NULL);
+		if (g_overlay) execl(e_run, e_run, SYS_DIR[cur_sys], r->path, (char *)NULL);
+			else execl(e_run, e_run, "--no-overlay", SYS_DIR[cur_sys], r->path, (char *)NULL);
 		fprintf(stderr, "cannot run %s: %s\n", e_run, strerror(errno));
 		_exit(127);
 	}
@@ -1052,6 +1222,7 @@ after:
 		if (ioctl(g_tty, KDSETMODE, KD_GRAPHICS) == 0) g_kd_graphics = 1;
 	}
 	input_resync();
+	read_status(); read_wifi(); read_sysfs_bri(now_ms());
 	if (rc != 0) {
 		err_rc = rc;
 		load_error_text();
@@ -1071,7 +1242,7 @@ after:
 /* ------------------------------------------------------------------ script */
 
 struct sev { uint64_t at; int kind, code, val; char arg[300]; };
-enum { SK_KEY, SK_DUMP, SK_CHORD, SK_END };
+enum { SK_KEY, SK_DUMP, SK_CHORD, SK_END, SK_TIME, SK_SH, SK_MARK };
 static struct sev *sev;
 static int nsev, isev;
 
@@ -1112,6 +1283,9 @@ static int script_load(const char *path)
 		} else if (!strcmp(cmd, "dump") && n >= 3) { e.kind = SK_DUMP; snprintf(e.arg, sizeof e.arg, "%s", a1); }
 		else if (!strcmp(cmd, "chord") && n >= 3) { e.kind = SK_CHORD; e.val = atoi(a1); }
 		else if (!strcmp(cmd, "end")) e.kind = SK_END;
+		else if (!strcmp(cmd, "time") && n >= 3) { e.kind = SK_TIME; snprintf(e.arg, sizeof e.arg, "%s", a1); }
+		else if (!strcmp(cmd, "sh") && n >= 3) { e.kind = SK_SH; snprintf(e.arg, sizeof e.arg, "%s", a1); }
+		else if (!strcmp(cmd, "mark")) e.kind = SK_MARK;
 		else { fprintf(stderr, "olpc-menu: script: bad line \"%s\"\n", line); fclose(f); return -1; }
 		sev = realloc(sev, (size_t)(nsev + 1) * sizeof *sev);
 		if (!sev) abort();
@@ -1185,6 +1359,11 @@ static void handle_inotify(int fd, int is_dev)
 				read_covers_status();
 				if (screen == SC_OPTIONS) draw_options();
 			}
+			if (!is_dev && !strcmp(e->name, "status")) read_status();
+			if (!is_dev && !strcmp(e->name, "wifi.status")) {
+				read_wifi();
+				if (screen == SC_OPTIONS) draw_options();
+			}
 		}
 		o += (ssize_t)sizeof *e + e->len;
 	}
@@ -1194,7 +1373,7 @@ static void usage(void)
 {
 	fputs("usage: olpc-menu [--script FILE]\n"
 	      "  Game launcher.  --script FILE: timed key events for tests (lines: <ms> key <UP|DOWN|LEFT|RIGHT|A|B|START|SELECT>\n"
-	      "  <down|up|tap> | <ms> dump FILE | <ms> chord 0|1 | <ms> end).  See the header of olpc-menu.c for env hooks.\n", stderr);
+	      "  <down|up|tap> | <ms> dump FILE | <ms> chord 0|1 | <ms> time EPOCH | <ms> sh FILE | <ms> mark | <ms> end).  See the header of olpc-menu.c for env hooks.\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -1220,6 +1399,14 @@ int main(int argc, char **argv)
 	e_reboot = envd("OLPC_MENU_REBOOT", "/sbin/reboot");
 	e_inputdir = envd("OLPC_MENU_INPUTDIR", "/dev/input");
 	e_devdir = envd("OLPC_MENU_DEVDIR", "/dev");
+	e_backlight = envd("OLPC_MENU_BACKLIGHT", "/sys/class/backlight/*");
+	e_wireless = envd("OLPC_MENU_WIRELESS", "/proc/net/wireless");
+	e_cfgdir = envd("OLPC_MENU_CFGDIR", "/mnt/olpclog");
+	e_tzfile = envd("OLPC_MENU_TZFILE", "/etc/TZ");
+	snprintf(p_status, sizeof p_status, "%s/status", e_rundir);
+	snprintf(p_wifist, sizeof p_wifist, "%s/wifi.status", e_rundir);
+	if (getenv("OLPC_MENU_DIRTYLOG")) dirtylog = fopen(getenv("OLPC_MENU_DIRTYLOG"), "w");
+	if (getenv("OLPC_MENU_FAKETIME")) { fake_on = 1; fake_base = (time_t)atoll(getenv("OLPC_MENU_FAKETIME")); fake_t0 = now_ms(); }
 	snprintf(p_state, sizeof p_state, "%s/menu.state", e_rundir);
 	snprintf(p_runerr, sizeof p_runerr, "%s/menu-run.err", e_rundir);
 	snprintf(p_covstat, sizeof p_covstat, "%s/covers.status", e_rundir);
@@ -1249,6 +1436,8 @@ int main(int argc, char **argv)
 		for (i = 0; i < NSYS; i++) if (L[i].n) { cur_sys = i; break; }
 	logf_("%d games (%d gb, %d gbc, %d nes)", total_roms, L[0].n, L[1].n, L[2].n);
 	read_covers_status();
+	tz_setup();
+	read_status(); read_wifi(); read_sysfs_bri(now_ms());
 	input_resync();       /* keys held while the menu starts must be released first */
 
 	sigemptyset(&blockset);
@@ -1276,6 +1465,9 @@ int main(int argc, char **argv)
 		if (ino_dev >= 0) { struct pollfd p = { ino_dev, POLLIN, 0 }; if (poll(&p, 1, 0) > 0) handle_inotify(ino_dev, 1); }
 		if (ino_run >= 0) { struct pollfd p = { ino_run, POLLIN, 0 }; if (poll(&p, 1, 0) > 0) handle_inotify(ino_run, 0); }
 		input_step(now);
+		if (g_wifi.state == WS_CONNECTED && now >= sig_due) read_signal(now);
+		if (now >= sysfs_due) read_sysfs_bri(now);
+		if (screen != SC_ERROR) ind_update(0);
 		if (screen == SC_LIST && total_roms && cov_state == CV_PENDING && now >= cov_due) cover_resolve();
 		if (sd_due && now >= sd_due) {
 			if (!jobs[JOB_SD].pid && file_exec(e_sd)) { jobs[JOB_SD].pid = spawn(NULL, e_sd, NULL); sd_due = 0; }
@@ -1290,7 +1482,10 @@ int main(int argc, char **argv)
 			else if (e->kind == SK_CHORD) {
 				FILE *f = fopen(e_chord, "w");
 				if (f) { fputs(e->val ? "1\n" : "0\n", f); fclose(f); }
-			} else if (e->kind == SK_END) break;
+			} else if (e->kind == SK_TIME) { fake_on = 1; fake_base = (time_t)atoll(e->arg); fake_t0 = now_ms(); }
+			else if (e->kind == SK_SH) { if (system(e->arg)) {} }
+			else if (e->kind == SK_MARK) { if (dirtylog) { fputs("M\n", dirtylog); fflush(dirtylog); } }
+			else if (e->kind == SK_END) break;
 			continue;
 		}
 		if (use_script && isev >= nsev) break;
@@ -1300,6 +1495,14 @@ int main(int argc, char **argv)
 		if (screen == SC_LIST && total_roms && cov_state == CV_PENDING) { t = cov_due > now ? (int)(cov_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (sd_due) { t = sd_due > now ? (int)(sd_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (in.rescan > 0 && (timeout < 0 || timeout > 100)) timeout = 100;
+		{       /* clock: next minute boundary; WiFi signal: only while connected */
+			time_t wt;
+			int wms;
+			wall_now(&wt, &wms);
+			t = ms_to_next_minute((long long)wt, wms);
+			if (timeout < 0 || t < timeout) timeout = t;
+			if (g_wifi.state == WS_CONNECTED) { t = sig_due > now ? (int)(sig_due - now) : 0; if (t < timeout) timeout = t; }
+		}
 		if (use_script && isev < nsev) { uint64_t at = t_start + sev[isev].at; t = at > now ? (int)(at - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		for (i = 0; i < in.ndev; i++) { pf[np].fd = in.dev[i].fd; pf[np].events = POLLIN; np++; }
 		if (in.ino >= 0) { pf[np].fd = in.ino; pf[np].events = POLLIN; np++; }

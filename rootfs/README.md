@@ -101,8 +101,19 @@ direction can be pressed on a human timescale; a consumer reading the same event
 stream should check the file when it handles a D-pad event and ignore it while `1`.
 CIRCLE and CHECK themselves still reach the consumer as normal keys.
 
+* **Status file.** Besides the chord flag, chordd publishes the device state it owns as one line in
+  `/run/olpcboy/status`: `vol=15 volmax=31 mute=0 bri=07 brimax=15 mono=0` (`vol` is relative to the
+  mixer minimum, `mute` is the Master/PCM playback switch, `bri`/`brimax` come from
+  `/sys/class/backlight/*`, `mono` from the DCON; any value that cannot be read is `-1`). It is
+  written at start (after the mixer init), then after every change chordd makes: built-in chords,
+  gamepad chords, each auto-repeat step, mute, mono/colour. The file is opened once and rewritten in
+  place with a single `pwrite()` at offset 0 (numbers are zero-padded to two digits, so the length
+  hardly ever changes; a stale tail after the newline is harmless, readers stop at the first newline),
+  so a watcher gets one inotify `IN_MODIFY` per change. A write that would repeat the previous line
+  (a press at a limit) is skipped. The launcher draws its volume and brightness indicators from it.
+
 Overrides (for tests): `CHORDD_INPUT_DIR`, `CHORDD_BACKLIGHT_GLOB`, `CHORDD_MONO`,
-`CHORDD_STATE`, `CHORDD_TIMELINE`, `CHORDD_TAIL_MS`, `CHORDD_SND_CTL`
+`CHORDD_STATE`, `CHORDD_STATUS` (default: `status` next to `CHORDD_STATE`), `CHORDD_TIMELINE`, `CHORDD_TAIL_MS`, `CHORDD_SND_CTL`
 (`/dev/snd/controlC0`), `CHORDD_FAKE_MIXER` (file-backed fake mixer for tests; the ioctl
 backend is never exercised by the test, and in `--test` mode it is pointed at a
 non-existent path unless `CHORDD_SND_CTL` is set).
@@ -111,6 +122,7 @@ Tests without hardware: `make chordd-test` (or `sh src/olpc-chordd/test.sh` anyw
 with gcc). `olpc-chordd --test` replays text events from stdin (`<ms> <KEY> <0|1|2>`;
 pad: keys `SELECT START L1 R1 L2 R2`, `<ms> ABS_Z|ABS_RZ <value>`, a `PAD <min> <max>` line sets the
 trigger range, `<ms> UNPLUG 1` removes the pad),
+Status-file cases (init, volume step/hold/floor/ceiling, mute, unmute, brightness step/hold, mono, colour, pad volume and brightness, no card/backlight/DCON, `CHORDD_STATUS`, no rewrite at a limit) assert the exact line.
 `--replay` replays raw 16-byte i386 `input_event` records (the struct is declared with
 fixed widths, so a 64-bit build reads the same bytes); sysfs paths point at a temp
 dir, and the repeat timer runs on a virtual clock taken from the event stream.
@@ -122,8 +134,9 @@ Geode itself.
 ## `olpc-run` (libretro frontend)
 
 Source: `src/olpc-run/` (`olpc-run.c` main loop, ROMs, saves, stats; `scale.c` integer
-scaler; `audio.c` + `resample.c` raw-ALSA sink; `input.c` evdev; `libretro.h` is the
-MIT-licensed API header). Built by `scripts/mkrootfs.sh` as a **dynamically linked**
+scaler; `audio.c` + `resample.c` raw-ALSA sink; `input.c` evdev; `overlay.c` in-game
+indicator strip; `libretro.h` is the MIT-licensed API header; it also compiles
+`src/common/status.c` and `gfx.c`, shared with olpc-menu). Built by `scripts/mkrootfs.sh` as a **dynamically linked**
 musl binary (`-O2 -march=geode -mtune=geode`, it `dlopen`s the cores) into
 `/usr/local/bin/olpc-run`. Cores live in `/usr/lib/libretro/<name>_libretro.so`.
 
@@ -137,10 +150,41 @@ the latency), `--no-rt`, `--xrun-debug N` (writes N to the PCM's
 `/proc/asound/cardX/pcmDp/xrun_debug`, 0..31: bit 0 = log XRUN and hw_ptr anomalies, bit 1 = also a stack dump, bit 2 = jiffies check; the boot test uses 5), `--test-stall-ms M --test-stall-at F[,F2..]` (sleeps M ms in the loop at those frames, to exercise the recovery), `--no-fill-query` (never calls the DELAY
 ioctl: paced by `poll()` only, frame skipping falls back to "the previous frame's core +
 blit took longer than a frame", fill statistics are -1), `--running-file F`, `--audio-dev PATH`, `--libdir DIR`, `--sysdir DIR`,
-`--restore-console` (only give the text console back and clear the screen), `olpc-run`
+`--no-overlay` (no indicator strip, see below), `--restore-console` (only give the text console back and clear the screen), `olpc-run`
 without arguments prints them all. Exit code 0 for every deliberate exit (frame limit,
 exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usage.
 
+* **In-game indicators** (on by default; `--no-overlay` or the launcher's "In-game
+  indicators" option turn them off): a vertical strip 96x368 px at y=16, centred in the
+  RIGHT border of the screen, outside the game rectangle (GB/GBC 6x leaves 120 px, QuickNES
+  4x 120 px, FCEUmm 3x 216 px). Top to bottom: clock (`3:07` / `PM`, or `15:07` with a 24 h
+  `TZ.CFG`; `--:--` while the RTC is unset), WiFi bars, speaker + volume 0-100 (muted: dim
+  speaker with a cross), sun + brightness 0-100, `MONO` / `COLOR` (the DCON mode; `--` when
+  unknown). The icons are the launcher's (`src/common/gfx.c`), drawn in dim neutral greys
+  on black (luminance about 133 / 91 / 46 of 255 for normal / dim / unlit, so they stay
+  legible in DCON mono, where only luminance reaches the panel). Nothing is composited over
+  the game and the scaler never touches the border, so the strip costs nothing per frame:
+  it is rendered in RAM, copied to the framebuffer (write-only, direct into the mmap) once
+  when the screen is cleared (start of the game, a geometry change by the core), and after
+  that only the slot whose value changed is rewritten. If the right border is narrower than
+  `96 + 2*4` px (computed from the actual game rectangle) nothing is drawn. Data, polled every
+  60th frame (about 1 s; one counter compare in the other frames, and the poll is postponed
+  while a blit is being skipped): `/run/olpcboy/status` (olpc-chordd: vol, volmax, mute, bri,
+  brimax, mono) and `/run/olpcboy/wifi.status` (olpc-wifi), each through a descriptor that stays
+  open and one `pread` (a `stat` on tmpfs notices the file being replaced, as olpc-wifi does,
+  or missing: it is reopened); `/proc/net/wireless` at most every 30 s and only while connected
+  (no reading falls back to 4 bars, like the launcher); the clock from `clock_gettime(CLOCK_REALTIME)` +
+  `localtime_r` at the same poll, redrawn when the text changes. No fork, no storage. The
+  time zone is `$TZ` inherited from the launcher; without it the launcher's rule applies
+  (`TZ.CFG` in `/mnt/olpclog`, then `/etc/TZ`, then `AST4`, through `src/common/status.c`), read once at
+  start, before the real-time loop; the 12/24 h flag always comes from `TZ.CFG`. There is no
+  sysfs brightness fallback here (the launcher has one): without `status` the value shows `--`.
+  The strip is cleared with the rest of the screen at exit. Statistics: `overlay`, `overlay_rect`,
+  `overlay_full_paints`, `overlay_redraws` (slot repaints), `overlay_redraw_us_total` / `_max`
+  (render + copy of one slot), `overlay_ticks`, `overlay_tick_us_total` / `_max` (a whole poll,
+  including reads), `overlay_period`; the poll time is also taken out of the audio-wait
+  statistic. Test hooks: `--status-file`, `--wifi-file`, `--wireless-file`, `--overlay-period F`,
+  env `OLPC_RUN_CFGDIR`, `OLPC_RUN_TZFILE`, `OLPC_RUN_FAKETIME` (epoch seconds).
 * **ROMs**: plain files, or `.zip` (detected by the `PK` magic): the first entry ending
   in `.gb/.gbc/.nes/.sgb` is found with `unzip -l` and read from `unzip -p` through a
   pipe (busybox applets, fork/exec, no zip library); ROMs are capped at 16 MB. The
@@ -272,7 +316,11 @@ framebuffer (QEMU) all five runs use `--no-video --no-audio` with 120 frames (th
 frames become 30,90); the interactive session and the WiFi test are skipped.
 
 Tests: `make olpc-run-test` (or `sh src/olpc-run/test.sh` in the builder container;
-`mkrootfs.sh` runs it and fails the build on failure). Self-test of the scaler (all
+`mkrootfs.sh` runs it and fails the build on failure). Self-test of the in-game strip (geometry
+for the 6x/4x/3x rectangles and the narrow-border cases, nothing written outside the strip in a
+16- or 32-bit framebuffer, a counter-compare-only quiet frame, the poll deferred during skipped
+blits, one slot per changed value, status files replaced/removed/restored, nothing touched when
+the border is too narrow), the scaler (all
 source/destination formats, odd sizes, strides and offsets against a per-pixel reference,
 dirty-row logic), the resampler (chunking independence, length, error against an ideal
 sine), the input mapping (via pipes) and the audio buffer derivation (period, buffer,
@@ -288,7 +336,7 @@ evdev nodes, inotify and all timing on the Geode.
 
 ### WiFi
 Put `wifi.cfg` in the repo root (git-ignored; `make image` copies it to WIFI.CFG in the FAT root, and it can be edited from any PC). One network per line, TAB-separated: `SSID<TAB>key<TAB>TYPE`, TYPE = WPA2|WPA|WEP|OPEN (case-insensitive); first line = highest priority; `#` comments, blank lines and CRLF are fine; spaces allowed in SSID and key; leave the key empty for OPEN.
-`olpc-wifi up|down|status|check|run` loads usb8xxx, starts wpa_supplicant (nl80211, then wext fallback), runs DHCP and a one-shot NTP; `check` tests connectivity and downloads a test cover. Details are in `wifi.log` in the boot dir (never the key); timeline lines are prefixed `wifi:`. The boot test sequence calls `olpc-wifi run` after the play session; `olpcboy.nowifi` on the cmdline skips it. The `olpc-wifi` OpenRC service exists but is not enabled.
+`olpc-wifi up|down|status|check|run` loads usb8xxx, starts wpa_supplicant (nl80211, then wext fallback), runs DHCP and a one-shot NTP; `check` tests connectivity and downloads a test cover. **State file:** on every transition (up start, DHCP success, failure, down, and an `up` that finds the link already connected) it replaces `/run/olpcboy/wifi.status` atomically (temp file + rename, mode 644) with `state=connecting`, `state=connected ssid=<ssid> ip=<ipv4>` (control characters dropped from the SSID; the parser takes the last ` ip=` as the address) or `state=off`; the key is never written to it. A link that drops later without an `olpc-wifi` call is not noticed (nothing monitors wpa_supplicant). The launcher shows it in the title bar and in its Options menu. `scripts/test-olpc-wifi.sh` runs the real `do_up_real`/`do_down_real` against stub commands and checks each transition, the failure paths, an odd SSID, the already-connected case and that the key (a made-up one) appears in neither the status file nor `wifi.log`. Details are in `wifi.log` in the boot dir (never the key); timeline lines are prefixed `wifi:`. The boot test sequence calls `olpc-wifi run` after the play session; `olpcboy.nowifi` on the cmdline skips it. The `olpc-wifi` OpenRC service exists but is not enabled.
 
 <!-- olpc-covers:begin -->
 ## `olpc-covers` (box art)
@@ -308,16 +356,23 @@ Tests: `sh src/olpc-covers/test.sh` in the builder container (no network: genera
 
 <!-- olpc-menu:begin -->
 ## `olpc-menu` (game launcher)
-Sources: `src/olpc-menu/` (`olpc-menu.c` UI and main loop, `menulib.c` discovery/covers/repeat/state/text, `font8x16.h`, `selftest.c`, `test.sh`); it also compiles `src/olpc-run/input.c` and `diag.c` (same button maps as the emulator). Installed as `/usr/local/bin/olpc-menu`, dynamically linked musl, `-O2 -march=geode -mtune=geode`. tty1 starts it after the selftest and restarts it when it exits (1 s pause; after 5 runs shorter than 3 s in a row, or exit code 3 = no Geode LX framebuffer as in QEMU, it falls back to the status screen). `olpcboy.nomenu` on the kernel command line skips it. The timed runs, the play session and the WiFi test of `olpc-tty1` now run only with `olpcboy.tests`.
+Sources: `src/olpc-menu/` (`olpc-menu.c` UI and main loop, `menulib.c` discovery/covers/repeat/state/text, `selftest.c`, `test.sh`); it also compiles `src/olpc-run/input.c` and `diag.c` (same button maps as the emulator) and `src/common/` (`status.c` parsers and the time-zone rule, `gfx.c` rectangles/text/icons, `font8x16.h`, `FONT-LICENSE.txt`), which olpc-run's in-game strip uses too. Installed as `/usr/local/bin/olpc-menu`, dynamically linked musl, `-O2 -march=geode -mtune=geode`. tty1 starts it after the selftest and restarts it when it exits (1 s pause; after 5 runs shorter than 3 s in a row, or exit code 3 = no Geode LX framebuffer as in QEMU, it falls back to the status screen). `olpcboy.nomenu` on the kernel command line skips it. The timed runs, the play session and the WiFi test of `olpc-tty1` now run only with `olpcboy.tests`.
 
 **ROMs.** On every filesystem directly under `/mnt` (and `/mnt/*`, `/media/*/*` for automounters) a top-level directory named `roms` (any case) with `gb`, `gbc`, `nes` directories (any case; others such as `GBA` are ignored). Files `.gb .gbc .nes .zip` (any case, hidden files and sub-directories skipped); the name shown is the file name without its last extension, sorted case-insensitively. The USB stick (`/mnt/olpclog`, FAT label OLPCLOG) has `roms/`; `make image` copies the repo's git-ignored `ROMs/GB|GBC|NES` zips into `roms/gb|gbc|nes` with their long names and fails when they do not fit the 256 MiB partition. An SD card's first partition (`/dev/mmcblk0p1`, vfat/ext2-4/exfat) is mounted read-write, noatime at `/mnt/sd` by `olpc-sdmount`: at boot (service `olpc-sd`, never fatal, no card = nothing) and from the menu when `/dev/mmcblk*` appears or disappears (inotify on `/dev`, 1 s debounce, then the menu rescans); a removed card is released with a lazy unmount. Only that one partition is ever touched, never an MTD device. Saves go to `<roms dir>/../saves` (olpc-run's default).
 
-**Screen** (1200x900 RGB565, back buffer in RAM, only changed rectangles are copied to `/dev/fb0`, the fb is never read): title bar (`< system >`, game count, colour per system), list with the selection bar and a scroll bar (names fitted to 39 columns with `...`), cover panel on the right (480x480 frame) with the full name wrapped under it, hint bar. Font: Terminus 16 (8x16, regular) drawn at 2x and 3x, Latin-1 accents render, characters beyond Latin-1 degrade to ASCII lookalikes or `?`; Terminus is (c) 2010 Dimitar Toshkov Zhekov, SIL Open Font License 1.1, text in `src/olpc-menu/FONT-LICENSE.txt`. Covers: `<roms dir>/../covers/<system dir lowercased>/<name>.obc` (OBC1, see olpc-covers), loaded only after the selection rested 150 ms; missing or invalid (bad magic, 0 or > 480 px, short file) shows a placeholder with the system name. No ROMs at all: a screen that says to put files in `roms/gb`, `roms/gbc`, `roms/nes` on the SD card or USB stick and use Rescan.
+**Screen** (1200x900 RGB565, back buffer in RAM, only changed rectangles are copied to `/dev/fb0`, the fb is never read): title bar (`< system >`, the game count in small dim text after it, colour per system, and on the right the status indicators below), list with the selection bar and a scroll bar (names fitted to 39 columns with `...`), cover panel on the right (480x480 frame) with the full name wrapped under it, hint bar. Font: Terminus 16 (8x16, regular) drawn at 2x and 3x, Latin-1 accents render, characters beyond Latin-1 degrade to ASCII lookalikes or `?`; Terminus is (c) 2010 Dimitar Toshkov Zhekov, SIL Open Font License 1.1, text in `src/common/FONT-LICENSE.txt`. Covers: `<roms dir>/../covers/<system dir lowercased>/<name>.obc` (OBC1, see olpc-covers), loaded only after the selection rested 150 ms; missing or invalid (bad magic, 0 or > 480 px, short file) shows a placeholder with the system name. No ROMs at all: a screen that says to put files in `roms/gb`, `roms/gbc`, `roms/nes` on the SD card or USB stick and use Rescan.
 
-**Controls.** UP/DOWN move; the repeat is computed from the held state (300 ms, then ~12 rows/s, after 1.5 s a page per 200 ms). LEFT/RIGHT switch system, A launches, START opens Options (Rescan ROMs, Download covers = `/usr/local/sbin/olpc-covers fetch` in the background with the last line of `/run/olpcboy/covers.status` shown (a second A stops it), WiFi on/off = `olpc-wifi up|down` in the background with its `status`, Power off and Reboot each ask for a second A), B or START closes. A, B, START act on release and only when pressed alone with no chord: CIRCLE+CHECK and SQUARE+CROSS are the olpc-chordd chords. While `/run/olpcboy/chord` is 1 the built-in D-pad is ignored. Built-in buttons and USB pads use the same maps as olpc-run. Idle = blocked in `ppoll()`; timers exist only for a held key, the cover rest, the SD debounce and a hot-plug rescan.
+**Status indicators** (title bar, right-aligned, left to right: WiFi, volume, brightness, clock; fixed-width slots at x = 676, 748, 864, 984 on a 1200-px screen, so a change repaints only its own 4..68 px band). WiFi = four rising bars (filled by signal; connecting = two dim bars; off = faint bars with a slash), volume = speaker with 0/1/2 sound waves plus a 0-100 number (muted: dim speaker with a cross; no `status` file: faint speaker and `--`), brightness = sun plus 0-100 %, clock = text in the title-text size (`3:07 PM`, or `15:07`; `--:--` while the year is before 2024). Drawn with filled rectangles only, in the existing palette (the faint colour is the title colour blended 27 % toward the text colour). Sources, none of them forking and none polled:
+ * `/run/olpcboy/status` (olpc-chordd, see its section) and `/run/olpcboy/wifi.status` (olpc-wifi): read at start, after every game, and when the inotify watch on `/run/olpcboy` reports the file (the same watch that reports `covers.status`). A missing `status` means chordd is not running: volume unknown, and brightness is then read from `/sys/class/backlight/*` (also re-read at most every 30 s when the loop is awake anyway). An empty, truncated or garbage file keeps the last values; a missing `wifi.status` means off. The Options menu's WiFi lines use `wifi.status` too (no `olpc-wifi status` is spawned any more; `up`/`down` are still started in the background), so the two never disagree.
+ * Signal: `/proc/net/wireless` (line `wlan0:`; a negative level is dBm; `CONFIG_CFG80211_WEXT=y` makes cfg80211 drivers provide it) at most every 30 s and only while connected; level >= -55 dBm 4 bars, >= -65 3, >= -75 2, else 1; no `wlan0` line or a non-dBm level: 4 bars.
+ * Clock: the poll timeout is the time to the next minute boundary (+30 ms), computed from `CLOCK_REALTIME` at every wake-up, so an NTP step is shown at the latest one minute later and the idle loop still wakes once per minute at most (no per-second tick). The text is compared with what is on screen and only a change repaints.
+ * **Time zone.** musl reads only `$TZ` (verified in the Alpine 3.18 builder container, musl 1.2.4: `TZ=AST4` gives `AST` / -14400; `/etc/TZ`, a text `/etc/localtime` and `TZ=:AST4` are all ignored and give UTC) and there is no tzdata in the image, so `olpc-menu` sets `TZ` itself at start (`setenv` + `tzset`, inherited by the games): first `TZ.CFG` in the FAT root (`/mnt/olpclog`, any case, next to WIFI.CFG), else the first line of `/etc/TZ` (shipped as `AST4` = UTC-4, no DST, the Dominican Republic), else `AST4`. `TZ.CFG` holds a POSIX TZ string and an optional second token `24` (24-hour clock; `12` is the default 3:07 PM style), e.g. `AST4 24` or `EST5EDT,M3.2.0,M11.1.0`; `#` lines and blank lines are ignored and an unusable file falls back. It is read at start (reboot or restart the menu after editing). Login shells get `TZ` from `/etc/profile.d/olpcboy.sh`, which reads `/etc/TZ`.
+ * Not shown in the title bar: mono/colour. The in-game strip (olpc-run, see above) shows it and the same other indicators, drawn by the same icon code.
+
+**Controls.** UP/DOWN move; the repeat is computed from the held state (300 ms, then ~12 rows/s, after 1.5 s a page per 200 ms). LEFT/RIGHT switch system, A launches, START opens Options (Rescan ROMs, Download covers = `/usr/local/sbin/olpc-covers fetch` in the background with the last line of `/run/olpcboy/covers.status` shown (a second A stops it), WiFi on/off = `olpc-wifi up|down` in the background, state from `wifi.status`, Power off and Reboot each ask for a second A; the last entry, "In-game indicators: ON/OFF", toggles the strip olpc-run draws in the right border during games: it is kept as a line `overlay=0|1` in `menu.state` and its stick copy, default ON, and when OFF the launcher starts olpc-run with `--no-overlay`), B or START closes. A, B, START act on release and only when pressed alone with no chord: CIRCLE+CHECK and SQUARE+CROSS are the olpc-chordd chords. While `/run/olpcboy/chord` is 1 the built-in D-pad is ignored. Built-in buttons and USB pads use the same maps as olpc-run. Idle = blocked in `ppoll()`; timers exist only for a held key, the cover rest, the SD debounce, a hot-plug rescan, the next minute boundary (clock) and, while connected, the 30 s signal read.
 
 **Launch.** "Loading..." frame, then `fork`/`exec` `/usr/local/bin/olpc-run <system> <rom path>` with stdout/stderr in `/run/olpcboy/menu-run.err`; any covers download is stopped first (olpc-run refuses it anyway). The menu stays in `KD_GRAPHICS`; on return it drains the input, reads the real key state (`EVIOCGKEY`) and ignores every key still held until it is released, then repaints. A non-zero exit shows the last lines of the file on an error screen until a button is pressed. The selection (system + file name) is kept in `/run/olpcboy/menu.state` (written on launch and exit) with a best-effort copy `<roms dir>/../olpc-menu.state` written by a forked child at launch, so the UI never waits for the stick; at start the tmpfs copy wins, else the first copy found. SIGTERM/INT/HUP exit cleanly; fatal signals restore the console first.
 
-**Tests.** `make olpc-menu-test` (or `sh src/olpc-menu/test.sh`; `mkrootfs.sh` runs it). Unit: discovery on a temp tree (case variants, GBA ignored, depth, `/media` depth 2, zip), sort order, repeat timing (300 ms delay, ~12/s, page steps, bounded catch-up), state round trip and atomicity, UTF-8/Latin-1 text, wrapping, cover validation. Program: with `OLPC_MENU_FAKEFB=<1200x900x2 file>` and `--script FILE` (lines `<ms> key UP|DOWN|LEFT|RIGHT|A|B|START|SELECT down|up|tap`, `<ms> dump FILE` writes the back buffer as raw RGB565, `<ms> chord 0|1`, `<ms> end`) it renders frames (keep them with `FRAMES_DIR=dir`), checks that the fake fb equals the back buffer, the chord flag, A+START not acting, repeat landing, page steps, a stub olpc-run (`OLPC_MENU_RUN`) with arguments and held-key handling, the error screen, power-off confirmation, zero CPU while idle, exit code 3 without the Geode framebuffer, and `olpc-sdmount` with stub `blkid`/`mount`. Other hooks: `OLPC_MENU_SCAN`, `OLPC_MENU_RUNDIR`, `OLPC_MENU_CHORD`, `OLPC_MENU_INPUTDIR`, `OLPC_MENU_DEVDIR`, `OLPC_MENU_COVERS_BIN`, `OLPC_MENU_WIFI_BIN`, `OLPC_MENU_SDMOUNT`, `OLPC_MENU_POWEROFF`, `OLPC_MENU_REBOOT`.
+**Tests.** `make olpc-menu-test` (or `sh src/olpc-menu/test.sh`; `mkrootfs.sh` runs it). Unit: discovery on a temp tree (case variants, GBA ignored, depth, `/media` depth 2, zip), sort order, repeat timing (300 ms delay, ~12/s, page steps, bounded catch-up), state round trip and atomicity (with and without the `overlay` line), UTF-8/Latin-1 text, wrapping, cover validation. Program: with `OLPC_MENU_FAKEFB=<1200x900x2 file>` and `--script FILE` (lines `<ms> key UP|DOWN|LEFT|RIGHT|A|B|START|SELECT down|up|tap`, `<ms> dump FILE` writes the back buffer as raw RGB565, `<ms> chord 0|1`, `<ms> end`) it renders frames (keep them with `FRAMES_DIR=dir`), checks that the fake fb equals the back buffer, the chord flag, A+START not acting, repeat landing, page steps, a stub olpc-run (`OLPC_MENU_RUN`) with arguments and held-key handling, the error screen, power-off confirmation, zero CPU while idle, exit code 3 without the Geode framebuffer, and `olpc-sdmount` with stub `blkid`/`mount`. Other hooks: `OLPC_MENU_SCAN`, `OLPC_MENU_RUNDIR`, `OLPC_MENU_CHORD`, `OLPC_MENU_INPUTDIR`, `OLPC_MENU_DEVDIR`, `OLPC_MENU_COVERS_BIN`, `OLPC_MENU_WIFI_BIN`, `OLPC_MENU_SDMOUNT`, `OLPC_MENU_POWEROFF`, `OLPC_MENU_REBOOT`, `OLPC_MENU_BACKLIGHT` (glob), `OLPC_MENU_WIRELESS`, `OLPC_MENU_CFGDIR` (where `TZ.CFG` is), `OLPC_MENU_TZFILE`, `OLPC_MENU_FAKETIME` (epoch seconds for the wall clock, advancing with the monotonic clock), `OLPC_MENU_DIRTYLOG` (file: every flushed rectangle, `M` lines for script marks); extra script lines `<ms> time EPOCH` (step the fake clock), `<ms> sh FILE` (run a shell command, used to rewrite the status files while the menu runs) and `<ms> mark`. Indicator tests: parsing (status file missing, truncated, garbage, out of range; wifi.status; `/proc/net/wireless` fixture; minute-boundary timeout; 12/24-hour text and `--:--`; `TZ.CFG`), every state rendered to a frame (WiFi off/connecting/1 bar/4 bars/no wlan0 line, volume 0/50/100/muted/unknown, brightness 0/mid/max, clock AM/PM/24 h/zone from `TZ.CFG`/unset, "Game Boy Color" with everything on), pixel checks that a change differs only inside its slot, live updates through inotify (in-place rewrite, atomic replace, truncated and empty files), the In-game indicators entry (screen changes, `overlay=0` in the state file, `--no-overlay` passed to olpc-run, the setting surviving the loss of the runtime state), the clock ticking at a minute boundary with no other event (only the clock slot repaints, from the dirty-rectangle log) and following a time step forward and back to 2001.
 Not covered without hardware: the real framebuffer and console modes, evdev nodes and hot-plug, the SD card mount, drawing speed on the Geode.
 <!-- olpc-menu:end -->

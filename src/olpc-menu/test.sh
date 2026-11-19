@@ -12,10 +12,10 @@ bad() { echo "  FAIL: $*"; fail=1; }
 ok()  { echo "  ok: $*"; }
 
 HCF="-O2 -Wall -Wextra"
-$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/menulib.c" || exit 1
-$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
+$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/menulib.c" "$here/../common/status.c" || exit 1
+$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/../common/status.c" "$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
 	|| { cat "$tmp/cc.log"; exit 1; }
-grep -E "olpc-menu\.c|menulib\.c" "$tmp/cc.log" | grep -i warning && bad "compiler warnings in olpc-menu"
+grep -E "olpc-menu\.c|menulib\.c|status\.c|gfx\.c" "$tmp/cc.log" | grep -i warning && bad "compiler warnings in olpc-menu"
 
 "$tmp/selftest" || fail=1
 
@@ -254,6 +254,93 @@ wait $pid
 echo "  cpu ticks at 2.5 s: ${t1:-?}, 0.6 s later: ${t2:-?}"
 [ -n "$t1" ] && [ "$t2" = "$t1" ] && ok "idle process used no CPU in 0.6 s" || bad "idle CPU not zero"
 
+echo "== idle while connected (30 s signal timer, minute timer): still no CPU between wake-ups"
+mkdir -p "$tmp/idle"; printf 'state=connected ssid=Casa ip=10.0.0.2\n' >"$tmp/idle/wifi.status"; printf 'vol=15 volmax=31 mute=0 bri=7 brimax=15 mono=0\n' >"$tmp/idle/status"
+printf ' wlan0: 0000   70.  -60.  -256        0      0      0      0      0        0\n' >"$tmp/idle/wireless"
+cat >"$tmp/s7b" <<EOS
+3300 end
+EOS
+OLPC_MENU_FAKEFB="$tmp/fb.raw" OLPC_MENU_SCAN="$T/mnt" OLPC_MENU_RUNDIR="$tmp/idle" OLPC_MENU_INPUTDIR="$tmp/noinput" OLPC_MENU_DEVDIR="$tmp/nodev" \
+	OLPC_MENU_WIRELESS="$tmp/idle/wireless" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none" "$tmp/olpc-menu" --script "$tmp/s7b" 2>/dev/null &
+pid=$!
+sleep 2.3
+t1=$(awk '{print $14+$15}' /proc/$pid/stat 2>/dev/null); sleep 0.6; t2=$(awk '{print $14+$15}' /proc/$pid/stat 2>/dev/null)
+wait $pid
+echo "  cpu ticks at 2.3 s: ${t1:-?}, 0.6 s later: ${t2:-?}"
+[ -n "$t1" ] && [ "$t2" = "$t1" ] && ok "idle while connected used no CPU in 0.6 s" || bad "idle CPU not zero while connected"
+
+echo "== options menu uses wifi.status"
+O=$tmp/optrun; mkdir -p "$O"
+cat >"$tmp/s-opt" <<EOS
+200 key START tap
+500 dump $D/opt-off.raw
+EOS
+run_menu "$tmp/s-opt" OLPC_MENU_RUNDIR="$O" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+printf 'state=connected ssid=Casa 5G ip=192.168.1.20\n' >"$O/wifi.status"
+run_menu "$tmp/s-opt" OLPC_MENU_RUNDIR="$O" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"; cp "$D/opt-off.raw" "$D/opt-on.raw"
+printf 'state=connecting\n' >"$O/wifi.status"
+run_menu "$tmp/s-opt" OLPC_MENU_RUNDIR="$O" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"; cp "$D/opt-off.raw" "$D/opt-connecting.raw"
+rm -f "$O/wifi.status"
+run_menu "$tmp/s-opt" OLPC_MENU_RUNDIR="$O" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"; cp "$D/opt-off.raw" "$D/opt-missing.raw"
+cmp -s "$D/opt-off.raw" "$D/opt-on.raw" && bad "options screen ignores wifi.status (connected)" || ok "options screen differs for connected"
+cmp -s "$D/opt-on.raw" "$D/opt-connecting.raw" && bad "options screen: connecting looks like connected" || ok "options screen differs for connecting"
+printf 'state=off\n' >"$O/wifi.status"
+run_menu "$tmp/s-opt" OLPC_MENU_RUNDIR="$O" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+cmp -s "$D/opt-off.raw" "$D/opt-missing.raw" && ok "options: state=off and a missing wifi.status look the same" || bad "off vs missing wifi.status differ"
+keep
+
+echo "== options: In-game indicators switch (state file, --no-overlay for olpc-run)"
+O2=$tmp/ovrun; rm -rf "$O2"; mkdir -p "$O2"; rm -f "$T/mnt/stick/olpc-menu.state" "$T/run.args"
+cat >"$tmp/s-ov1" <<EOS
+200 key START tap
+300 key DOWN tap
+400 key DOWN tap
+500 key DOWN tap
+600 key DOWN tap
+700 key DOWN tap
+900 dump $D/ov-on.raw
+1000 key A tap
+1300 dump $D/ov-off.raw
+1400 key A tap
+1700 dump $D/ov-on2.raw
+1800 key A tap
+2100 end
+EOS
+run_menu "$tmp/s-ov1" OLPC_MENU_RUNDIR="$O2" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+cmp -s "$D/ov-on.raw" "$D/ov-off.raw" && bad "the options screen did not change when the switch was pressed" || ok "options screen shows the switch changing"
+cmp -s "$D/ov-off.raw" "$D/ov-on2.raw" && bad "OFF and ON screens are the same" || ok "ON, OFF, ON: the third screen differs from the OFF one"
+grep -q '^overlay=0' "$O2/menu.state" && ok "after ON, OFF, ON, OFF the state file holds overlay=0: $(tr '\n' ' ' <"$O2/menu.state")" || bad "state file lacks overlay=0: $(cat "$O2/menu.state" 2>/dev/null)"
+cp "$D/ov-off.raw" "$D/ov-off-keep.raw"
+cat >"$tmp/s-ov2" <<EOS
+200 key A tap
+600 end
+EOS
+rm -f "$T/run.args"
+run_menu "$tmp/s-ov2" OLPC_MENU_RUNDIR="$O2"
+case "$(cat "$T/run.args" 2>/dev/null)" in --no-overlay\ *) ok "a game started with the switch OFF gets --no-overlay: $(cat "$T/run.args")";; *) bad "no --no-overlay in: $(cat "$T/run.args" 2>/dev/null)";; esac
+# the switch is remembered from the copy next to the ROMs when the runtime state is gone (reboot)
+rm -f "$O2/menu.state" "$T/run.args"
+run_menu "$tmp/s-ov2" OLPC_MENU_RUNDIR="$O2"
+case "$(cat "$T/run.args" 2>/dev/null)" in --no-overlay\ *) ok "the OFF setting survives a reboot (copy on the stick)";; *) bad "setting lost without the runtime state: $(cat "$T/run.args" 2>/dev/null)";; esac
+cat >"$tmp/s-ov3" <<EOS
+200 key START tap
+300 key DOWN tap
+400 key DOWN tap
+500 key DOWN tap
+600 key DOWN tap
+700 key DOWN tap
+800 key A tap
+1000 key B tap
+1100 key A tap
+1500 end
+EOS
+rm -f "$T/run.args"
+run_menu "$tmp/s-ov3" OLPC_MENU_RUNDIR="$O2"
+case "$(cat "$T/run.args" 2>/dev/null)" in --no-overlay*|"") bad "after switching back ON a game still got: $(cat "$T/run.args" 2>/dev/null)";; *) ok "switched ON again: plain olpc-run arguments: $(cat "$T/run.args")";; esac
+grep -q '^overlay=1' "$O2/menu.state" && ok "state file holds overlay=1" || bad "state file lacks overlay=1"
+rm -f "$T/mnt/stick/olpc-menu.state" "$T/run.args"
+keep
+
 echo "== no framebuffer: clean exit code 3"
 env -u OLPC_MENU_FAKEFB OLPC_MENU_SCAN="$T/mnt" OLPC_MENU_RUNDIR="$T/run" "$tmp/olpc-menu" 2>"$tmp/nofb.err"
 [ $? = 3 ] && ok "exit 3 without the Geode framebuffer: $(head -n1 "$tmp/nofb.err")" || bad "no-fb exit code"
@@ -285,6 +372,162 @@ fi
 echo "x $tmp/sd vfat rw 0 0" >"$tmp/mounts-full"; rm -f "$tmp/mount.log"
 sdrun /dev/does-not-exist "$tmp/mounts-full"; grep -q "umount -l $tmp/sd" "$tmp/mount.log" && ok "card removed: stale mount released" || bad "stale mount kept"
 grep -q '/dev/mtd' "$SD" && bad "olpc-sdmount mentions an MTD node"
+
+echo "== title-bar indicators (WiFi, volume, brightness, clock)"
+I=$tmp/ind; BL=$tmp/bl; WLS=$tmp/wireless; CFGD=$tmp/cfgdir; TZF=$tmp/TZ
+mkdir -p "$I" "$BL/panel" "$CFGD"
+echo 15 >"$BL/panel/max_brightness"; echo 7 >"$BL/panel/brightness"; echo AST4 >"$TZF"
+# 2026-11-19 15:07:00 in AST4 (UTC-4)
+T_PM=$(date -u -d '2026-11-19 19:07:00' +%s); T_AM=$(date -u -d '2026-11-19 09:05:00' +%s)
+# geometry (1200 px wide): slots wifi 676+44, volume 748+88, brightness 864+92, clock 984+192; bar is 72 high
+X_WIFI=676; X_VOL=748; X_BRI=864; X_CLK=984; Y1=4; Y2=68
+wl_fix() { printf 'Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n wlan0: 0000   70.  %s.  -256        0      0      0      0      0        0\n' "$1" >"$WLS"; }
+wl_fix -50
+# ind_run NAME [keys-script-line] [env...]: one frame after start (ST/WF/NOW/TZC set by the caller)
+ind_run() {
+	n=$1; extra=$2; shift; [ $# -gt 0 ] && shift
+	rm -rf "$I"/*; rm -f "$CFGD"/*
+	[ -n "$ST" ] && printf '%s\n' "$ST" >"$I/status"
+	[ -n "$WF" ] && printf '%s\n' "$WF" >"$I/wifi.status"
+	[ -n "$TZC" ] && printf '%s\n' "$TZC" >"$CFGD/Tz.Cfg"
+	{ [ -n "$extra" ] && echo "100 key $extra tap"; echo "600 dump $D/ind-$n.raw"; } >"$tmp/si"
+	run_menu "$tmp/si" OLPC_MENU_RUNDIR="$I" OLPC_MENU_BACKLIGHT="$BL/*" OLPC_MENU_WIRELESS="$WLS" OLPC_MENU_CFGDIR="$CFGD" \
+		OLPC_MENU_TZFILE="$TZF" OLPC_MENU_FAKETIME="${NOW:-$T_PM}" "$@" || bad "indicator run $n failed"
+	[ "$(stat -c %s "$D/ind-$n.raw" 2>/dev/null)" = 2160000 ] || bad "indicator frame $n missing"
+}
+VOK="vol=15 volmax=31 mute=0 bri=7 brimax=15 mono=0"
+ST=$VOK; WF=; TZC=; NOW=$T_PM
+ind_run wifi-off
+WF="state=connecting"; ind_run wifi-connecting
+WF="state=connected ssid=Casa 5G ip=192.168.1.20"; wl_fix -80; ind_run wifi-1bar
+wl_fix -50; ind_run wifi-4bars
+rm -f "$WLS"; ind_run wifi-nofile-4bars; wl_fix -50
+WF=
+for v in 0 15 31; do ST="vol=$v volmax=31 mute=0 bri=7 brimax=15 mono=0"; ind_run vol-$v; done
+ST="vol=15 volmax=31 mute=1 bri=7 brimax=15 mono=0"; ind_run vol-muted
+ST=; ind_run vol-unknown-sysfs-bri
+for b in 0 7 15; do ST="vol=15 volmax=31 mute=0 bri=$b brimax=15 mono=0"; ind_run bri-$b; done
+ST=$VOK
+ind_run clock-pm
+NOW=$T_AM; ind_run clock-am
+TZC="AST4 24" ind_run clock-24h
+TZC="AST4 24"; NOW=$T_PM ind_run clock-24h-pm
+TZC="EST5 12"; ind_run clock-tzcfg-est
+TZC=; NOW=1000000000; ind_run clock-unset
+NOW=$T_PM; WF="state=connected ssid=x ip=10.0.0.1"; ST="vol=31 volmax=31 mute=0 bri=15 brimax=15 mono=0"; TZC=; NOW=$T_PM
+ind_run long-name-gbc RIGHT
+WF="state=connecting"; ST="vol=15 volmax=31 mute=1 bri=0 brimax=15 mono=0"; NOW=$T_AM; ind_run long-name-gbc-b RIGHT
+ST=$VOK; WF=
+# the four values on screen are compared by pixel: they must differ where the states differ
+dif() { cmp -s "$D/ind-$1.raw" "$D/ind-$2.raw" && return 1; return 0; }
+dif wifi-off wifi-connecting && dif wifi-connecting wifi-1bar && dif wifi-1bar wifi-4bars && ok "WiFi off / connecting / 1 bar / 4 bars render differently" || bad "WiFi states not distinguishable"
+cmp -s "$D/ind-wifi-nofile-4bars.raw" "$D/ind-wifi-4bars.raw" && ok "no wlan0 line in /proc/net/wireless: 4 bars" || bad "fallback to 4 bars failed"
+dif vol-0 vol-15 && dif vol-15 vol-31 && dif vol-15 vol-muted && dif vol-15 vol-unknown-sysfs-bri && ok "volume 0 / 50 / 100 / muted / unknown render differently" || bad "volume states not distinguishable"
+dif bri-0 bri-7 && dif bri-7 bri-15 && ok "brightness 0 / mid / max render differently" || bad "brightness states not distinguishable"
+dif clock-pm clock-am && dif clock-pm clock-24h && dif clock-pm clock-unset && dif clock-24h clock-24h-pm && dif clock-pm clock-tzcfg-est && ok "clock AM / PM / 24 h / TZ.CFG zone / unset render differently" || bad "clock states not distinguishable"
+# outside_diffs A B x0 x1 y0 y1: number of differing pixels outside the rectangle
+outside() {
+	cmp -l "$1" "$2" | awk -v x0="$3" -v x1="$4" -v y0="$5" -v y1="$6" '{ p = int(($1 - 1) / 2); x = p % 1200; y = int(p / 1200);
+		if (x < x0 || x >= x1 || y < y0 || y >= y1) n++ } END { print n + 0 }'
+}
+[ "$(outside "$D/ind-vol-15.raw" "$D/ind-vol-0.raw" $X_VOL $((X_VOL + 88)) $Y1 $Y2)" = 0 ] && ok "volume change touches only the volume slot" || bad "volume change leaked outside its slot"
+[ "$(outside "$D/ind-bri-0.raw" "$D/ind-bri-15.raw" $X_BRI $((X_BRI + 92)) $Y1 $Y2)" = 0 ] && ok "brightness change touches only the brightness slot" || bad "brightness change leaked outside its slot"
+[ "$(outside "$D/ind-clock-pm.raw" "$D/ind-clock-am.raw" $X_CLK $((X_CLK + 192)) $Y1 $Y2)" = 0 ] && ok "clock change touches only the clock slot" || bad "clock change leaked outside its slot"
+[ "$(outside "$D/ind-wifi-off.raw" "$D/ind-wifi-1bar.raw" $X_WIFI $((X_WIFI + 44)) $Y1 $Y2)" = 0 ] && ok "WiFi change touches only the WiFi slot" || bad "WiFi change leaked outside its slot"
+keep
+
+echo "== indicators update live: inotify on status files, minute timer, dirty rectangles"
+# in-place status rewrite, like olpc-chordd; atomic replace, like olpc-wifi
+cat >"$tmp/c-vol" <<EOS
+#!/bin/sh
+printf 'vol=31 volmax=31 mute=0 bri=7 brimax=15 mono=0\n' | dd of="$I/status" conv=notrunc 2>/dev/null
+EOS
+cat >"$tmp/c-wifi" <<EOS
+#!/bin/sh
+printf 'state=connecting\n' >"$I/wifi.status.tmp" && mv "$I/wifi.status.tmp" "$I/wifi.status"
+EOS
+cat >"$tmp/c-wifi2" <<EOS
+#!/bin/sh
+printf 'state=connected ssid=Casa 5G ip=192.168.1.20\n' >"$I/wifi.status.tmp" && mv "$I/wifi.status.tmp" "$I/wifi.status"
+EOS
+cat >"$tmp/c-bri" <<EOS
+#!/bin/sh
+printf 'vol=31 volmax=31 mute=0 bri=15 brimax=15 mono=0\n' | dd of="$I/status" conv=notrunc 2>/dev/null
+EOS
+cat >"$tmp/c-garbage" <<EOS
+#!/bin/sh
+printf 'vol=3' >"$I/status"
+: >"$I/wifi.status"
+EOS
+cat >"$tmp/c-mute" <<EOS
+#!/bin/sh
+printf 'vol=31 volmax=31 mute=1 bri=15 brimax=15 mono=0\n' | dd of="$I/status" conv=notrunc 2>/dev/null
+EOS
+chmod +x "$tmp"/c-*
+rm -rf "$I"/*; printf 'vol=15 volmax=31 mute=0 bri=7 brimax=15 mono=0\n' >"$I/status"; printf 'state=off\n' >"$I/wifi.status"
+cat >"$tmp/s-live" <<EOS
+300 dump $D/live-0.raw
+350 mark
+400 sh $tmp/c-vol
+700 dump $D/live-1.raw
+750 mark
+800 sh $tmp/c-wifi
+1100 dump $D/live-2.raw
+1150 mark
+1200 sh $tmp/c-bri
+1500 dump $D/live-3.raw
+1550 mark
+1600 sh $tmp/c-garbage
+1900 dump $D/live-4.raw
+1950 mark
+2000 sh $tmp/c-wifi2
+2300 dump $D/live-5.raw
+2350 mark
+2400 sh $tmp/c-mute
+2700 dump $D/live-6.raw
+EOS
+run_menu "$tmp/s-live" OLPC_MENU_RUNDIR="$I" OLPC_MENU_BACKLIGHT="$BL/*" OLPC_MENU_WIRELESS="$WLS" OLPC_MENU_CFGDIR="$CFGD" OLPC_MENU_TZFILE="$TZF" \
+	OLPC_MENU_FAKETIME="$T_PM" OLPC_MENU_DIRTYLOG="$tmp/dirty.log" || bad "live run failed"
+# rects_after_mark N: dirty rectangles flushed between the Nth and the next mark, bounding box of all
+rects() { awk -v k="$1" '/^M/ { m++; next } m == k && /^D/ { n++; if (!have || $2 < a) a = $2; if (!have || $3 < b) b = $3; if (!have || $4 > c) c = $4; if (!have || $5 > d) d = $5; have = 1 } END { print n + 0, a, b, c, d }' "$tmp/dirty.log"; }
+chk() { # chk NAME N before after x0 x1
+	cn=$1; ck=$2; cb=$3; ca=$4; cx0=$5; cx1=$6
+	set -- $(rects "$ck")           # count x0 y0 x1 y1
+	if [ "$1" -ge 1 ] && [ "$2" -ge "$cx0" ] && [ "$4" -le "$cx1" ] && [ "$3" -ge $Y1 ] && [ "$5" -le $Y2 ] \
+	   && [ "$(outside "$D/live-$cb.raw" "$D/live-$ca.raw" "$cx0" "$cx1" $Y1 $Y2)" = 0 ]; then
+		ok "$cn: dirty rect $2,$3..$4,$5 inside the slot, frame untouched elsewhere"
+	else bad "$cn: dirty rects '$*' not inside $cx0..$cx1 x $Y1..$Y2"; fi
+}
+chk "volume rewritten in place" 1 0 1 $X_VOL $((X_VOL + 88))
+chk "WiFi status replaced (connecting)" 2 1 2 $X_WIFI $((X_WIFI + 44))
+chk "brightness rewritten in place" 3 2 3 $X_BRI $((X_BRI + 92))
+[ "$(rects 4 | cut -d' ' -f1)" = 0 ] && cmp -s "$D/live-3.raw" "$D/live-4.raw" && ok "truncated status / empty wifi.status: nothing redrawn, last values kept" || bad "garbage status changed the screen ($(rects 4))"
+chk "WiFi connected (4 bars from the fixture)" 5 4 5 $X_WIFI $((X_WIFI + 44))
+chk "mute" 6 5 6 $X_VOL $((X_VOL + 88))
+cmp -s "$D/live-1.raw" "$D/live-0.raw" && bad "volume frame did not change"
+keep
+
+# minute boundary: 15:06:58 -> the clock must tick to 3:07 PM with no event at all, and only the clock repaints
+rm -rf "$I"/*; printf '%s\n' "$VOK" >"$I/status"
+T58=$(date -u -d '2026-11-19 19:06:58' +%s)
+cat >"$tmp/s-min" <<EOS
+300 dump $D/min-0.raw
+350 mark
+3500 dump $D/min-1.raw
+3600 time $(date -u -d '2026-11-19 19:30:10' +%s)
+3700 dump $D/min-2.raw
+3750 time 1000000000
+3800 dump $D/min-3.raw
+EOS
+run_menu "$tmp/s-min" OLPC_MENU_RUNDIR="$I" OLPC_MENU_BACKLIGHT="$BL/*" OLPC_MENU_WIRELESS="$WLS" OLPC_MENU_CFGDIR="$CFGD" OLPC_MENU_TZFILE="$TZF" \
+	OLPC_MENU_FAKETIME="$T58" OLPC_MENU_DIRTYLOG="$tmp/dirty.log"
+r=$(awk '/^M/ { m = 1; next } m && /^D/ { n++; if (!have || $2 < a) a = $2; if (!have || $3 < b) b = $3; if (!have || $4 > c) c = $4; if (!have || $5 > d) d = $5; have = 1 } END { print n + 0, a, b, c, d }' "$tmp/dirty.log")
+cmp -s "$D/min-0.raw" "$D/min-1.raw" && bad "clock did not tick at the minute boundary" || {
+	[ "$(outside "$D/min-0.raw" "$D/min-1.raw" $X_CLK $((X_CLK + 192)) $Y1 $Y2)" = 0 ] && ok "3:06 -> 3:07 PM on the timer alone; only the clock slot differs" || bad "minute tick touched other pixels"; }
+cmp -s "$D/min-1.raw" "$D/min-2.raw" && bad "time step (NTP) not shown" || ok "time stepped forward 23 min: clock re-read"
+cmp -s "$D/min-2.raw" "$D/min-3.raw" && bad "year before 2024 not shown as --:--" || ok "time stepped back to 2001: --:--"
+echo "  dirty rectangles after the first mark: $r"
+keep
 
 if [ $fail = 0 ]; then echo "olpc-menu tests: ALL OK"; else echo "olpc-menu tests: FAILED"; fi
 exit $fail

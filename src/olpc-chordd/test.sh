@@ -286,4 +286,64 @@ v=$(sed -n 's/^Master Playback Volume=0 31 2 \([0-9]*\) .*/\1/p' "$T/mixer")
 echo "  -> Master volume=$v (expect 19)"
 [ "$v" = 19 ] || { echo "  FAIL: binary pad replay"; fail=1; }
 
+# ---- status file: written at init and after every change chordd makes ---------------------------
+# sx <expected content>: the status file of the last vrun/prun must be exactly that one line
+sx() {
+	got=$(cat "$T/case/status" 2>/dev/null); lines=$(wc -l <"$T/case/status" 2>/dev/null)
+	[ "$got" = "$1" ] && [ "$lines" = 1 ] && echo "  ok: status = $got" || { echo "  FAIL: status \"$got\" ($lines lines), expected \"$1\""; fail=1; }
+}
+fake 20 1 20 1 23 1
+vrun "status at init (no events)" "20 1 20 1 23 1 5" "0 ROTATE 0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+fake 20 1 20 1 23 1
+vrun "status after one volume-up step" "21 1 21 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 UP 1" "130 UP 0" "140 CROSS 0" "145 SQUARE 0"
+sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+fake 20 1 20 1 23 1
+vrun "status after volume up held 1 s (final value, not the first step)" "26 1 26 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 UP 1" "1100 UP 0" "1110 CROSS 0" "1115 SQUARE 0"
+sx "vol=26 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+fake 3 1 3 1 23 1
+vrun "status after volume down to the floor" "0 1 0 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 DOWN 1" "1100 DOWN 0"
+sx "vol=00 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+fake 20 1 20 1 23 1
+vrun "status after mute" "20 0 20 0 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 LEFT 1" "150 LEFT 0"
+sx "vol=20 volmax=31 mute=1 bri=05 brimax=15 mono=0"
+fake 20 0 20 0 23 1
+vrun "status after unmute" "20 1 20 1 23 1 5" "0 SQUARE 1" "5 CROSS 1" "100 RIGHT 1" "150 RIGHT 0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+fake 20 1 20 1 23 1
+vrun "status after brightness up (chord)" "20 1 20 1 23 1 6" "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "130 UP 0"
+sx "vol=20 volmax=31 mute=0 bri=06 brimax=15 mono=0"
+vrun "status after brightness up held 1 s" "20 1 20 1 23 1 11" "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "1100 UP 0"
+sx "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0"
+vrun "status after mono (chord LEFT)" "20 1 20 1 23 1 5" "0 CIRCLE 1" "5 CHECK 1" "100 LEFT 1" "150 LEFT 0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=1"
+vrun "status after colour (mono set first, chord RIGHT)" "20 1 20 1 23 1 5" "0 CIRCLE 1" "5 CHECK 1" "100 LEFT 1" "150 LEFT 0" "200 RIGHT 1" "250 RIGHT 0"
+sx "vol=20 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+prun "status after pad SELECT+L1 (volume up)" "21 1 21 1 23 1 5" "0 SELECT 1" "100 L1 1" "130 L1 0" "140 SELECT 0"
+sx "vol=21 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+prun "status after pad SELECT+R2 (brightness down)" "20 1 20 1 23 1 4" "0 SELECT 1" "100 R2 1" "130 R2 0" "140 SELECT 0"
+sx "vol=20 volmax=31 mute=0 bri=04 brimax=15 mono=0"
+PF="31 1 31 1 23 1" prun "status when already at the ceiling" "31 1 31 1 23 1 5" "0 SELECT 1" "100 L1 1" "130 L1 0" "140 SELECT 0"
+sx "vol=31 volmax=31 mute=0 bri=05 brimax=15 mono=0"
+[ "$(grep -c 'status: ' "$T/last.out")" = 1 ] && echo "  ok: a press at the limit does not rewrite the status file" || { echo "  FAIL: status rewritten at a limit"; fail=1; }
+# no sound card, no backlight, no DCON: unknown fields are -1, the file still exists
+d="$T/nocard"; rm -rf "$d"; mkdir -p "$d"
+echo "=== status without card, backlight or DCON"
+printf '%s\n' "0 ROTATE 0" | CHORDD_FAKE_MIXER="$T/absent" CHORDD_BACKLIGHT_GLOB="$d/none/*" CHORDD_MONO="$d/none" CHORDD_STATE="$d/state" \
+	"$T/chordd" --test 2>/dev/null
+[ "$(cat "$d/status")" = "vol=-1 volmax=-1 mute=0 bri=-1 brimax=-1 mono=-1" ] && echo "  ok: $(cat "$d/status")" || { echo "  FAIL: nocard status: $(cat "$d/status")"; fail=1; }
+# explicit CHORDD_STATUS path, and a status file written in place (same inode across rewrites)
+d="$T/explicit"; rm -rf "$d"; mkdir -p "$d/bl/dcon-bl"; echo 15 >"$d/bl/dcon-bl/max_brightness"; echo 5 >"$d/bl/dcon-bl/brightness"; echo 0 >"$d/mono"
+fake 20 1 20 1 23 1
+printf '%s\n' "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "1100 UP 0" | CHORDD_STATUS="$d/st.out" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$d/bl/*" \
+	CHORDD_MONO="$d/mono" CHORDD_STATE="$d/state" "$T/chordd" --test 2>/dev/null
+[ "$(cat "$d/st.out")" = "vol=20 volmax=31 mute=0 bri=11 brimax=15 mono=0" ] && [ ! -e "$d/status" ] && echo "  ok: CHORDD_STATUS honoured" || { echo "  FAIL: CHORDD_STATUS"; fail=1; }
+# a reader with inotify would see every rewrite as a modify of the same file: check one write per change
+if command -v strace >/dev/null 2>&1; then
+	strace -f -e trace=pwrite64 -o "$T/strace.out" env CHORDD_STATUS="$d/st.out" CHORDD_FAKE_MIXER="$T/mixer" CHORDD_BACKLIGHT_GLOB="$d/bl/*" CHORDD_MONO="$d/mono" \
+		CHORDD_STATE="$d/state" sh -c 'printf "%s\n" "0 CIRCLE 1" "5 CHECK 1" "100 UP 1" "130 UP 0" | "$1" --test' x "$T/chordd" >/dev/null 2>&1
+	n=$(grep -c ', 53) *= 53\|pwrite64' "$T/strace.out" 2>/dev/null)
+	[ "${n:-0}" -ge 1 ] && echo "  ok: status written with pwrite64 ($n calls)" || echo "  (strace gave no pwrite64 lines)"
+fi
+
 [ $fail -eq 0 ] && echo "ALL OK" || { echo "FAILED"; exit 1; }

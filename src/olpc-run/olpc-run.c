@@ -38,6 +38,8 @@
 #include "input.h"
 #include "diag.h"
 #include "saver.h"
+#include "overlay.h"
+#include "../common/status.h"
 
 typedef uint64_t u64;
 
@@ -71,6 +73,9 @@ static int o_blit_delay_ms;           /* test hook: busy-wait inside the blit */
 static int o_restore;
 static int o_maxscale;                  /* 0 = largest that fits */
 static int o_poke_save;               /* test hook: flip one save RAM byte at frame 100 */
+static int o_overlay = 1;             /* in-game indicator strip in the right border; --no-overlay */
+static const char *o_status = "/run/olpcboy/status", *o_wifist = "/run/olpcboy/wifi.status", *o_wireless = "/proc/net/wireless";
+static int o_ovl_period = OVL_PERIOD; /* --overlay-period F: test hook, frames between polls */
 
 /* ------------------------------------------------------------------ time, log */
 
@@ -255,6 +260,7 @@ static struct {
 
 static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static int g_video_null;                                 /* --no-video or no framebuffer */
+static struct overlay OV;
 static unsigned long st_drawn, st_skipped, st_dupes;
 static u64 st_rows_drawn, st_rows_total;
 static u64 g_blit_ns;                                    /* blit time of the current frame */
@@ -281,6 +287,12 @@ static int video_configure(unsigned w, unsigned h, unsigned fmt, size_t pitch)
 	V.full = 1;
 	fb_clear();                                          /* borders cleared once */
 	V.ok = 1;
+	if (o_overlay) {                                     /* the clear above removed the strip: paint it again */
+		if (ovl_place(&OV, g_fbw, g_fbh, V.x0, V.y0, (int)w * V.k, (int)h * V.k, g_map, g_stride, &g_tab))
+			logf_("overlay: strip %dx%d at %d,%d", OVL_W, OVL_H, OV.x, OV.y);
+		else
+			logf_("overlay: right border %d px is too narrow (needs %d): nothing drawn", g_fbw - (V.x0 + (int)w * V.k), OVL_W + 2 * OVL_MARGIN);
+	}
 	g_last_k = V.k; g_last_x0 = V.x0; g_last_y0 = V.y0;
 	g_last_dw = (int)w * V.k; g_last_dh = (int)h * V.k;
 	logf_("video: source %ux%u fmt %u scale %dx -> %dx%d at %d,%d", w, h, fmt, V.k,
@@ -679,6 +691,9 @@ static size_t stats_format(char *buf, size_t cap, const char *status)
 	P("rt=%s\nrt_policy=%d\nrt_errno=%d\nmlockall=%d\n", g_rt, g_rt_policy, g_rt_errno, g_mlock);
 	P("audio_mode=%s\naudio_core_rate=%u\naudio_device_rate=%u\naudio_period=%u\naudio_buffer=%u\naudio_target=%u\n",
 	  A.mode == AUD_ALSA ? "alsa" : A.mode == AUD_CLOCK ? "clock" : "null", A.core_rate, A.rate, A.period, A.bufsz, A.target);
+	P("overlay=%d\noverlay_rect=%dx%d+%d+%d\noverlay_full_paints=%lu\noverlay_redraws=%lu\noverlay_redraw_us_total=%.1f\noverlay_redraw_us_max=%.1f\n",
+	  OV.on, OV.on ? OVL_W : 0, OV.on ? OVL_H : 0, OV.x, OV.y, OV.full_paints, OV.redraws, OV.redraw_ns / 1e3, OV.redraw_ns_max / 1e3);
+	P("overlay_ticks=%lu\noverlay_tick_us_total=%.1f\noverlay_tick_us_max=%.1f\noverlay_period=%d\n", OV.ticks, OV.tick_ns / 1e3, OV.tick_ns_max / 1e3, OV.period);
 	P("video_mode=%s\nvideo_scale=%d\nvideo_rect=%dx%d+%d+%d\nrows_drawn_pct=%.1f\n",
 	  g_video_null ? "null" : g_fake ? "fake" : "fb", g_last_k, g_last_dw, g_last_dh, g_last_x0, g_last_y0,
 	  st_rows_total ? 100.0 * st_rows_drawn / st_rows_total : 0.0);
@@ -746,7 +761,8 @@ static void usage(void)
 	      "  --audio-dev PATH   PCM device (default: probe /dev/snd)\n"
 	      "  --libdir DIR       core directory (default /usr/lib/libretro)\n"
 	      "  --sysdir DIR       libretro system directory\n"
-	      "  --restore-console  only restore the text console and clear the screen\n", stderr);
+	      "  --no-overlay       no status strip (WiFi, volume, brightness, mono/colour, clock) in the right border\n"
+		      "  --restore-console  only restore the text console and clear the screen\n", stderr);
 }
 
 #define SYM(n) do { *(void **)&n = dlsym(h, "retro_" #n); if (!n) { logf_("core lacks retro_" #n); return 1; } } while (0)
@@ -791,6 +807,11 @@ int main(int argc, char **argv)
 		else if ((v = OPTV("--audio-dev"))) o_audiodev = v;
 		else if ((v = OPTV("--chord-file"))) o_chord = v;
 		else if ((v = OPTV("--input-dir"))) o_inputdir = v;
+		else if ((v = OPTV("--status-file"))) o_status = v;
+		else if ((v = OPTV("--wifi-file"))) o_wifist = v;
+		else if ((v = OPTV("--wireless-file"))) o_wireless = v;
+		else if ((v = OPTV("--overlay-period"))) { o_ovl_period = atoi(v); if (o_ovl_period < 1) o_ovl_period = 1; }
+		else if (!strcmp(a, "--no-overlay")) o_overlay = 0;
 		else if ((v = OPTV("--frames"))) o_frames = strtoul(v, NULL, 10);
 		else if ((v = OPTV("--max-seconds"))) o_maxsec = atoi(v);
 		else if ((v = OPTV("--max-scale"))) o_maxscale = atoi(v);
@@ -926,6 +947,21 @@ int main(int argc, char **argv)
 	A.no_query = o_nofill;
 	if (o_xrun_debug >= 0) g_xrun_debug_ok = audio_xrun_debug(&A, (unsigned)o_xrun_debug) == 0;
 	input_init(&IN, o_inputdir, o_chord);
+	ovl_init(&OV);
+	OV.status_path = o_status; OV.wifi_path = o_wifist; OV.wireless_path = o_wireless; OV.period = o_ovl_period;
+	if (!g_video_null && o_overlay) {
+		/* The zone and the 12/24 h flag are read here, once, before the real-time loop: the launcher's
+		 * $TZ is kept when present, else TZ.CFG, /etc/TZ, AST4. */
+		const char *ft = getenv("OLPC_RUN_FAKETIME");
+		char tz[64];
+		int h24 = 0;
+
+		tz_apply(getenv("OLPC_RUN_CFGDIR") ? getenv("OLPC_RUN_CFGDIR") : "/mnt/olpclog",
+			 getenv("OLPC_RUN_TZFILE") ? getenv("OLPC_RUN_TZFILE") : "/etc/TZ", 1, tz, sizeof tz, &h24);
+		OV.h24 = h24;
+		if (ft && *ft) { OV.fake_base = (time_t)atoll(ft); OV.fake_t0 = now_ns(); }
+		logf_("overlay: time zone %s, %s-hour clock", tz, h24 ? "24" : "12");
+	}
 	/* background jobs (log sync) read this to back off while a game runs; it holds our pid so
 	 * a stale file left by a SIGKILL is recognisable */
 	if (o_running) {
@@ -944,7 +980,7 @@ int main(int argc, char **argv)
 	t_stats = t_save = now_ns();
 	dlog_buffering(1);               /* from here on nothing is written to stderr (the stick) until exit */
 	for (;;) {
-		u64 t0, t1, t2, t3, core, blit, wait;
+		u64 t0, t1, t2, t3, core, blit, wait, ovl_ns0;
 
 		if (o_poke_save && !poked && st_frames == 100 && g_sram_size) { g_sram[0] ^= 0xff; poked = 1; }
 		if (g_quit) { reason = g_timeout ? "timeout" : "signal"; break; }
@@ -976,12 +1012,16 @@ int main(int argc, char **argv)
 		t1 = now_ns();
 		run();
 		t2 = now_ns();
+		/* indicator strip: a counter compare, except once a second (before the audio wait, which absorbs it) */
+		ovl_ns0 = OV.tick_ns;
+		if (OV.on && !g_video_null) ovl_frame(&OV, g_map, g_stride, &g_tab, g_skip_now);
 		audio_flush(&A);
 		t3 = now_ns();
 
 		blit = g_blit_ns;
 		core = (t2 - t1) > blit ? (t2 - t1) - blit : 0;
 		wait = t3 - t2;
+		if (OV.tick_ns - ovl_ns0 < wait) wait -= OV.tick_ns - ovl_ns0; else wait = 0;     /* not audio waiting */
 		st_frames++;
 		acc_add(&a_core, core); acc_add(&a_audio, wait); acc_add(&a_work, core + blit); acc_add(&a_frame, t3 - t0);
 		hist_add(t3 - t0);
@@ -1027,6 +1067,7 @@ int main(int argc, char **argv)
 	unload_game();
 	deinit();
 	audio_close(&A);
+	ovl_close(&OV);
 	if (!g_video_null || g_map) fb_close();
 	if (g_saves_ok) {
 		g_saves_unfinished = sv_wait(&SVR, SAVE_WAIT_MS);
