@@ -29,6 +29,8 @@ struct input {
 	int chord, chord_tick;
 	int chord_fd, chord_retry;      /* kept open; -1 = not open */
 	uint64_t rot_since, ss_since;  /* ns when the exit gesture started, 0 = not held */
+	int tap;                       /* a gesture was released since the last input_tap() */
+	uint64_t tap_dur;              /* how long it was held, ns */
 };
 
 void inp_dev_event(struct inp_dev *d, const struct input_event *e);
@@ -40,6 +42,10 @@ void input_scan(struct input *in);
 /* Drain every device, refresh the chord flag; now_ns is a monotonic clock. */
 void input_poll(struct input *in, uint64_t now_ns);
 uint16_t input_mask(const struct input *in);
+/* Sleep until a device has events or ms passed. */
+void input_wait(struct input *in, int ms);
+/* 1 once per release of rotate (or pad Select+Start) that was held for less than hold_ns. */
+int input_tap(struct input *in, uint64_t hold_ns);
 /* 1 when rotate (or pad Select+Start) has been held for hold_ns. */
 int input_exit(const struct input *in, uint64_t now_ns, uint64_t hold_ns);
 #endif

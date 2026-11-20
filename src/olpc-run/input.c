@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <poll.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -220,8 +221,27 @@ void input_poll(struct input *in, uint64_t now_ns)
 		if (d->rotate) rot = 1;
 		if (d->cls == IN_PAD && (d->btn & BIT(J_SELECT)) && (d->btn & BIT(J_START))) ss = 1;
 	}
-	if (!rot) in->rot_since = 0; else if (!in->rot_since) in->rot_since = now_ns | 1;
-	if (!ss) in->ss_since = 0; else if (!in->ss_since) in->ss_since = now_ns | 1;
+	if (!rot) { if (in->rot_since) { in->tap = 1; in->tap_dur = now_ns - in->rot_since; } in->rot_since = 0; }
+	else if (!in->rot_since) in->rot_since = now_ns ? now_ns : 1;
+	if (!ss) { if (in->ss_since) { in->tap = 1; in->tap_dur = now_ns - in->ss_since; } in->ss_since = 0; }
+	else if (!in->ss_since) in->ss_since = now_ns ? now_ns : 1;
+}
+
+void input_wait(struct input *in, int ms)
+{
+	struct pollfd p[IN_MAXDEV];
+	int i;
+
+	for (i = 0; i < in->ndev; i++) { p[i].fd = in->dev[i].fd; p[i].events = POLLIN; p[i].revents = 0; }
+	poll(p, (nfds_t)in->ndev, ms);
+}
+
+int input_tap(struct input *in, uint64_t hold_ns)
+{
+	int t = in->tap && in->tap_dur < hold_ns;
+
+	in->tap = 0;
+	return t;
 }
 
 uint16_t input_mask(const struct input *in)

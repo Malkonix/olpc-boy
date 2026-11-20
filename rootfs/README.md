@@ -171,7 +171,7 @@ musl binary (`-O2 -march=geode -mtune=geode`, it `dlopen`s the cores) into
 
 `gb`/`gbc` use gambatte, `nes` uses quicknes; `--core fceumm` (or a name/path) overrides.
 Options: `--stats FILE` (written at exit only), `--stats-live FILE` (also every 10 s; point it at tmpfs), `--frames N`, `--max-seconds N`, `--no-audio`, `--no-video`,
-`--savedir DIR`, `--max-skip N` (default 4), `--max-scale N`, `--audio-period-ms X`
+`--savedir DIR`, `--statedir DIR`, `--max-skip N` (default 4), `--max-scale N`, `--audio-period-ms X`
 (default 4), `--audio-latency-ms X` (default 45), `--audio-target N` (frames, overrides
 the latency), `--no-rt`, `--xrun-debug N` (writes N to the PCM's
 `/proc/asound/cardX/pcmDp/xrun_debug`, 0..31: bit 0 = log XRUN and hw_ptr anomalies, bit 1 = also a stack dump, bit 2 = jiffies check; the boot test uses 5), `--test-stall-ms M --test-stall-at F[,F2..]` (sleeps M ms in the loop at those frames, to exercise the recovery), `--no-fill-query` (never calls the DELAY
@@ -225,6 +225,32 @@ exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usag
   changed, always as temp file + `fsync` + `rename` + directory `fsync`. A failed
   `mkdir`/write is logged and the game goes on. A crash (SIGSEGV, SIGKILL, power loss)
   loses what was not written yet. The boot test uses `/run/olpcboy/saves` (tmpfs).
+* **Pause menu and save states**: emulation and audio stop while the menu is open (centred
+  600x472 box, black on white with an inverted cursor row, so it reads the same in DCON mono;
+  drawn only when input arrives, polling every 25 ms for the chord flag). Items: Resume, Save
+  state, Load state, `Slot: < N >` (1..4), Quit game. Below them the current slot shows
+  `Slot N: empty` or `Slot N: saved 2:32 PM Nov 20` (24 h form when the zone file says so), and a
+  message line shows the result (`Saved to slot 2`, `Loaded slot 2`, `Slot 3 is empty`,
+  `Slot 3 is not valid`, `Save states not supported` when the core's `retro_serialize_size` is 0).
+  UP/DOWN move the cursor, LEFT/RIGHT change the slot from any row, A (check / pad A) selects, B
+  (cross / pad B), another ROTATE tap or another pad SELECT+START tap resumes; holding either
+  for 1 s still quits. A and B act on release and only when pressed alone, so the olpc-chordd
+  chords (CIRCLE+CHECK, SQUARE+CROSS) do nothing in the menu, and the built-in D-pad is ignored
+  while the chord flag is set. After a save or load the menu stays open (the message is
+  visible); resume with B. The last slot used is remembered per game and the menu opens on it.
+  States: `<statedir>/<rom basename>.st1`..`.st4`, default `<romdir>/../states/` (next to
+  `saves/`, created on the first save), plus `<basename>.slot` (one digit, the last slot). Each
+  file is the core's `retro_serialize` blob written as temp file + `fsync` + `rename` + directory
+  `fsync` while the loop is stopped; a load needs a file of exactly `retro_serialize_size` bytes.
+  Battery RAM is untouched by the menu: after a load the periodic save check notices the changed
+  RAM like any other change. Resume: the audio PCM is `DROP`ped when the menu opens and, on
+  resume, `PREPARE`d and primed with silence up to the target like after an underrun (the
+  kernel's restart-on-prepare path), with the pacing state reset (clock fallback: the virtual
+  stream restarts), so there is no xrun cascade and no catch-up of the paused time; the main
+  loop forgets the previous frame's start time. The screen is rebuilt from the last drawn
+  source frame (`V.prev`) plus the strip, and the dirty-row cache is invalidated. Outside the
+  menu the cost is one flag test per frame. Test hook `--test-keys "MS:b|p:KEY:0|1,..."` injects
+  key events (b = built-in, p = pad; keys up down left right a b start select rot), one per poll.
 * **Video**: largest integer scale that fits 1200x900, centred, borders cleared once and
   again on a geometry change. Each source row is expanded once and `memcpy`d for the
   repeated lines; rows equal to the previous drawn frame are skipped (a copy of the
@@ -277,6 +303,9 @@ exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usag
   `input.c`. While `/run/olpcboy/chord` is `1` the built-in D-pad is not passed to the
   game. **Exit**: hold ROTATE (KEY_DIRECTION, 153) for 1 s, or pad SELECT+START for
   1 s, or SIGTERM. ROTATE re-sends presses while held; only the held state is tracked.
+  A SHORT press (released before 1 s) of ROTATE, or of pad SELECT+START, opens the pause
+  menu (below). The 1 s timer starts at the first frame that sees the press, so holding
+  still quits directly as before.
 * **Storage never blocks the loop**: nothing in the frame loop writes to the USB stick. The
   statistics are kept in memory and written once at exit (`--stats`); `--stats-live` is a
   copy every 10 s meant for tmpfs, which `olpc-tty1` uses so a run killed by the hard timeout
@@ -297,7 +326,7 @@ exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usag
   incident closes at the first frame whose `poll()` really blocked (at least 1 ms) or after 6
   clean frames; the first event of each incident then gets `rec_frames` and `rec_ms`.
 * **Statistics**: `--stats FILE`, text `status=running` only in the live copy and
-  `status=<frames|exit-button|signal|timeout>` at exit.
+  `status=<frames|exit-button|menu-quit|signal|timeout>` at exit.
   `key=value` lines: `frames_run`, `frames_drawn`, `frames_skipped`, `frames_dupe`,
   `wall_s`, `fps_effective`; per-frame `core_ms_*` (core only, blit excluded),
   `blit_ms_*` (average over drawn frames), `audio_wait_ms_*` (poll + write),
@@ -315,7 +344,7 @@ exit gesture, SIGTERM/SIGINT, time limit), 1 for load/runtime errors, 2 for usag
   `underrun_recover_failed`, `recover_prepare` / `recover_reopen` / `recover_clock` /
   `recover_reopen_failed`, `incidents`, `incidents_recovered`, `recovery_paced_frames`,
   `xrun_debug_req` / `xrun_debug_applied` / `xrun_debug_errno` / `xrun_debug_path`,
-  `test_stall_ms`, `test_stalls_done`, `saves_written`, `saves_failed`, `saves_unfinished`,
+  `test_stall_ms`, `test_stalls_done`, `saves_written`, `saves_failed`, `saves_unfinished`, `states_saved`, `states_loaded`, `pause_count`,
   `xrun_events_total`,
   `xrun_events_kept` and up to 64 `xrun_event_N=frame=.. since_prev_ms=.. work_ms=a,b,c
   fill=.. via=poll|write action=prepare|reopen|clock rec_frames=.. rec_ms=..` lines (the last 64 underruns: frame number, time since the previous

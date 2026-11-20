@@ -88,6 +88,11 @@ int  audio_open(struct audio *a, unsigned core_rate, const char *dev, int mode_n
 int  audio_xrun_debug(struct audio *a, unsigned n);
 void audio_push(struct audio *a, const int16_t *frames, size_t n);   /* never blocks */
 void audio_flush(struct audio *a);          /* pacing point: waits, then hands the queue to the sink */
+/* Menu pause: drop what is queued and stop the stream; nothing may be flushed until audio_resume(),
+ * which restarts it like after an underrun (PREPARE, silence up to the target) and forgets the pacing
+ * history so the paused time is not caught up. */
+void audio_pause(struct audio *a);
+void audio_resume(struct audio *a);
 long audio_fill(struct audio *a);           /* frames queued in the sink, -1 when unknown (null) */
 void audio_close(struct audio *a);
 #endif

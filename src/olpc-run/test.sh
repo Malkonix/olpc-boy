@@ -16,10 +16,10 @@ bad() { echo "  FAIL: $*"; fail=1; }
 
 # The container CPU is not a Geode: build the host copies for a plain i586.
 HCF="-O2 -march=i586 -Wall -Wextra"
-$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/scale.c" "$here/resample.c" "$here/input.c" "$here/audio.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/../common/status.c" "$here/../common/gfx.c" -lm -pthread || exit 1
+$CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/scale.c" "$here/resample.c" "$here/input.c" "$here/audio.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/state.c" "$here/pause.c" "$here/../common/status.c" "$here/../common/gfx.c" -lm -pthread || exit 1
 $CC $HCF -o "$tmp/fbcheck" "$here/fbcheck.c" || exit 1
 $CC $HCF -o "$tmp/mkzip" "$here/mkzip.c" || exit 1
-$CC $HCF -o "$tmp/olpc-run" "$here/olpc-run.c" "$here/scale.c" "$here/audio.c" "$here/input.c" "$here/resample.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/../common/status.c" "$here/../common/gfx.c" -ldl -pthread || exit 1
+$CC $HCF -o "$tmp/olpc-run" "$here/olpc-run.c" "$here/scale.c" "$here/audio.c" "$here/input.c" "$here/resample.c" "$here/diag.c" "$here/saver.c" "$here/overlay.c" "$here/state.c" "$here/pause.c" "$here/../common/status.c" "$here/../common/gfx.c" -ldl -pthread || exit 1
 
 echo "== self-test (scaler, resampler, input mapping, audio plan, diagnostics)"
 "$tmp/selftest" || exit 1
@@ -206,7 +206,7 @@ if [ $found = 1 ]; then
 			core_over12_frames blit_over12_frames audio_wait_over12_frames audio_fill_min audio_fill_max \
 			audio_req_period_ms audio_req_latency_ms audio_period_ms audio_target_ms audio_avail_min audio_start_threshold rt mlockall \
 			underruns_poll underruns_write underrun_recover_failed fill_query rt_policy rt_errno xrun_debug_req xrun_debug_applied xrun_debug_errno xrun_debug_path \
-			recover_prepare recover_reopen recover_clock incidents incidents_recovered test_stall_ms test_stalls_done saves_unfinished saves_written xrun_events_total xrun_events_kept; do
+			recover_prepare recover_reopen recover_clock incidents incidents_recovered test_stall_ms test_stalls_done saves_unfinished saves_written states_saved states_loaded pause_count xrun_events_total xrun_events_kept; do
 			grep -q "^$k=" "$tmp/s.txt" || bad "stats lack $k"
 		done
 		hsum=0; for k in lt14 14_18 18_22 22_30 30_40 gt40; do hsum=$((hsum + $(stat_get "$tmp/s.txt" frame_hist_$k))); done
@@ -296,6 +296,93 @@ if [ $found = 1 ]; then
 	else
 		echo "== battery saves: SKIPPED (no real ROM)"
 	fi
+fi
+
+
+# pause menu and save states, driven by --test-keys (synthetic key events through pipes)
+K=""
+# kt <b|p> <key> <ms>: press at ms, release 80 ms later
+kt() { K="$K$3:$1:$2:1,$(($3 + 80)):$1:$2:0,"; }
+pm_run() { # <sys> <rom> <core> <statedir> <stats> [more olpc-run args...]
+	psys=$1; prom=$2; pcore=$3; pst=$4; pstats=$5; shift 5
+	"$tmp/olpc-run" --libdir "$cores" --core "$pcore" --no-audio --max-seconds 30 --statedir "$pst" --savedir "$tmp/saves" \
+		--input-dir "$tmp/noinput" --test-keys "${K%,}" --stats "$pstats" "$@" "$psys" "$prom" >"$tmp/log" 2>&1
+}
+
+pause_suite() { # <sys> <rom> <core>
+	sys=$1; rom=$2; core=$3
+	echo "== pause menu + save states ($core, $(basename "$rom"))"
+	# a) holding rotate still quits and never opens the menu
+	K="300:b:rot:1,"; pm_run $sys "$rom" $core "$tmp/st-a" "$tmp/s.txt" --no-video
+	[ "$(stat_get "$tmp/s.txt" status)" = exit-button ] && [ "$(stat_get "$tmp/s.txt" pause_count)" = 0 ] || bad "rotate held: status=$(stat_get "$tmp/s.txt" status) pause_count=$(stat_get "$tmp/s.txt" pause_count)"
+	# b) a short rotate tap opens the menu; Quit game leaves
+	K=""; kt b rot 300; kt b down 450; kt b down 610; kt b down 770; kt b down 930; kt b a 1090
+	pm_run $sys "$rom" $core "$tmp/st-b" "$tmp/s.txt" --no-video
+	[ "$(stat_get "$tmp/s.txt" status)" = menu-quit ] && [ "$(stat_get "$tmp/s.txt" pause_count)" = 1 ] || bad "tap + Quit: status=$(stat_get "$tmp/s.txt" status) pause_count=$(stat_get "$tmp/s.txt" pause_count)"
+	[ "$(stat_get "$tmp/s.txt" states_saved)" = 0 ] && [ "$(stat_get "$tmp/s.txt" states_loaded)" = 0 ] || bad "tap + Quit changed states"
+	# c) pad: Select+Start tap opens, a second tap resumes, holding quits
+	K="300:p:select:1,340:p:start:1,420:p:start:0,460:p:select:0,700:p:select:1,740:p:start:1,820:p:start:0,860:p:select:0,1200:p:select:1,1240:p:start:1,"
+	pm_run $sys "$rom" $core "$tmp/st-c" "$tmp/s.txt" --no-video
+	[ "$(stat_get "$tmp/s.txt" status)" = exit-button ] && [ "$(stat_get "$tmp/s.txt" pause_count)" = 1 ] || bad "pad: status=$(stat_get "$tmp/s.txt" status) pause_count=$(stat_get "$tmp/s.txt" pause_count)"
+	# d) save slot 1, later save slot 2, load slot 1, save it as slot 3: 3 must equal 1, 2 must differ
+	st="$tmp/st-d"; rm -rf "$st"
+	K=""; kt b rot 300; kt b down 450; kt b a 610; kt b b 770
+	kt b rot 1300; kt b right 1450; kt b down 1610; kt b a 1770; kt b left 1930; kt b down 2090; kt b a 2250
+	kt b right 2410; kt b right 2570; kt b up 2730; kt b a 2890; kt b down 3050; kt b down 3210; kt b down 3370; kt b a 3530
+	pm_run $sys "$rom" $core "$st" "$tmp/s.txt" --no-video
+	b=$(basename "$rom"); b=${b%.*}
+	echo "  round trip: status=$(stat_get "$tmp/s.txt" status) saved=$(stat_get "$tmp/s.txt" states_saved) loaded=$(stat_get "$tmp/s.txt" states_loaded) pauses=$(stat_get "$tmp/s.txt" pause_count); $(ls "$st" | tr '\n' ' ')"
+	[ "$(stat_get "$tmp/s.txt" status)" = menu-quit ] && [ "$(stat_get "$tmp/s.txt" states_saved)" = 3 ] && [ "$(stat_get "$tmp/s.txt" states_loaded)" = 1 ] && [ "$(stat_get "$tmp/s.txt" pause_count)" = 2 ] || { bad "round trip counters"; tail -n 8 "$tmp/log"; }
+	[ -s "$st/$b.st1" ] && [ -s "$st/$b.st2" ] && [ -s "$st/$b.st3" ] || bad "state files missing"
+	# gambatte re-serializes one byte differently right after an unserialize (offset 378), so "equal" means
+	# a handful of bytes at most, while a state saved after the game ran on differs in far more
+	d13=$(cmp -l "$st/$b.st1" "$st/$b.st3" | wc -l); d12=$(cmp -l "$st/$b.st1" "$st/$b.st2" | wc -l)
+	echo "  bytes differing: slot1 vs slot3 (load, save) = $d13, slot1 vs slot2 (game ran on) = $d12"
+	[ "$d13" -le 4 ] || bad "load of slot 1 then save as 3: slot 3 differs from slot 1 in $d13 bytes"
+	[ "$d12" -gt 4 ] || bad "slot 2 (saved later) is almost equal to slot 1 ($d12 bytes): the game did not advance"
+	[ "$(cat "$st/$b.slot")" = 3 ] || bad "last slot not remembered: '$(cat "$st/$b.slot" 2>/dev/null)'"
+	ls "$st" | grep -q '\.tmp$' && bad "temp file left in the state dir"
+	# e) the remembered slot is where the next menu opens: Save with no slot change goes to slot 3
+	st2="$tmp/st-e"; rm -rf "$st2"; mkdir -p "$st2"; cp "$st/$b.st1" "$st/$b.st2" "$st/$b.slot" "$st2/"
+	K=""; kt b rot 300; kt b down 450; kt b a 610; kt b down 770; kt b down 930; kt b down 1090; kt b a 1250
+	pm_run $sys "$rom" $core "$st2" "$tmp/s.txt" --no-video
+	[ -s "$st2/$b.st3" ] && cmp -s "$st/$b.st1" "$st2/$b.st1" && cmp -s "$st/$b.st2" "$st2/$b.st2" || bad "slot persistence: save did not go to the remembered slot 3 alone"
+	# f) loading an empty slot: a message, nothing loaded, nothing created
+	st3="$tmp/st-f"; rm -rf "$st3"
+	K=""; kt b rot 300; kt b down 450; kt b down 610; kt b a 770; kt b down 930; kt b down 1090; kt b a 1250
+	pm_run $sys "$rom" $core "$st3" "$tmp/s.txt" --no-video
+	grep -q 'state: load of .* empty' "$tmp/log" && [ "$(stat_get "$tmp/s.txt" states_loaded)" = 0 ] && [ -z "$(ls "$st3" 2>/dev/null)" ] || bad "empty slot load"
+	# g) a state of the wrong size is refused
+	st4="$tmp/st-g"; rm -rf "$st4"; mkdir -p "$st4"; head -c 100 "$st/$b.st1" >"$st4/$b.st1"
+	K=""; kt b rot 300; kt b down 450; kt b down 610; kt b a 770; kt b down 930; kt b down 1090; kt b a 1250
+	pm_run $sys "$rom" $core "$st4" "$tmp/s.txt" --no-video
+	[ "$(stat_get "$tmp/s.txt" states_loaded)" = 0 ] && grep -q 'state: load of .* failed' "$tmp/log" || bad "short state file was not refused"
+}
+
+if [ $found = 1 ] && [ -n "$gb" ] && [ -f "$cores/gambatte_libretro.so" ]; then
+	pause_suite gb "$gb" gambatte
+	[ -n "$nes" ] && [ -f "$cores/quicknes_libretro.so" ] && pause_suite nes "$nes" quicknes
+
+	# the screen: the menu is drawn black on white in a centred box, and after a resume the picture is
+	# exactly what an uninterrupted run shows (paused time costs no frames, the dirty-row cache is reset)
+	echo "== pause menu: drawing, repaint after resume, timing (gambatte)"
+	rm -f "$tmp/fbm.raw"; K=""; kt b rot 500
+	OLPC_RUN_FAKEFB="$tmp/fbm.raw" "$tmp/olpc-run" --libdir "$cores" --core gambatte --no-audio --max-seconds 2 --statedir "$tmp/st-h" \
+		--savedir "$tmp/saves" --input-dir "$tmp/noinput" --test-keys "${K%,}" --no-overlay --stats "$tmp/s.txt" gb "$gb" >"$tmp/log" 2>&1
+	res=$("$tmp/fbcheck" "$tmp/fbm.raw" 300 214 600 472); inside=${res#inside=}; inside=${inside%% *}
+	echo "  menu box 600x472+300+214: $res"
+	[ "${inside:-0}" -gt 180000 ] || bad "menu box not drawn (inside=$inside of 283200)"
+	[ "$(stat_get "$tmp/s.txt" pause_count)" = 1 ] || bad "menu did not open on the fake framebuffer"
+	for v in ref menu; do
+		rm -f "$tmp/fb-$v.raw"; K=""; [ $v = menu ] && { kt b rot 500; kt b b 900; }
+		OLPC_RUN_FAKEFB="$tmp/fb-$v.raw" "$tmp/olpc-run" --libdir "$cores" --core gambatte --audio-dev /nonexistent/pcm --frames 150 --statedir "$tmp/st-h" \
+			--savedir "$tmp/saves" --input-dir "$tmp/noinput" --test-keys "${K%,}" --no-overlay --stats "$tmp/s-$v.txt" gb "$gb" >"$tmp/log" 2>&1 || bad "$v run failed"
+	done
+	cmp -s "$tmp/fb-ref.raw" "$tmp/fb-menu.raw" || bad "screen after resume differs from an uninterrupted run"
+	[ "$(stat_get "$tmp/s-menu.txt" pause_count)" = 1 ] && [ "$(stat_get "$tmp/s-menu.txt" frames_run)" = 150 ] || bad "paused run: pause_count=$(stat_get "$tmp/s-menu.txt" pause_count) frames_run=$(stat_get "$tmp/s-menu.txt" frames_run)"
+	fm=$(stat_get "$tmp/s-menu.txt" frame_ms_max)
+	echo "  after resume: screen identical to the uninterrupted run; frame_ms_max=$fm underruns=$(stat_get "$tmp/s-menu.txt" underruns)"
+	awk -v m="$fm" 'BEGIN{exit !(m<60)}' || bad "a frame took $fm ms after the pause (the paused time was caught up?)"
 fi
 
 if [ $fail = 0 ]; then echo "olpc-run tests: ALL OK"; else echo "olpc-run tests: FAILED"; fi

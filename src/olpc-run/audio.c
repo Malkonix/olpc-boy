@@ -442,6 +442,22 @@ void audio_flush(struct audio *a)
 	else a->qn = 0;
 }
 
+void audio_pause(struct audio *a)
+{
+	a->qn = 0;
+	if (a->mode == AUD_ALSA) ioctl(a->fd, SNDRV_PCM_IOCTL_DROP);
+}
+
+void audio_resume(struct audio *a)
+{
+	if (a->mode == AUD_ALSA) {
+		if (ioctl(a->fd, SNDRV_PCM_IOCTL_PREPARE) < 0) { a->recover_fail++; to_clock(a, "PREPARE failed after a pause"); }
+		else prime_silence(a);
+	}
+	if (a->mode == AUD_CLOCK) { a->t0 = now_ns(); a->written = 0; }
+	a->pace_next = 0;
+}
+
 void audio_close(struct audio *a)
 {
 	if (a->mode == AUD_ALSA && a->fd >= 0) {

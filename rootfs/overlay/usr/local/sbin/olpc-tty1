@@ -1,7 +1,8 @@
 #!/bin/sh
-# tty1 driver (respawned by init): selftest -> game menu (olpc-menu, respawned here) -> status
+# tty1 driver (respawned by init): game menu (olpc-menu, respawned here) -> status
 # screen as the fallback.  The timed emulator runs, the play session and the WiFi test are opt-in
-# (kernel command line olpcboy.tests).
+# (kernel command line olpcboy.tests).  The hardware selftest is opt-in too (olpcboy.selftest):
+# it took ~25 s of every boot.
 # The button capture and the sound test are opt-in (kernel command line
 # olpcboy.buttons / olpcboy.soundtest) so the games come up sooner.
 # Never waits for keyboard input.  Runs only once per boot.
@@ -17,7 +18,7 @@ if [ ! -e "$STATE" ]; then
 	: >"$STATE"
 	# The boot splash keeps the console in graphics mode (nothing below is painted).  The opt-in
 	# test screens print to the console, so they get the text console back first.
-	for o in buttons soundtest fbbench corebench tests; do
+	for o in buttons soundtest fbbench corebench tests selftest; do
 		cmdline_has olpcboy.$o && { /usr/local/sbin/olpc-splash text; break; }
 	done
 	if cmdline_has olpcboy.buttons; then
@@ -26,11 +27,12 @@ if [ ! -e "$STATE" ]; then
 		tl "tty1: buttons done"
 	fi
 	printf '\033[2J\033[H'
-	/usr/local/sbin/olpc-splash progress 85 "Checking hardware"
-	tl "tty1: selftest start"
-	/usr/local/sbin/olpc-selftest
-	tl "tty1: selftest done"
-	olpc_sync
+	if cmdline_has olpcboy.selftest || cmdline_has olpcboy.tests; then
+		tl "tty1: selftest start"
+		/usr/local/sbin/olpc-selftest
+		tl "tty1: selftest done"
+		olpc_sync
+	fi
 	# audible tone so the volume chord can be tried by ear
 	if [ -c /dev/snd/controlC0 ] && cmdline_has olpcboy.soundtest; then
 		printf '\033[2J\033[H\n  SOUND TEST - 25 SECONDS\n\n'

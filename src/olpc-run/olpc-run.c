@@ -39,6 +39,8 @@
 #include "diag.h"
 #include "saver.h"
 #include "overlay.h"
+#include "state.h"
+#include "pause.h"
 #include "../common/status.h"
 
 typedef uint64_t u64;
@@ -46,12 +48,13 @@ typedef uint64_t u64;
 #define FB_W 1200
 #define FB_H 900
 #define MAX_ROM (16u << 20)
+#define HOLD_NS 1000000000ull          /* rotate / pad Select+Start held this long quits; a shorter press opens the pause menu */
 
 /* ------------------------------------------------------------------ options */
 
 static const char *o_core;            /* --core override (name or path) */
 static const char *o_libdir = "/usr/lib/libretro";
-static const char *o_savedir, *o_sysdir = "/usr/share/olpcboy/system", *o_stats;
+static const char *o_savedir, *o_statedir, *o_keys, *o_sysdir = "/usr/share/olpcboy/system", *o_stats;
 static const char *o_audiodev;
 static const char *o_stats_live;      /* --stats-live FILE: periodic copy of the statistics, meant for tmpfs */
 static unsigned long o_stall_at[8];   /* --test-stall-at F[,F2...] with --test-stall-ms M */
@@ -298,6 +301,17 @@ static int video_configure(unsigned w, unsigned h, unsigned fmt, size_t pitch)
 	logf_("video: source %ux%u fmt %u scale %dx -> %dx%d at %d,%d", w, h, fmt, V.k,
 	      g_last_dw, g_last_dh, V.x0, V.y0);
 	return 0;
+}
+
+/* After the pause menu: the whole screen again from the last frame that was drawn (V.prev), the strip,
+ * and the dirty-row cache invalidated so the next frame repaints everything. */
+static void video_repaint(void)
+{
+	if (g_video_null || !g_map || !V.ok) return;
+	fb_clear();
+	blit_rows(&V.b, V.prev, V.pitch, NULL, 1, g_map + (size_t)V.y0 * g_stride + (size_t)V.x0 * (size_t)g_tab.B);
+	V.full = 1;
+	if (o_overlay) ovl_place(&OV, g_fbw, g_fbh, V.x0, V.y0, (int)V.w * V.k, (int)V.h * V.k, g_map, g_stride, &g_tab);
 }
 
 static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
@@ -643,6 +657,7 @@ static struct xrun_ring g_xr;
 #define STATS_BUF (XR_MAX * 260 + 6000)
 
 static unsigned long g_stalls_done;
+static unsigned long st_saved, st_loaded, st_pauses;      /* save states written / loaded, pause menus opened */
 static int g_saves_unfinished = -1;      /* -1 = not waited for yet */
 
 /* The statistics as text in buf; returns the length.  Pure memory work: no file is touched. */
@@ -685,6 +700,7 @@ static size_t stats_format(char *buf, size_t cap, const char *status)
 		for (i = 0; i < SVR.n; i++) { w += SVR.slot[i].written; f += SVR.slot[i].failed; }
 		P("saves_written=%lu\nsaves_failed=%lu\n", w, f);
 	}
+	P("states_saved=%lu\nstates_loaded=%lu\npause_count=%lu\n", st_saved, st_loaded, st_pauses);
 	P("audio_req_period_ms=%.2f\naudio_req_latency_ms=%.1f\naudio_req_target_frames=%u\n", o_period_ms, o_latency_ms, o_target);
 	P("audio_period_ms=%.2f\naudio_target_ms=%.1f\naudio_avail_min=%u\naudio_start_threshold=%u\n",
 	  A.rate ? 1000.0 * A.period / A.rate : 0.0, A.rate ? 1000.0 * A.target / A.rate : 0.0, A.avail_min, A.start_threshold);
@@ -729,6 +745,204 @@ static void stats_write(const char *path, const char *status, int sync)
 	if (off != n || rename(tmp, path) < 0) unlink(tmp);
 }
 
+/* ------------------------------------------------------------------ pause menu */
+
+static struct core_ser g_cs;
+static char g_statedir[PATH_MAX], g_base[PATH_MAX];
+static struct pmenu PM;
+
+/* <ROM dir>/../<name> */
+static void sibling_dir(char *out, size_t cap, const char *rom_abs, const char *name)
+{
+	char a[PATH_MAX], b[PATH_MAX];
+
+	snprintf(a, sizeof a, "%s", rom_abs);
+	snprintf(b, sizeof b, "%s", dirname(a));
+	snprintf(a, sizeof a, "%s", b);
+	snprintf(out, cap, "%s/%s", dirname(a), name);
+}
+
+/* Test hook --test-keys "MS:b|p:KEY:0|1,...": synthetic key events (b = built-in buttons, p = pad), one per
+ * input poll once MS milliseconds have passed since the start, through pipes that look like evdev nodes. */
+static struct { u64 ns; int pad, code, val; } g_sev[64];
+static int g_nsev, g_sev_i, g_sfd[2] = { -1, -1 };
+
+static int key_code(int pad, const char *n)
+{
+	static const struct { const char *n; int b, p; } K[] = {
+		{ "up", KEY_UP, BTN_DPAD_UP }, { "down", KEY_DOWN, BTN_DPAD_DOWN }, { "left", KEY_LEFT, BTN_DPAD_LEFT },
+		{ "right", KEY_RIGHT, BTN_DPAD_RIGHT }, { "a", KEY_END, BTN_EAST }, { "b", KEY_PAGEDOWN, BTN_SOUTH },
+		{ "start", KEY_PAGEUP, BTN_START }, { "select", KEY_HOME, BTN_SELECT }, { "rot", 153, -1 },
+	};
+	unsigned i;
+
+	for (i = 0; i < sizeof K / sizeof K[0]; i++) if (!strcmp(K[i].n, n)) return pad ? K[i].p : K[i].b;
+	return -1;
+}
+
+static void script_init(const char *spec)
+{
+	char *dup = strdup(spec), *save = NULL, *tok;
+	int pad;
+
+	for (tok = strtok_r(dup, ",", &save); tok && g_nsev < 64; tok = strtok_r(NULL, ",", &save)) {
+		unsigned long ms;
+		char dev, name[16];
+		int val;
+
+		if (sscanf(tok, "%lu:%c:%15[a-z]:%d", &ms, &dev, name, &val) != 4 || (dev != 'b' && dev != 'p') || key_code(dev == 'p', name) < 0) {
+			logf_("--test-keys: bad entry '%s'", tok);
+			continue;
+		}
+		g_sev[g_nsev].ns = (u64)ms * 1000000ull; g_sev[g_nsev].pad = dev == 'p';
+		g_sev[g_nsev].code = key_code(dev == 'p', name); g_sev[g_nsev].val = val;
+		g_nsev++;
+	}
+	free(dup);
+	for (pad = 0; pad < 2; pad++) {
+		int p[2];
+		struct inp_dev *d;
+
+		if (IN.ndev >= IN_MAXDEV || pipe2(p, O_NONBLOCK | O_CLOEXEC) < 0) continue;
+		d = &IN.dev[IN.ndev++];
+		memset(d, 0, sizeof *d);
+		d->fd = p[0]; d->cls = pad ? IN_PAD : IN_BUILTIN;
+		snprintf(d->path, sizeof d->path, "script%d", pad);
+		d->absmin[0] = d->absmin[1] = -32768; d->absmax[0] = d->absmax[1] = 32767;
+		g_sfd[pad] = p[1];
+	}
+}
+
+static void poll_inputs(u64 t)
+{
+	if (g_sev_i < g_nsev && t - g_t_start >= g_sev[g_sev_i].ns && g_sfd[g_sev[g_sev_i].pad] >= 0) {
+		struct input_event e;
+
+		memset(&e, 0, sizeof e);
+		e.type = EV_KEY; e.code = (uint16_t)g_sev[g_sev_i].code; e.value = g_sev[g_sev_i].val;
+		if (write(g_sfd[g_sev[g_sev_i].pad], &e, sizeof e) < 0) {}
+		g_sev_i++;
+	}
+	input_poll(&IN, t);
+}
+
+static void pm_show(struct pmenu *m)
+{
+	int bx = (g_fbw - PM_W) / 2, by = (g_fbh - PM_H) / 2, y, x, B = g_tab.B;
+
+	pm_draw(m);
+	if (g_video_null || !g_map || bx < 0 || by < 0) return;
+	for (y = 0; y < PM_H; y++) {
+		const uint16_t *src = m->px + (size_t)y * PM_W;
+		uint8_t *dst = g_map + (size_t)(by + y) * g_stride + (size_t)bx * (size_t)B;
+
+		if (g_tab.ident16) memcpy(dst, src, PM_W * 2);
+		else if (B == 2) for (x = 0; x < PM_W; x++) ((uint16_t *)dst)[x] = (uint16_t)(g_tab.r[src[x] >> 11] + g_tab.g[(src[x] >> 5) & 63] + g_tab.b[src[x] & 31]);
+		else for (x = 0; x < PM_W; x++) ((uint32_t *)dst)[x] = g_tab.r[src[x] >> 11] + g_tab.g[(src[x] >> 5) & 63] + g_tab.b[src[x] & 31];
+	}
+}
+
+static void pm_refresh(struct pmenu *m)
+{
+	char p[PATH_MAX];
+	int s;
+
+	for (s = 1; s <= ST_SLOTS; s++) { st_path(p, sizeof p, g_statedir, g_base, s); m->when[s] = st_stamp(p); }
+}
+
+static void pm_do_save(struct pmenu *m)
+{
+	char p[PATH_MAX];
+	int r;
+
+	if (!m->supported) { pm_msg(m, "Save states not supported"); return; }
+	st_path(p, sizeof p, g_statedir, g_base, m->slot);
+	r = st_save(&g_cs, g_statedir, p);
+	if (r == ST_OK) { st_saved++; pm_msg(m, "Saved to slot %d", m->slot); logf_("state: saved %s", p); }
+	else { pm_msg(m, "Save failed"); logf_("state: save of %s failed (%d)", p, r); }
+	pm_refresh(m);
+}
+
+static void pm_do_load(struct pmenu *m)
+{
+	char p[PATH_MAX];
+	int r;
+
+	if (!m->supported) { pm_msg(m, "Save states not supported"); return; }
+	st_path(p, sizeof p, g_statedir, g_base, m->slot);
+	r = st_load(&g_cs, p);
+	if (r == ST_OK) { st_loaded++; pm_msg(m, "Loaded slot %d", m->slot); logf_("state: loaded %s", p); return; }
+	if (r == ST_EMPTY) pm_msg(m, "Slot %d is empty", m->slot);
+	else if (r == ST_BADSIZE || r == ST_REFUSED) pm_msg(m, "Slot %d is not valid", m->slot);
+	else pm_msg(m, "Load failed");
+	logf_("state: load of %s: %s (%d)", p, r == ST_EMPTY ? "empty" : "failed", r);
+}
+
+#define JBIT(id) (1u << RETRO_DEVICE_ID_JOYPAD_##id)
+
+/* The pause menu.  Emulation and audio are stopped while it runs; it only wakes for input (and every
+ * 25 ms to keep the chord flag fresh).  Returns 0 to resume, 1 for "Quit game", 2 when the exit gesture
+ * was held, and 0 with g_quit set when a signal arrived. */
+static int pause_menu(void)
+{
+	struct pmenu *m = &PM;
+	static const struct { unsigned bit; int key; } DIR[] = {
+		{ JBIT(UP), PK_UP }, { JBIT(DOWN), PK_DOWN }, { JBIT(LEFT), PK_LEFT }, { JBIT(RIGHT), PK_RIGHT } };
+	static const unsigned FACE = JBIT(A) | JBIT(B) | JBIT(START) | JBIT(SELECT);
+	unsigned prev, cur, clean = 0;
+	int slot0, ret = 0, i;
+
+	st_pauses++;
+	audio_pause(&A);
+	pm_init(m, st_slot_read(g_statedir, g_base), g_cs.size && g_cs.size() > 0, OV.h24);
+	slot0 = m->slot;
+	pm_refresh(m);
+	pm_show(m);
+	prev = input_mask(&IN);
+	for (;;) {
+		u64 t;
+		int act, key = -1;
+
+		input_wait(&IN, 25);
+		t = now_ns();
+		poll_inputs(t);
+		if (g_quit) goto out;
+		if (input_exit(&IN, t, HOLD_NS)) { ret = 2; goto out; }
+		if (input_tap(&IN, HOLD_NS)) break;
+		cur = input_mask(&IN);
+		if (cur == prev) continue;
+		for (i = 0; i < 4; i++) if ((cur & DIR[i].bit) && !(prev & DIR[i].bit)) key = DIR[i].key;
+		/* A and B act on release and only when pressed alone (CIRCLE+CHECK and SQUARE+CROSS are chords) */
+		if ((cur & JBIT(A)) && !(prev & JBIT(A)) && !(cur & FACE & ~JBIT(A))) clean |= JBIT(A);
+		if ((cur & JBIT(B)) && !(prev & JBIT(B)) && !(cur & FACE & ~JBIT(B))) clean |= JBIT(B);
+		if (cur & FACE & ~JBIT(A)) clean &= ~JBIT(A);
+		if (cur & FACE & ~JBIT(B)) clean &= ~JBIT(B);
+		if (!(cur & JBIT(A)) && (prev & JBIT(A)) && (clean & JBIT(A))) { key = PK_A; clean &= ~JBIT(A); }
+		if (!(cur & JBIT(B)) && (prev & JBIT(B)) && (clean & JBIT(B))) { key = PK_B; clean &= ~JBIT(B); }
+		prev = cur;
+		if (key < 0) continue;
+		act = pm_key(m, key);
+		if (act == PA_RESUME) break;
+		if (act == PA_QUIT) { ret = 1; goto out; }
+		if (act == PA_SAVE) pm_do_save(m);
+		else if (act == PA_LOAD) pm_do_load(m);
+		pm_show(m);
+	}
+	/* resume: screen back, audio restarted, then wait (briefly) for the keys to be let go so the
+	 * game does not see the press that closed the menu */
+	video_repaint();
+	audio_resume(&A);
+	for (i = 0; i < 20; i++) {
+		input_wait(&IN, 25);
+		poll_inputs(now_ns());
+		if (!input_mask(&IN)) break;
+	}
+	input_tap(&IN, HOLD_NS);
+out:
+	if (m->slot != slot0) st_slot_write(g_statedir, g_base, m->slot);
+	return ret;
+}
+
 /* ------------------------------------------------------------------ main */
 
 /* frames of audio kept in hand beyond the expected core + blit time before a blit is
@@ -741,6 +955,7 @@ static void usage(void)
 	fputs("usage: olpc-run [options] <gb|gbc|nes|core.so> <rom|rom.zip>\n"
 	      "  --core NAME|PATH   override the core (e.g. --core fceumm)\n"
 	      "  --savedir DIR      battery saves (default: <rom dir>/../saves)\n"
+		      "  --statedir DIR     save states (default: <rom dir>/../states)\n"
 	      "  --stats FILE       write statistics here at exit (never while playing: it is on the stick)\n"
 	      "  --stats-live FILE  also write them here every 10 s (for tmpfs, so a killed run leaves something)\n"
 	      "  --frames N         exit after N frames\n"
@@ -800,6 +1015,8 @@ int main(int argc, char **argv)
 		const char *v;
 		if ((v = OPTV("--core"))) o_core = v;
 		else if ((v = OPTV("--savedir"))) o_savedir = v;
+		else if ((v = OPTV("--statedir"))) o_statedir = v;
+		else if ((v = OPTV("--test-keys"))) o_keys = v;
 		else if ((v = OPTV("--sysdir"))) o_sysdir = v;
 		else if ((v = OPTV("--stats"))) o_stats = v;
 		else if ((v = OPTV("--stats-live"))) o_stats_live = v;
@@ -898,6 +1115,9 @@ int main(int argc, char **argv)
 	SYM(set_environment); SYM(set_video_refresh); SYM(set_audio_sample); SYM(set_audio_sample_batch);
 	SYM(set_input_poll); SYM(set_input_state); SYM(init); SYM(run); SYM(unload_game); SYM(deinit);
 	SYM(get_system_info); SYM(get_system_av_info); SYM(load_game);
+	*(void **)&g_cs.size = dlsym(h, "retro_serialize_size");
+	*(void **)&g_cs.ser = dlsym(h, "retro_serialize");
+	*(void **)&g_cs.unser = dlsym(h, "retro_unserialize");
 
 	/* save directory: sibling of the ROM directory unless given */
 	rp = realpath(romarg, NULL);
@@ -906,13 +1126,10 @@ int main(int argc, char **argv)
 	snprintf(base, sizeof base, "%s", basename(tmp));
 	{ char *dot = strrchr(base, '.'); if (dot && dot != base) *dot = 0; }
 	if (o_savedir) snprintf(savedir, sizeof savedir, "%s", o_savedir);
-	else {
-		char d1[PATH_MAX], d2[PATH_MAX];
-		snprintf(d1, sizeof d1, "%s", tmp);
-		snprintf(d2, sizeof d2, "%s", dirname(d1));
-		snprintf(d1, sizeof d1, "%s", d2);
-		snprintf(savedir, sizeof savedir, "%s/saves", dirname(d1));
-	}
+	else sibling_dir(savedir, sizeof savedir, tmp, "saves");
+	if (o_statedir) snprintf(g_statedir, sizeof g_statedir, "%s", o_statedir);
+	else sibling_dir(g_statedir, sizeof g_statedir, tmp, "states");
+	snprintf(g_base, sizeof g_base, "%s", base);
 	g_savedir_env = savedir;
 
 	set_environment(env_cb);
@@ -947,6 +1164,7 @@ int main(int argc, char **argv)
 	A.no_query = o_nofill;
 	if (o_xrun_debug >= 0) g_xrun_debug_ok = audio_xrun_debug(&A, (unsigned)o_xrun_debug) == 0;
 	input_init(&IN, o_inputdir, o_chord);
+	if (o_keys) script_init(o_keys);
 	ovl_init(&OV);
 	OV.status_path = o_status; OV.wifi_path = o_wifist; OV.wireless_path = o_wireless; OV.period = o_ovl_period;
 	if (!g_video_null && o_overlay) {
@@ -995,8 +1213,14 @@ int main(int argc, char **argv)
 		}
 		if (o_frames && st_frames >= o_frames) { reason = "frames"; break; }
 		t0 = now_ns();
-		input_poll(&IN, t0);
-		if (input_exit(&IN, t0, 1000000000ull)) { reason = "exit-button"; break; }
+		poll_inputs(t0);
+		if (input_exit(&IN, t0, HOLD_NS)) { reason = "exit-button"; break; }
+		if (input_tap(&IN, HOLD_NS)) {
+			int r = pause_menu();
+			if (r) { reason = r == 1 ? "menu-quit" : "exit-button"; break; }
+			prev_t0 = 0;                                      /* the paused time is not a frame time */
+			continue;
+		}
 
 		/* behind schedule when the audio buffer will not outlast core + blit: skip the blit */
 		g_skip_now = 0;

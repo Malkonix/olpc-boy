@@ -12,6 +12,8 @@
 #include "diag.h"
 #include "saver.h"
 #include "overlay.h"
+#include "state.h"
+#include "pause.h"
 #include <sys/stat.h>
 #include <time.h>
 
@@ -863,6 +865,170 @@ static void overlay_tests(void)
 	printf("overlay: done\n");
 }
 
+/* ------------------------------------------------------------------ pause menu, states */
+
+static void tap_tests(void)
+{
+	int q[2];
+	struct input in;
+	struct input_event e;
+	const uint64_t H = 1000000000ull;
+
+	CHECK(pipe(q) == 0, "pipe");
+	fcntl(q[0], F_SETFL, O_NONBLOCK);
+	memset(&in, 0, sizeof in);
+	in.ino = -1; in.rescan = -1; in.chord_fd = -1; in.ndev = 1;
+	in.dev[0].fd = q[0]; in.dev[0].cls = IN_BUILTIN;
+	e = ev(EV_KEY, 153, 1); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 1 * H);
+	CHECK(!input_tap(&in, H), "tap: nothing before the release");
+	e = ev(EV_KEY, 153, 0); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 1 * H + H / 4);
+	CHECK(input_tap(&in, H), "rotate 0.25 s: tap");
+	CHECK(!input_tap(&in, H), "tap is reported once");
+	e = ev(EV_KEY, 153, 1); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 5 * H);
+	CHECK(!input_exit(&in, 5 * H, H), "exit is not reported at the very instant of the press (even timestamp)");
+	CHECK(input_exit(&in, 6 * H + 1, H), "held 1 s: exit");
+	e = ev(EV_KEY, 153, 0); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 6 * H + 1);
+	CHECK(!input_tap(&in, H), "rotate held 1 s is not a tap");
+	close(q[0]); close(q[1]);
+	/* pad Select+Start */
+	CHECK(pipe(q) == 0, "pipe");
+	fcntl(q[0], F_SETFL, O_NONBLOCK);
+	memset(&in, 0, sizeof in);
+	in.ino = -1; in.rescan = -1; in.chord_fd = -1; in.ndev = 1;
+	in.dev[0].fd = q[0]; in.dev[0].cls = IN_PAD;
+	e = ev(EV_KEY, 0x13a, 1); if (write(q[1], &e, sizeof e) < 0) {}
+	e = ev(EV_KEY, 0x13b, 1); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 1 * H);
+	e = ev(EV_KEY, 0x13b, 0); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 1 * H + H / 5);
+	CHECK(input_tap(&in, H), "pad select+start 0.2 s: tap");
+	/* Select alone (volume/brightness chords) never taps */
+	e = ev(EV_KEY, 0x13b, 0); if (write(q[1], &e, sizeof e) < 0) {}
+	e = ev(EV_KEY, 0x13a, 0); if (write(q[1], &e, sizeof e) < 0) {}
+	input_poll(&in, 3 * H);
+	CHECK(!input_tap(&in, H), "select alone: no tap");
+	close(q[0]); close(q[1]);
+}
+
+static void pm_tests(void)
+{
+	static struct pmenu m;
+	int i, white = 0, black = 0;
+
+	pm_init(&m, 2, 1, 1);
+	CHECK(m.cur == PM_RESUME && m.slot == 2, "pm: opens on Resume with the stored slot");
+	CHECK(pm_key(&m, PK_A) == PA_RESUME, "pm: A on Resume");
+	CHECK(pm_key(&m, PK_DOWN) == PA_REDRAW && m.cur == PM_SAVE && pm_key(&m, PK_A) == PA_SAVE, "pm: Save");
+	pm_key(&m, PK_DOWN); CHECK(pm_key(&m, PK_A) == PA_LOAD, "pm: Load");
+	pm_key(&m, PK_DOWN); CHECK(m.cur == PM_SLOT && pm_key(&m, PK_A) == PA_NONE, "pm: A on Slot does nothing");
+	pm_key(&m, PK_DOWN); CHECK(pm_key(&m, PK_A) == PA_QUIT, "pm: Quit");
+	pm_key(&m, PK_DOWN); CHECK(m.cur == PM_RESUME, "pm: cursor wraps down");
+	pm_key(&m, PK_UP); CHECK(m.cur == PM_QUIT, "pm: cursor wraps up");
+	CHECK(pm_key(&m, PK_B) == PA_RESUME, "pm: B resumes from any row");
+	m.slot = 4; pm_key(&m, PK_RIGHT); CHECK(m.slot == 1, "pm: slot wraps 4 -> 1");
+	pm_key(&m, PK_LEFT); CHECK(m.slot == ST_SLOTS, "pm: slot wraps 1 -> 4");
+	pm_msg(&m, "Saved to slot %d", 3); CHECK(!strcmp(m.msg, "Saved to slot 3"), "pm: message");
+	pm_init(&m, 1, 0, 0);
+	CHECK(!strcmp(m.msg, "Save states not supported"), "pm: unsupported core message");
+	/* black on white: only the two colours, mostly white inside, the cursor row inverted */
+	pm_init(&m, 1, 1, 0);
+	m.when[1] = 1700000000;
+	pm_draw(&m);
+	for (i = 0; i < PM_W * PM_H; i++) { if (m.px[i] == 0xffff) white++; else if (m.px[i] == 0) black++; }
+	CHECK(white + black == PM_W * PM_H, "pm: only black and white pixels");
+	CHECK(white > PM_W * PM_H / 2 && black > PM_W * PM_H / 20, "pm: white %d black %d", white, black);
+	CHECK(m.px[0] == 0 && m.px[(size_t)(PM_H / 2) * PM_W + PM_W / 2] != 0x1234, "pm: black frame");
+}
+
+static uint8_t g_fake_state[64];
+static size_t fake_size(void) { return sizeof g_fake_state; }
+static bool fake_ser(void *b, size_t n) { memcpy(b, g_fake_state, n); return true; }
+static bool fake_unser(const void *b, size_t n) { memcpy(g_fake_state, b, n); return true; }
+static size_t zero_size(void) { return 0; }
+
+static void state_tests(void)
+{
+	struct core_ser c = { fake_size, fake_ser, fake_unser }, nos = { zero_size, fake_ser, fake_unser };
+	char dir[] = "/tmp/olpc-st-XXXXXX", sd[200], p[256], q[256];
+	uint8_t before[64];
+	size_t n;
+	char *d;
+	int i;
+	time_t t;
+
+	CHECK(mkdtemp(dir) != NULL, "mkdtemp");
+	snprintf(sd, sizeof sd, "%s/states", dir);
+	st_path(p, sizeof p, sd, "Game", 3);
+	CHECK(!strcmp(p, "/tmp/olpc-st-XXXXXX/states/Game.st3") || strstr(p, "/states/Game.st3"), "st_path %s", p);
+	CHECK(st_stamp(p) == (time_t)-1, "no file: stamp -1");
+	CHECK(st_load(&c, p) == ST_EMPTY, "load of a missing slot");
+	for (i = 0; i < 64; i++) g_fake_state[i] = (uint8_t)(i * 7 + 1);
+	memcpy(before, g_fake_state, 64);
+	CHECK(st_save(&c, sd, p) == ST_OK, "save creates the directory and the file");
+	t = st_stamp(p);
+	CHECK(t != (time_t)-1 && time(NULL) - t < 5, "stamp is recent");
+	d = slurp(p, &n);
+	CHECK(d && n == 64 && !memcmp(d, before, 64), "file holds the serialized state");
+	free(d);
+	CHECK(!has_tmp(sd), "no temp file left behind");
+	memset(g_fake_state, 0, 64);
+	CHECK(st_load(&c, p) == ST_OK && !memcmp(g_fake_state, before, 64), "round trip");
+	/* a failed save leaves the old file alone and no temp file */
+	snprintf(q, sizeof q, "%s/nodir/x.st1", sd);
+	CHECK(st_save(&c, sd, q) == ST_IO, "save into a missing directory fails");
+	CHECK(st_stamp(p) == t && !has_tmp(sd), "failed save: nothing changed");
+	/* size validation */
+	{
+		FILE *f = fopen(p, "wb"); fwrite(before, 1, 63, f); fclose(f);
+		CHECK(st_load(&c, p) == ST_BADSIZE, "short file refused");
+		f = fopen(p, "wb"); fwrite(before, 1, 64, f); fwrite("x", 1, 1, f); fclose(f);
+		CHECK(st_load(&c, p) == ST_BADSIZE, "long file refused");
+	}
+	CHECK(st_save(&nos, sd, p) == ST_UNSUPPORTED && st_load(&nos, p) == ST_UNSUPPORTED, "core without serialization");
+	/* slot memory */
+	CHECK(st_slot_read(sd, "Game") == 1, "default slot 1");
+	st_slot_write(sd, "Game", 3);
+	CHECK(st_slot_read(sd, "Game") == 3 && st_slot_read(sd, "Other") == 1, "slot remembered per game");
+	{
+		char sp[256]; FILE *f;
+		snprintf(sp, sizeof sp, "%s/Game.slot", sd);
+		f = fopen(sp, "w"); fputs("9\n", f); fclose(f);
+		CHECK(st_slot_read(sd, "Game") == 1, "out-of-range slot file ignored");
+	}
+	{
+		char w[40];
+		st_when(w, sizeof w, 1700000000, 1);
+		CHECK(strlen(w) > 8 && strstr(w, "Nov"), "st_when: %s", w);
+	}
+	snprintf(p, sizeof p, "rm -rf %s", dir);
+	if (system(p)) {}
+}
+
+static void pause_audio_tests(void)
+{
+	struct audio a;
+	volatile int quit = 0;
+
+	memset(&a, 0, sizeof a);
+	audio_open(&a, 32768, "/nonexistent/pcm", 0, 4.0, 45.0, 0, &quit);
+	CHECK(a.mode == AUD_CLOCK, "clock mode without a card");
+	{
+		int16_t f[2] = { 100, 100 };
+		audio_push(&a, f, 1);
+		a.written = 5000; a.pace_next = 77;
+		audio_pause(&a);
+		CHECK(a.qn == 0, "pause drops the queue");
+		usleep(20000);
+		audio_resume(&a);
+		CHECK(a.written == 0 && a.pace_next == 0 && mono_ms() - a.t0 / 1000000ull < 10, "resume restarts the virtual stream");
+	}
+	audio_close(&a);
+}
+
 int main(void)
 {
 	audio_tests();
@@ -873,6 +1039,10 @@ int main(void)
 	chord_tests();
 	saver_tests();
 	overlay_tests();
+	tap_tests();
+	pm_tests();
+	state_tests();
+	pause_audio_tests();
 	printf("%d checks, %d failures\n%s\n", g_checks, g_fail, g_fail ? "FAILED" : "ALL OK");
 	return g_fail ? 1 : 0;
 }
