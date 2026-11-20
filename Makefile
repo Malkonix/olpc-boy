@@ -22,7 +22,7 @@ INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
 ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
 
-.PHONY: olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: backup-test backup-rootfs backup-check backup-image qemu-backup olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -67,7 +67,7 @@ logs:
 
 # out/ holds root-owned files from the container, so delete from inside it.
 clean:
-	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
+	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/olpc-boy-nandbackup.img out/backup-rootfs.tar out/backup-work out/backup-work.test.log out/qemu-backup-* out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
 
 distclean:
 	$(RUN_ROOT) sh -c 'rm -rf out/* out/.*.stamp'
@@ -91,3 +91,31 @@ olpc-splash-test:
 # Host tests of src/olpc-menu (unit checks, scripted UI against a fake framebuffer, stub launch).
 olpc-menu-test:
 	$(RUN_USER) sh src/olpc-menu/test.sh
+
+# ---- NAND backup image (separate, read-only; the normal image is unaffected) ----------------
+# make backup-image  ->  out/olpc-boy-nandbackup.img  (boot stick; dumps go to a second stick, FAT label OLPCNAND)
+BACKUP_SRC   := $(shell find backup -type f 2>/dev/null) scripts/mkbackup.sh rootfs/overlay/usr/libexec/olpcboy/common.sh $(shell find src/olpc-splash src/common -type f 2>/dev/null)
+
+backup-rootfs: out/backup-rootfs.tar
+backup-check:  out/.backup-check.stamp
+backup-image:  out/olpc-boy-nandbackup.img
+
+out/backup-rootfs.tar: out/kernel/bzImage $(BACKUP_SRC)
+	$(RUN_ROOT) bash scripts/mkbackup.sh
+	@touch $@
+
+out/.backup-check.stamp: out/backup-rootfs.tar scripts/check-sse.sh
+	$(RUN_USER) bash scripts/check-sse.sh out/backup-rootfs.tar
+	@touch $@
+
+out/olpc-boy-nandbackup.img: out/kernel/bzImage out/backup-rootfs.tar out/.backup-check.stamp backup/olpc.fth scripts/mkimage.sh
+	$(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) -e IMG_OUT=out/olpc-boy-nandbackup.img \
+	  -e ROOTFS_TAR=out/backup-rootfs.tar -e FTH=backup/olpc.fth -e NO_USERDATA=1 -e FREE_MIB=8 \
+	  $(BUILDER) bash scripts/mkimage.sh
+
+qemu-backup: out/olpc-boy-nandbackup.img
+	bash scripts/qemu-backup-test.sh
+
+# Logic tests of the backup script against a fake MTD (needs zstd in the builder: apk add zstd).
+backup-test:
+	$(RUN_ROOT) sh -c 'apk add --no-cache zstd >/dev/null 2>&1; sh backup/test.sh'

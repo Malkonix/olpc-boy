@@ -13,6 +13,8 @@
 # Output : out/olpc-boy.img     (chown'ed to $HOST_UID:$HOST_GID)
 # Env    : HOST_UID HOST_GID  IMG_OUT KERNEL_IMG ROOTFS_TAR (override paths, for tests)
 #            FREE_MIB (default 200)  FAT_MIB (default 256)
+#            FTH (default boot/olpc.fth)  NO_USERDATA=1 (no WIFI.CFG, no roms/)
+#            IMG_BYTES: total image size; the FAT partition then takes everything the ext4 root leaves
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,7 +22,7 @@ OUT=out
 IMG=${IMG_OUT:-$OUT/olpc-boy.img}
 KERNEL=${KERNEL_IMG:-$OUT/kernel/bzImage}
 ROOTFS=${ROOTFS_TAR:-$OUT/rootfs.tar}
-FTH=boot/olpc.fth
+FTH=${FTH:-boot/olpc.fth}
 FAT_MIB=${FAT_MIB:-256}
 FREE_MIB=${FREE_MIB:-200}
 ALIGN_SECT=2048                     # 1 MiB in 512-byte sectors
@@ -39,20 +41,35 @@ WORK=$(mktemp -d /tmp/mkimage.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 export MTOOLS_SKIP_CHECK=1
 
+# ---- 0. root tree + size (before the FAT partition: IMG_BYTES sizes the FAT from it) --------
+echo "mkimage: extracting $ROOTFS"
+TREE=$WORK/tree
+mkdir -p "$TREE"
+tar -xpf "$ROOTFS" -C "$TREE" --numeric-owner
+USED_KIB=$(du -sk "$TREE" | cut -f1)
+# content + 12% for metadata/rounding + requested free space
+EXT_MIB=$(( (USED_KIB * 112 / 100 + 1023) / 1024 + FREE_MIB ))
+echo "mkimage: rootfs content ${USED_KIB} KiB -> ext4 of ${EXT_MIB} MiB"
+if [ -n "${IMG_BYTES:-}" ]; then
+    FAT_MIB=$(( IMG_BYTES / 1048576 - 2 - EXT_MIB ))
+    [ "$FAT_MIB" -ge 256 ] || die "IMG_BYTES=$IMG_BYTES leaves only ${FAT_MIB} MiB for the FAT partition"
+fi
+
 # ---- 1. FAT32 log/boot partition ------------------------------------------------
 echo "mkimage: building FAT32 OLPCLOG (${FAT_MIB} MiB)"
 FAT=$WORK/fat.img
 truncate -s "${FAT_MIB}M" "$FAT"
 # 2 KiB clusters keep the cluster count well above the FAT32 minimum (65525).
 mkfs.vfat -F 32 -s 4 -n OLPCLOG "$FAT" >/dev/null
-mmd   -i "$FAT" ::boot ::logs ::roms
+mmd   -i "$FAT" ::boot ::logs
+[ -n "${NO_USERDATA:-}" ] || mmd -i "$FAT" ::roms
 # Upper-case 8.3 names: Open Firmware's FAT reader sees short names only
 # (it upper-cases lookups, so "\boot\bzImage" matches BZIMAGE).
 mcopy -i "$FAT" "$FTH"    ::boot/OLPC.FTH
 mcopy -i "$FAT" "$KERNEL" ::boot/BZIMAGE
 # Optional WiFi credentials (git-ignored, repo root): the device reads WIFI.CFG from the
 # FAT root; it can also be edited from any PC.  Never echo its contents.
-if [ -f wifi.cfg ]; then
+if [ -z "${NO_USERDATA:-}" ] && [ -f wifi.cfg ]; then
     mcopy -i "$FAT" wifi.cfg ::WIFI.CFG
     echo "mkimage: wifi.cfg -> ::WIFI.CFG"
 fi
@@ -61,6 +78,7 @@ fi
 # FAT partition with their long names (VFAT LFN; only the files the firmware reads need 8.3 names).
 ROMS_COPIED=0
 for sysd in GB GBC NES; do
+    [ -z "${NO_USERDATA:-}" ] || break
     [ -d "ROMs/$sysd" ] || continue
     low=$(echo "$sysd" | tr 'A-Z' 'a-z')
     LIST=$WORK/roms-$low.list
@@ -92,14 +110,6 @@ if [ "$ROMS_COPIED" = 1 ]; then
 fi
 
 # ---- 2. ext4 root partition -----------------------------------------------------
-echo "mkimage: extracting $ROOTFS"
-TREE=$WORK/tree
-mkdir -p "$TREE"
-tar -xpf "$ROOTFS" -C "$TREE" --numeric-owner
-USED_KIB=$(du -sk "$TREE" | cut -f1)
-# content + 12% for metadata/rounding + requested free space
-EXT_MIB=$(( (USED_KIB * 112 / 100 + 1023) / 1024 + FREE_MIB ))
-echo "mkimage: rootfs content ${USED_KIB} KiB -> ext4 of ${EXT_MIB} MiB"
 EXT=$WORK/root.img
 truncate -s "${EXT_MIB}M" "$EXT"
 # -m 1: small reserved-blocks share (this is a tiny single-purpose system).
@@ -121,14 +131,14 @@ unit: sectors
 start=$P1_START, size=$P1_SECT, type=c, bootable
 start=$P2_START, size=$P2_SECT, type=83
 EOF
-dd if="$FAT" of="$IMG" bs=1M seek=$(( P1_START / 2048 )) conv=notrunc status=none
+dd if="$FAT" of="$IMG" bs=1M seek=$(( P1_START / 2048 )) conv=notrunc,sparse status=none
 dd if="$EXT" of="$IMG" bs=1M seek=$(( P2_START / 2048 )) conv=notrunc status=none
 rm -f "$FAT" "$EXT"; rm -rf "$TREE"
 
 # ---- 4. Verification (extract the partitions back out of the image) -------------
 echo "mkimage: ---- verification ----"
 sfdisk -l "$IMG"
-dd if="$IMG" of="$WORK/p1.img" bs=1M skip=$(( P1_START / 2048 )) count=$FAT_MIB status=none
+dd if="$IMG" of="$WORK/p1.img" bs=1M skip=$(( P1_START / 2048 )) count=$FAT_MIB conv=sparse status=none
 dd if="$IMG" of="$WORK/p2.img" bs=1M skip=$(( P2_START / 2048 )) count=$EXT_MIB status=none
 echo "--- mdir ::boot"
 mdir -i "$WORK/p1.img" ::boot

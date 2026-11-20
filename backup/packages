@@ -1,0 +1,8 @@
+# NAND backup rootfs package list (Alpine 3.18, x86).  Deliberately tiny.
+# busybox itself, musl and baselayout come with alpine-baselayout/busybox.
+busybox
+alpine-baselayout
+# modprobe/depmod for the explicit, read-only load of cafe_nand
+kmod
+# only /usr/sbin/nanddump is kept (mkbackup.sh deletes every other file of this package)
+mtd-utils-nand

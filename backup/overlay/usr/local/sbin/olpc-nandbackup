@@ -1,0 +1,516 @@
+#!/bin/sh
+# olpc-nandbackup -- the NAND backup flow of the backup image (runs from inittab, once, as root).
+#
+# READ-ONLY by construction: the NAND is exposed as a single MTD partition forced read-only
+# by the kernel command line (mtdparts=cafe_nand:-(nand)ro), the driver never writes its
+# bad block table (allow_bbt_write=0), and the only tool that touches /dev/mtd0 is nanddump
+# (no nandwrite/flash_erase/flashcp/mtd_debug exist in this image).  Nothing is mounted from it.
+# Devices written: the vfat volume labelled OLPCNAND (the backup stick) and the boot stick's
+# log partition.  Nothing is ever formatted.
+#
+#   1. wait (15 min) for a FAT volume labelled OLPCNAND, mount it, check free space
+#   2. load cafe_nand, refuse unless the MTD is read-only and has the expected geometry
+#   3. raw dump (data+OOB, no ECC, every block), SHA-256 of the stream
+#   4. second full raw read (hash only), compare; mismatch -> third read
+#   5. ECC-corrected data dump (every block), SHA-256
+#   6. NANDCOPY.DAT: the data dump compacted the way Open Firmware's save-nand does, i.e. a
+#      valid input for  nd-copy-nand  (see nbcompact.c)
+#   7. read the stored files back, MANIFEST.txt, SHA256SUMS, STREAMS.sha256, umount
+# Dumps go to OLPCNAND:/nandbackup-NNN/ (never overwritten), logs to the boot stick.
+#
+# Env overrides exist for the test harness (backup/test.sh); NB_TEST=1 also unlocks NB_SIZE & co.
+. "${OLPC_COMMON:-/usr/libexec/olpcboy/common.sh}"
+
+MTD=${NB_MTD:-/dev/mtd0}
+SYS=${NB_SYS:-/sys/class/mtd/mtd0}
+ND=${NB_NANDDUMP:-/usr/sbin/nanddump}
+NBHASH=${NB_NBHASH:-/usr/local/sbin/nbhash}
+NBCOMPACT=${NB_NBCOMPACT:-/usr/local/sbin/nbcompact}
+NBCMP=${NB_NBCMP:-/usr/local/sbin/nbcmp}
+SPLASH=${NB_SPLASH:-/usr/local/sbin/olpc-splash}
+RUN=${NB_RUN:-/run/olpcboy/nb}
+TTY=${NB_TTY:-/dev/tty1}
+CMDLINE=${NB_CMDLINE:-/proc/cmdline}
+MODSYS=${NB_MODSYS:-/sys/module/cafe_nand}
+LABEL=OLPCNAND
+DMNT=${NB_DEST_MNT:-/run/olpcboy/nbdest}
+BLKIDS=${NB_BLKIDS:-olpc_blkid}          # prints blkid lines of the candidate block devices
+MOUNT=${NB_MOUNT:-mount}
+UMOUNT=${NB_UMOUNT:-umount}
+WAIT_ITER=${NB_WAIT_ITER:-450}           # x 2 s = 15 min
+LOG=$BOOTDIR/nandbackup.log
+OUTD=$BOOTDIR/nandbackup
+
+# expected NAND geometry of the XO-1 (CaFe + 1 GiB SLC); only the tests may change it
+SIZE=1073741824 ERASE=131072 WRITE=2048 OOB=64
+if [ -n "$NB_TEST" ]; then
+	SIZE=${NB_SIZE:-$SIZE} ERASE=${NB_ERASE:-$ERASE} WRITE=${NB_WRITE:-$WRITE} OOB=${NB_OOB:-$OOB}
+fi
+RAW_BYTES=$(( SIZE / WRITE * (WRITE + OOB) ))
+MARGIN=$(( 16 * 1048576 ))
+RAWF=nand-raw-oob.bin
+DATF=nand-data-ecc.bin
+CPYF=NANDCOPY.DAT          # 8.3 name: Open Firmware reads short names only
+
+mkdir -p "$RUN" "$OUTD" 2>/dev/null
+: >"$LOG"
+
+up() { read -r _u _ <"${NB_UPTIME:-/proc/uptime}"; echo "${_u%.*}"; }
+T0=$(up)
+say() { echo "[nandbackup] $*"; echo "$(up) $*" >>"$LOG"; tl "nandbackup: $*"; }
+prog() { [ -x "$SPLASH" ] && "$SPLASH" progress "$1" "$2" 2>/dev/null; }
+mib() { echo $(( $1 / 1048576 )); }
+need_for() { echo $(( $1 + $1 / 100 + MARGIN )); }
+
+# free bytes of the filesystem holding $1 (tests: NB_FREE forces a value)
+free_bytes() {
+	[ -n "$NB_TEST" ] && [ -n "$NB_FREE" ] && { echo "$NB_FREE"; return; }
+	df -P -k "$1" 2>/dev/null | awk 'NR==2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+# ---- screens ----------------------------------------------------------------------------
+screen() {   # screen HEADLINE [line...]
+	_h=$1; shift
+	[ -x "$SPLASH" ] && "$SPLASH" text 2>/dev/null
+	{
+		printf '\033[2J\033[H\n\n'
+		printf '  ########################################################\n'
+		printf '  #                                                      #\n'
+		printf '  #   %-48s   #\n' "$_h"
+		printf '  #                                                      #\n'
+		printf '  ########################################################\n\n'
+		for _l in "$@"; do printf '  %s\n' "$_l"; done
+	} >"$TTY" 2>/dev/null
+	{ echo "== $_h"; for _l in "$@"; do echo "   $_l"; done; } >>"$LOG"
+	cp "$LOG" "$OUTD/final-screen.txt" 2>/dev/null
+}
+
+stop_monitor() {
+	if [ -n "$MON" ]; then kill "$MON" 2>/dev/null; wait "$MON" 2>/dev/null; MON=""; fi
+}
+
+fail() {
+	stop_monitor
+	say "FAILED: $*"
+	sync
+	# leave the backup stick unmounted if it was mounted (best effort; data is synced)
+	[ -z "$NB_DEST_DIR" ] && grep -q " $DMNT " /proc/mounts 2>/dev/null && $UMOUNT "$DMNT" 2>/dev/null
+	screen "BACKUP FAILED: $1" "$2" "$3" "Details: $LOG" "(power off by holding the power button)"
+	FINAL_RC=1
+	finish
+}
+
+finish() {
+	sync
+	if [ "$FINAL_RC" = 0 ] && [ -z "$NB_NOPOWEROFF" ]; then
+		olpc_sleep 60
+		sync
+		poweroff
+		olpc_sleep 20
+		poweroff -f
+	fi
+	[ -n "$NB_NOIDLE" ] && exit "$FINAL_RC"
+	[ "$FINAL_RC" = 0 ] && exit 0
+	while :; do olpc_sleep 30; done
+}
+
+# ---- progress monitor: reads the byte counter nbhash keeps -----------------------------
+# start_monitor TAG LABEL BASE SPAN EXPECT
+start_monitor() {
+	( _e=$(( $5 / 1048576 )); [ "$_e" -ge 1 ] || _e=1
+	  while :; do
+		_c=0; [ -r "$RUN/$1.cnt" ] && read -r _c <"$RUN/$1.cnt"
+		_c=$(( ${_c:-0} / 1048576 ))
+		[ "$_c" -gt "$_e" ] && _c=$_e
+		prog $(( $3 + $4 * _c / _e )) "$2: $_c of $_e MiB"
+		olpc_sleep 3
+	  done ) &
+	MON=$!
+}
+
+# ---- one streaming pass over the NAND ---------------------------------------------------
+# run_read TAG DEST|- LABEL BASE SPAN EXPECT -- nanddump args
+# Leaves $RUN/TAG.sha ("HEX BYTES") and returns 0 only if every stage succeeded and the
+# byte count is EXPECT.  DEST is the output file, or - to only hash.
+run_read() {
+	_t=$1 _d=$2 _lb=$3 _b=$4 _s=$5 _x=$6; shift 7
+	rm -f "$RUN/$_t".*
+	: >"$RUN/$_t.cnt"
+	_bo=""; [ -n "$RR_BLK" ] && _bo="-B $RR_BLK -L $RUN/$_t.blk"     # optional per-block hash list
+	start_monitor "$_t" "$_lb" "$_b" "$_s" "$_x"
+	if [ "$_d" = - ]; then
+		{ "$ND" "$@" "$MTD" 2>"$RUN/$_t.err"; echo $? >"$RUN/$_t.nd"; } \
+			| { "$NBHASH" -n $_bo -c "$RUN/$_t.cnt" -o "$RUN/$_t.sha"; echo $? >"$RUN/$_t.hs"; }
+	else
+		{ "$ND" "$@" "$MTD" 2>"$RUN/$_t.err"; echo $? >"$RUN/$_t.nd"; } \
+			| { "$NBHASH" $_bo -c "$RUN/$_t.cnt" -o "$RUN/$_t.sha" >"$_d"; echo $? >"$RUN/$_t.hs"; }
+	fi
+	stop_monitor
+	_ok=1
+	for _k in nd hs; do
+		_v=x; read -r _v <"$RUN/$_t.$_k" 2>/dev/null
+		[ "$_v" = 0 ] || { say "$_t: stage $_k failed (rc=${_v})"; _ok=0; }
+	done
+	_sha=""; _n=0; read -r _sha _n <"$RUN/$_t.sha" 2>/dev/null
+	if [ "$_n" != "$_x" ]; then
+		say "$_t: got ${_n:-0} bytes, expected $_x"; _ok=0
+	fi
+	[ -n "$_sha" ] || _ok=0
+	head -n 200 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	[ "$_ok" = 1 ] && return 0
+	[ "$_d" != - ] && rm -f "$_d"       # never leave a half-written dump looking complete
+	return 1
+}
+
+# run_cmp TAG FILE LABEL BASE SPAN EXPECT BLK -- nanddump args
+# One more pass over the NAND, compared with the stored FILE.  Returns 0 if the pass itself
+# completed (EXPECT bytes read); the differences are left in CMP_B CMP_BITS CMP_BLK.
+run_cmp() {
+	_t=$1 _f=$2 _lb=$3 _b=$4 _s=$5 _x=$6 _bs=$7; shift 8
+	rm -f "$RUN/$_t".*
+	: >"$RUN/$_t.cnt"
+	start_monitor "$_t" "$_lb" "$_b" "$_s" "$_x"
+	{ "$ND" "$@" "$MTD" 2>"$RUN/$_t.err"; echo $? >"$RUN/$_t.nd"; } \
+		| { "$NBCMP" -b "$_bs" -c "$RUN/$_t.cnt" -o "$RUN/$_t.res" "$_f"; echo $? >"$RUN/$_t.hs"; }
+	stop_monitor
+	head -n 200 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	_ok=1
+	for _k in nd hs; do
+		_v=x; read -r _v <"$RUN/$_t.$_k" 2>/dev/null
+		[ "$_v" = 0 ] || { say "$_t: stage $_k failed (rc=${_v})"; _ok=0; }
+	done
+	CMP_B=0; CMP_BITS=0; CMP_BLK=0; _sn=0; _fn=0
+	read -r CMP_B CMP_BITS CMP_BLK _sn _fn <"$RUN/$_t.res" 2>/dev/null || _ok=0
+	[ "$_sn" = "$_x" ] || { say "$_t: got ${_sn:-0} bytes, expected $_x"; _ok=0; }
+	[ "$_ok" = 1 ]
+}
+
+ecc_counts() {   # ecc_counts TAG -> "UNCORR_PAGES UNCORR_BITS CORR_PAGES CORR_BITS"
+	awk '/uncorrectable bitflip/ { up++; ub += $2 }
+	     /corrected bitflip/ { cp++; cb += $2 }
+	     END { printf "%d %d %d %d\n", up, ub, cp, cb }' "$RUN/$1.err" 2>/dev/null
+}
+
+sys_attr() { read -r _a <"$SYS/$1" 2>/dev/null && echo "$_a" || echo "?"; }
+
+# ---- 0. start ---------------------------------------------------------------------------
+FINAL_RC=0
+MON=""
+say "start: nand backup, geometry expected $SIZE/$ERASE/$WRITE/$OOB, raw stream $RAW_BYTES bytes"
+prog 2 "Preparing"
+[ -w "$BOOTDIR" ] || fail "boot stick not writable" "$BOOTDIR cannot be written."
+
+# ---- 1. the backup stick: wait for FAT label OLPCNAND, mount, space ----------------------
+NEED_RAW=$(need_for "$RAW_BYTES")
+NEED_DAT=$(need_for "$SIZE")
+NEED_CPY=$(need_for "$SIZE")
+BOTH=$(( NEED_RAW + NEED_DAT ))
+DESTDEV=""
+find_dest() {   # sets DESTDEV to the device of a vfat volume labelled OLPCNAND
+	DESTDEV=""
+	$BLKIDS 2>/dev/null | while IFS= read -r _line; do
+		case $_line in
+		*" LABEL=\"$LABEL\""*" TYPE=\"vfat\""*|*" TYPE=\"vfat\""*" LABEL=\"$LABEL\""*) echo "${_line%%:*}"; break ;;
+		esac
+	done >"$RUN/dest.dev"
+	read -r DESTDEV <"$RUN/dest.dev" 2>/dev/null
+	[ -n "$DESTDEV" ]
+}
+wait_screen() {
+	screen "INSERT THE BACKUP STICK NOW" \
+		"Plug the 4 GB USB stick labelled $LABEL into the XO-1." \
+		"Waiting for it ($(( ($WAIT_ITER - $1) * 2 / 60 )) minutes left)..." \
+		"The NAND is not touched until the stick is mounted."
+}
+i=0
+if [ -n "$NB_DEST_DIR" ]; then            # tests: a ready directory stands in for the mounted stick
+	DMNT=$NB_DEST_DIR; DESTDEV=test
+else
+	until find_dest; do
+		[ "$i" -ge "$WAIT_ITER" ] && fail "no FAT volume labelled $LABEL appeared" "Format the backup stick as FAT32 with label $LABEL, plug it in, boot again." ""
+		[ $(( i % 15 )) -eq 0 ] && wait_screen "$i"
+		i=$(( i + 1 ))
+		olpc_sleep 2
+	done
+	say "backup stick: $DESTDEV (label $LABEL)"
+	mkdir -p "$DMNT"
+	$MOUNT -t vfat -o rw,noatime,flush "$DESTDEV" "$DMNT" 2>"$RUN/mount.err" \
+		|| fail "cannot mount $DESTDEV" "$(head -c 120 "$RUN/mount.err")" ""
+fi
+[ -w "$DMNT" ] || fail "backup stick not writable" "$DMNT is read-only." ""
+FREE=$(free_bytes "$DMNT")
+say "space: backup stick free $(mib "$FREE") MiB; need raw $(mib "$NEED_RAW") + data $(mib "$NEED_DAT") + restore file $(mib "$NEED_CPY") MiB (worst case)"
+if [ "$FREE" -lt "$NEED_RAW" ]; then
+	fail "not enough free space on the backup stick" \
+	  "Need $(mib "$NEED_RAW") MiB free (raw dump) + $(mib "$NEED_DAT") MiB (data) + $(mib "$NEED_CPY") MiB (restore file); $(mib "$FREE") free." \
+	  "Use a bigger/empty stick (nothing is ever overwritten here)."
+fi
+n=1
+while [ -e "$DMNT/$(printf 'nandbackup-%03d' $n)" ]; do n=$(( n + 1 )); done
+SET=$(printf 'nandbackup-%03d' $n)
+DEST=$DMNT/$SET
+mkdir "$DEST" || fail "cannot create $SET on the backup stick" "" ""
+say "destination: $DEST"
+
+# ---- 2. load the driver read-only -------------------------------------------------------
+# back to the graphic splash (the wait screen was text); the progress bar draws only while it is up
+[ -x "$SPLASH" ] && "$SPLASH" init 6 "Loading NAND driver (read-only)" 2>/dev/null
+say "estimate: each full NAND read takes about 7 min on this CPU; 3 raw + 2 ECC passes + file work + read-back = about 50-60 min"
+grep -q 'mtdparts=cafe_nand:-(nand)ro' "$CMDLINE" \
+	|| fail "kernel command line lacks mtdparts=cafe_nand:-(nand)ro" "Refusing to load the NAND driver: the MTD would be writeable."
+if [ -z "$NB_TEST" ] && ls /sys/class/mtd/mtd[0-9]* >/dev/null 2>&1; then
+	fail "an MTD device exists before the driver was loaded" "Unexpected; not continuing."
+fi
+BASEDMESG=$(dmesg | wc -l)
+if [ -z "$NB_NOLOAD" ]; then
+	modprobe --ignore-install cafe_nand allow_bbt_write=0 2>"$RUN/modprobe.err" \
+		|| fail "cafe_nand failed to load" "$(head -c 200 "$RUN/modprobe.err")"
+fi
+i=0
+while [ ! -d "$SYS" ] || [ ! -e "$MTD" ]; do
+	i=$(( i + 1 ))
+	[ "$i" -gt 20 ] && fail "no NAND found (no MTD device appeared)" "cafe_nand loaded but did not detect a CaFe NAND controller." "$(dmesg | grep -v 'command line' | grep -i -E 'cafe|nand' | tail -n 2 | cut -c1-70 | tr '\n' ' ')"
+	olpc_sleep 1
+done
+dmesg | tail -n +"$BASEDMESG" >"$OUTD/dmesg-nand.txt" 2>/dev/null
+dmesg | grep -i -E 'cafe|nand|mtd|bbt|bad block' >>"$OUTD/dmesg-nand.txt" 2>/dev/null
+
+# ---- 3. validate ------------------------------------------------------------------------
+{
+	echo "== /proc/mtd"; cat /proc/mtd 2>&1
+	echo "== $SYS"
+	for a in name type flags size erasesize writesize oobsize subpagesize numeraseregions ecc_strength \
+		bitflip_threshold ecc_failures corrected_bits bad_blocks bbt_blocks; do
+		echo "$a=$(sys_attr $a)"
+	done
+	echo "== module parameters"
+	for p in "$MODSYS"/parameters/*; do [ -f "$p" ] && echo "$(basename "$p")=$(cat "$p" 2>/dev/null)"; done
+} >"$OUTD/mtd-info.txt" 2>&1
+FLAGS=$(sys_attr flags); [ "$FLAGS" = "?" ] && fail "cannot read $SYS/flags" "Not dumping a device whose write flag is unknown."
+[ $(( FLAGS & 0x400 )) -eq 0 ] || fail "MTD IS WRITEABLE (flags $FLAGS)" "Refusing to continue; nothing was read." "mtdparts=cafe_nand:-(nand)ro did not apply."
+ABP=$(cat "$MODSYS/parameters/allow_bbt_write" 2>/dev/null)
+[ -n "$NB_NOLOAD" ] && ABP=0
+[ "$ABP" = 0 ] || fail "allow_bbt_write is '$ABP', not 0" "Refusing: the driver could write the bad block table."
+[ "$(sys_attr type)" = nand ] || fail "MTD type is '$(sys_attr type)', not nand" ""
+[ "$(sys_attr name)" = nand ] || fail "MTD name is '$(sys_attr name)', not the read-only partition 'nand'" "The master device may be exposed writeable."
+for kv in size:$SIZE erasesize:$ERASE writesize:$WRITE oobsize:$OOB; do
+	a=${kv%%:*}; want=${kv#*:}; got=$(sys_attr "$a")
+	[ "$got" = "$want" ] || fail "unexpected NAND geometry: $a=$got, expected $want" "Not dumping: wrong device or unknown layout."
+done
+say "mtd ok: read-only (flags $FLAGS), $SIZE bytes, erase $ERASE, page $WRITE, oob $OOB"
+BAD0=$(sys_attr bad_blocks); BBT0=$(sys_attr bbt_blocks); CORR0=$(sys_attr corrected_bits); EF0=$(sys_attr ecc_failures)
+say "driver bad blocks (RAM table): $BAD0, bbt blocks $BBT0 (the table is NOT used by the dumps: every block is read)"
+
+# ---- 4. raw dumps: warm-up pass, stored pass, confirming pass ------------------------------
+# On the real NAND the first read after the driver load differed from the later ones, so pass 1
+# is a warm-up (hashed per erase block, not stored), pass 2 is the stored file and pass 3 is
+# compared with it.  Differences are measured and reported; they never fail the run.
+RAW_BLK=$(( ERASE / WRITE * (WRITE + OOB) ))
+TA=$(up)
+prog 8 "Raw read 1 of 3 (warm-up)"
+RR_BLK=$RAW_BLK run_read raw1 - "Raw read 1 (warm-up)" 8 11 "$RAW_BYTES" -- -q --bb=dumpbad --oob --noecc \
+	|| fail "raw read failed" "See $LOG" "$(tail -n 1 "$OUTD/nanddump-raw1.err" 2>/dev/null)"
+read -r WARM_SHA _ <"$RUN/raw1.sha"
+say "raw read 1 (warm-up, not stored): sha256 $WARM_SHA ($(( $(up) - TA )) s)"
+prog 19 "Raw read 2 of 3 (stored)"
+TA2=$(up)
+RR_BLK=$RAW_BLK run_read raw2 "$DEST/$RAWF" "Raw read 2 (stored)" 19 14 "$RAW_BYTES" -- -q --bb=dumpbad --oob --noecc \
+	|| fail "raw dump failed" "See $LOG" "$(tail -n 1 "$OUTD/nanddump-raw2.err" 2>/dev/null)"
+read -r RAW_SHA RAW_N <"$RUN/raw2.sha"
+RR_BLK=""
+sync
+TB=$(up)
+say "raw read 2 (stored): $RAW_N bytes sha256 $RAW_SHA ($(( TB - TA2 )) s)"
+WARM=$(awk 'NR == FNR { a[$1] = $2; next } a[$1] != $2 { n++; if (n <= 16) l = l " " $1 } END { printf "%d%s", n + 0, l }' "$RUN/raw1.blk" "$RUN/raw2.blk" 2>/dev/null)
+WARMN=${WARM%% *}; WARMN=${WARMN:-0}
+if [ "$WARMN" = 0 ]; then WARMTXT="warm-up read 1 vs stored: identical"
+else WARMTXT="warm-up read 1 vs stored: $WARMN erase blocks differ (first: ${WARM#* })"; fi
+say "$WARMTXT"
+
+prog 33 "Raw read 3 of 3 (compare)"
+RAWNOISE=""; RAWWARN=""
+if run_cmp raw3 "$DEST/$RAWF" "Raw read 3 (compare)" 33 12 "$RAW_BYTES" "$RAW_BLK" -- -q --bb=dumpbad --oob --noecc; then
+	RAWNOISE="raw read 3 vs stored: $CMP_B bytes / $CMP_BITS bits in $CMP_BLK blocks differ (of $(( SIZE / ERASE )))"
+	if [ "$CMP_B" != 0 ]; then RAWWARN="WARNING: the stored raw read is NOT confirmed by read 3"; fi
+	[ $(( CMP_B * 100 )) -gt "$RAW_BYTES" ] && RAWWARN="WARNING: raw read noise is above 1% of the bytes; the stored raw read is NOT confirmed"
+else
+	RAWNOISE="raw read 3 vs stored: not measured (the pass did not complete)"
+	RAWWARN="WARNING: $RAWNOISE"
+fi
+TC=$(up)
+say "$RAWNOISE ($(( TC - TB )) s)"; [ -n "$RAWWARN" ] && say "$RAWWARN"
+
+# ---- 5. ECC-corrected data dump: the integrity anchor, read twice ------------------------
+DATA_STATE="done"
+DAT_SHA=""; DAT_N=0; DSTAB=""
+FREE_NOW=$(free_bytes "$DMNT")
+[ -n "$NB_TEST" ] && [ -n "$NB_FREE_AFTER_RAW" ] && FREE_NOW=$NB_FREE_AFTER_RAW
+if [ "$FREE_NOW" -lt "$NEED_DAT" ]; then
+	DATA_STATE="SKIPPED (free $(mib "$FREE_NOW") MiB < $(mib "$NEED_DAT") MiB needed; derive it from the raw dump on a PC)"
+	say "ECC data dump $DATA_STATE"
+else
+	prog 45 "ECC-corrected dump 1 of 2"
+	# dumpbad: the (possibly wrong) bad block table must not make nanddump skip blocks
+	run_read dat "$DEST/$DATF" "ECC-corrected dump" 45 12 "$SIZE" -- -q --bb=dumpbad \
+		|| fail "ECC-corrected dump failed" "The raw dump is complete: $DEST/$RAWF" "$(tail -n 1 "$OUTD/nanddump-dat.err" 2>/dev/null)"
+	read -r DAT_SHA DAT_N <"$RUN/dat.sha"
+	sync
+	TD=$(up)
+	say "data dump 1: $DAT_N bytes sha256 $DAT_SHA ($(( TD - TC )) s)"
+	prog 57 "ECC-corrected read 2 of 2"
+	DSTAB="stable (pass 2 identical to the stored file)"
+	if ! { run_cmp dat2 "$DEST/$DATF" "ECC-corrected read 2 (compare)" 57 11 "$SIZE" "$ERASE" -- -q --bb=dumpbad && [ "$CMP_B" = 0 ]; }; then
+		say "ECC-corrected pass 2 differs from the stored file ($CMP_B bytes in $CMP_BLK blocks); pass 3"
+		P2="pass 2 did not match ($CMP_B bytes / $CMP_BITS bits in $CMP_BLK blocks)"
+		if run_cmp dat3 "$DEST/$DATF" "ECC-corrected read 3 (compare)" 57 11 "$SIZE" "$ERASE" -- -q --bb=dumpbad && [ "$CMP_B" = 0 ]; then
+			DSTAB="UNSTABLE: $P2; pass 3 identical to the stored file"
+			say "$DSTAB"
+		else
+			DSTAB="UNSTABLE: $P2; pass 3 also differs from the stored file"
+			say "$DSTAB"
+			fail "ECC-corrected reads unstable" "Two later passes did not match the stored data dump; the files are kept for analysis." "Do not rely on this backup; try again (see $LOG)."
+		fi
+	fi
+	say "data read stability: $DSTAB"
+fi
+ECC=$(ecc_counts dat); ECC2=$(ecc_counts dat2); ECC3=$(ecc_counts dat3)
+CORR1=$(sys_attr corrected_bits); EF1=$(sys_attr ecc_failures)
+
+# ---- 6. NANDCOPY.DAT (input for Open Firmware nd-copy-nand) ------------------------------
+CPY_STATE="not built"
+CPY_SHA=""; CPY_N=0
+if [ -n "$DAT_SHA" ]; then
+	FREE_NOW=$(free_bytes "$DMNT")
+	[ -n "$NB_TEST" ] && [ -n "$NB_FREE_AFTER_DATA" ] && FREE_NOW=$NB_FREE_AFTER_DATA
+	if [ "$FREE_NOW" -lt "$NEED_CPY" ]; then
+		CPY_STATE="SKIPPED (free $(mib "$FREE_NOW") MiB < $(mib "$NEED_CPY") MiB needed)"
+		say "restore file $CPY_STATE"
+	else
+		prog 68 "Building the restore file"
+		rm -f "$RUN/cpy".*
+		{ "$NBCOMPACT" -r "$DEST/$RAWF" -d "$DEST/$DATF" -R "$RUN/cpy.rep" -e "$ERASE" -w "$WRITE" -o "$OOB"; echo $? >"$RUN/cpy.rc"; } \
+			| { "$NBHASH" -o "$RUN/cpy.sha" >"$DEST/$CPYF"; echo $? >"$RUN/cpy.hs"; }
+		_a=x; _b=x; read -r _a <"$RUN/cpy.rc" 2>/dev/null; read -r _b <"$RUN/cpy.hs" 2>/dev/null
+		if [ "$_a" = 0 ] && [ "$_b" = 0 ] && read -r CPY_SHA CPY_N <"$RUN/cpy.sha" && [ "${CPY_N:-0}" -gt 0 ]; then
+			CPY_STATE="done"
+			sync
+			say "restore file: $CPY_N bytes sha256 $CPY_SHA; $(tr '\n' ' ' <"$RUN/cpy.rep")"
+		else
+			rm -f "$DEST/$CPYF"; CPY_SHA=""
+			CPY_STATE="FAILED (compaction rc=$_a/$_b; the raw and data dumps are fine)"
+			say "restore file $CPY_STATE"
+		fi
+	fi
+fi
+
+# ---- 7. read the stored files back ------------------------------------------------------
+prog 72 "Verifying stored files"
+echo 3 2>/dev/null >/proc/sys/vm/drop_caches
+verify_file() {   # verify_file FILE EXPECT_SHA EXPECT_BYTES BASE SPAN
+	rm -f "$RUN/vf".*
+	: >"$RUN/vf.cnt"
+	_fs=$(stat -c %s "$1")
+	start_monitor vf "Verifying $(basename "$1")" "$4" "$5" "$_fs"
+	{ "$NBHASH" -n -c "$RUN/vf.cnt" -o "$RUN/vf.sha" <"$1"; echo $? >"$RUN/vf.h"; }
+	stop_monitor
+	_v=x; read -r _v <"$RUN/vf.h" 2>/dev/null
+	read -r _vs _vn <"$RUN/vf.sha" 2>/dev/null
+	[ "$_v" = 0 ] && [ "$_vs" = "$2" ] && [ "$_vn" = "$3" ]
+}
+verify_file "$DEST/$RAWF" "$RAW_SHA" "$RAW_BYTES" 72 10 \
+	|| fail "stored raw dump does not read back as the hashed stream" "$DEST/$RAWF is bad; the NAND is untouched. Try again." ""
+[ -z "$DAT_SHA" ] || verify_file "$DEST/$DATF" "$DAT_SHA" "$DAT_N" 82 10 \
+	|| fail "stored data dump does not read back as the hashed stream" "$DEST/$DATF is bad; the raw dump is fine." ""
+[ -z "$CPY_SHA" ] || verify_file "$DEST/$CPYF" "$CPY_SHA" "$CPY_N" 92 4 \
+	|| fail "stored restore file does not read back as the hashed stream" "$DEST/$CPYF is bad." ""
+
+# ---- 8. manifest ------------------------------------------------------------------------
+prog 97 "Writing manifest"
+TEND=$(up)
+REP_KEPT=0; REP_LIMIT=0; REP_BEYOND=0
+if [ -n "$CPY_SHA" ]; then
+	while IFS== read -r k v; do
+		case $k in kept) REP_KEPT=$v ;; limit) REP_LIMIT=$v ;; beyond_limit_nonff) REP_BEYOND=$v ;; esac
+	done <"$RUN/cpy.rep"
+fi
+{
+	echo "olpc-boy NAND backup (Linux, read-only)"
+	echo "set:            $SET on the volume $LABEL"
+	echo "kernel:         $(uname -r)"
+	echo "nanddump:       $("$ND" --version 2>&1 | head -n 1)"
+	echo "driver param:   allow_bbt_write=0, mtdparts=cafe_nand:-(nand)ro"
+	echo
+	echo "[mtd] size=$SIZE erasesize=$ERASE writesize=$WRITE oobsize=$OOB flags=$FLAGS (MTD_WRITEABLE clear)"
+	echo "[mtd] driver bad_blocks=$BAD0 bbt_blocks=$BBT0 (not used for the dumps: all $(( SIZE / ERASE )) eraseblocks were read)"
+	echo "[mtd] sysfs ecc_failures $EF0 -> $EF1, corrected_bits $CORR0 -> $CORR1"
+	echo
+	echo "[raw]  file=$RAWF bytes=$RAW_N sha256=$RAW_SHA"
+	echo "[raw]  layout: for each page, $WRITE data bytes then $OOB OOB bytes; no ECC; bad blocks included"
+	echo "[raw]  stored file = raw read 2 (read 1 was a warm-up pass, read 3 confirms)"
+	echo "[raw]  $WARMTXT"
+	echo "[raw]  $RAWNOISE"
+	[ -n "$RAWWARN" ] && echo "[raw]  $RAWWARN"
+	if [ -n "$DAT_SHA" ]; then
+		echo "[data] file=$DATF bytes=$DAT_N sha256=$DAT_SHA"
+		echo "[data] ECC-corrected, every block read (nanddump --bb=dumpbad), positions preserved"
+		echo "[data] read stability: $DSTAB"
+		echo "[data] nanddump ECC (uncorrectable pages/bits, corrected pages/bits): pass 1 = $ECC, pass 2 = $ECC2, pass 3 = $ECC3"
+	else
+		echo "[data] $DATA_STATE"
+	fi
+	echo
+	if [ -n "$CPY_SHA" ]; then
+		echo "[restore] file=$CPYF bytes=$CPY_N sha256=$CPY_SHA ($REP_KEPT erase blocks)"
+		echo "[restore] built like Open Firmware's save-nand: blocks below the bad block tables (block $REP_LIMIT)"
+		echo "[restore] that are not entirely 0xFF, in order; $(tr '\n' ' ' <"$RUN/cpy.rep")"
+		echo "[restore] HOW (Open Firmware, no Linux): copy $CPYF to the ROOT of a FAT USB stick that OFW"
+		echo "[restore]   reads reliably (OFW sees 8.3 names only; this nandbackup-NNN folder is not one), then at the ok prompt:"
+		echo "[restore]       nd-copy-nand u:\\$CPYF"
+		echo "[restore]   (optional afterwards: verify-nand u:\\$CPYF).  nd-copy-nand ERASES every good block first, then writes the"
+		echo "[restore]   blocks one after the other into the next good blocks; blocks it does not need get a JFFS2 cleanmarker."
+		echo "[restore]   No .crc file is needed (nand-dump mode). Check sha256 of the copy on a PC first."
+		if [ "$REP_BEYOND" -gt 0 ]; then
+			echo "[restore] WARNING: $REP_BEYOND non-erased block(s) at/after the bad block tables are NOT in the restore file (see raw dump)."
+		fi
+		case $BAD0 in ''|'?'|0) ;; *)
+			if [ $(( REP_KEPT + BAD0 )) -gt "$REP_LIMIT" ]; then
+				echo "[restore] WARNING: the flash bad block table marks $BAD0 blocks bad; $REP_KEPT blocks + $BAD0 > $REP_LIMIT usable:"
+				echo "[restore]   nd-copy-nand would run out of good blocks AFTER erasing. Do NOT restore until this is understood."
+			elif [ "$BAD0" -gt 40 ]; then
+				echo "[restore] WARNING: the flash bad block table marks $BAD0 blocks bad (a table written by an earlier Linux boot can do that)."
+			fi ;;
+		esac
+	else
+		echo "[restore] $CPY_STATE"
+	fi
+	echo
+	echo "[time] raw reads 1+2 $(( TB - TA )) s, raw read 3 $(( TC - TB )) s, whole run $(( TEND - T0 )) s (uptime based)"
+} >"$DEST/MANIFEST.txt"
+{
+	echo "$RAW_SHA  $RAWF"
+	[ -n "$DAT_SHA" ] && echo "$DAT_SHA  $DATF"
+	[ -n "$CPY_SHA" ] && echo "$CPY_SHA  $CPYF"
+	( cd "$DEST" && sha256sum MANIFEST.txt )
+} >"$DEST/SHA256SUMS"
+cp "$DEST/SHA256SUMS" "$DEST/STREAMS.sha256"      # files are stored as-is: stream hash == file hash
+( cd "$DEST" && sha256sum -c SHA256SUMS >"$OUTD/sha256sums-check.txt" 2>&1 ) \
+	|| fail "SHA256SUMS does not verify" "$(head -c 100 "$OUTD/sha256sums-check.txt")" ""
+cp "$DEST/MANIFEST.txt" "$DEST/SHA256SUMS" "$OUTD/" 2>/dev/null
+sync
+# release the backup stick cleanly (tests use a plain directory)
+if [ -z "$NB_DEST_DIR" ]; then
+	i=0; until $UMOUNT "$DMNT" 2>/dev/null; do
+		i=$(( i + 1 )); [ "$i" -ge 10 ] && fail "cannot unmount the backup stick" "Data is synced; do not remove the stick until this is cleared." ""
+		olpc_sleep 1
+	done
+fi
+prog 100 "Backup complete"
+
+say "DONE: $SET"
+W="$RAWNOISE"; [ -n "$RAWWARN" ] && W="$RAWWARN"
+case $DSTAB in UNSTABLE*) W="$W / WARNING: ECC reads $DSTAB" ;; esac
+D2=""; case $DATA_STATE in SKIPPED*) D2="ECC-corrected dump skipped (space); the raw dump has everything." ;; esac
+C2=""; case $CPY_STATE in done) ;; *) C2="Restore file NOT built: $CPY_STATE" ;; esac
+screen "BACKUP OK - you can power off" "Saved on the $LABEL stick, folder $SET/" "$W" "$D2" "$C2" "Powering off in 60 s."
+FINAL_RC=0
+finish
