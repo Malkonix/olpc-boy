@@ -54,6 +54,10 @@ if [ -w $P/default_red ]; then
 	[ -c /dev/tty1 ] && printf '\033]R' >/dev/tty1 2>/dev/null
 fi
 
+# boot splash (skipped by olpcboy.verbose); the console stays in graphics mode so nothing scribbles on it
+olpc-splash init 5 "Starting kernel"
+grep -q olpcboy.verbose /proc/cmdline && dmesg -n 7   # verbose: kernel messages on screen again (loglevel=1 hides them)
+
 CMDLINE=$(cat /proc/cmdline)
 
 cmdline_get() {   # cmdline_get key  -> value of key=value (empty if absent)
@@ -223,6 +227,7 @@ dump_diag() {   # dump_diag file
 }
 
 fail() {   # fail "reason line 1" ["reason line 2"]
+	[ -f /run/olpcboy/splash ] && olpc-splash text   # text console back so the message below is visible
 	spawn_tty2_shell
 	{
 		echo
@@ -326,6 +331,7 @@ handover() {
 # ================================================================= main
 say "olpc-boy initramfs starting, cmdline: $CMDLINE"
 
+olpc-splash progress 15 "Mounting storage"
 if mount_log; then
 	HAVE_LOG=1
 	if new_boot_dir; then
@@ -344,6 +350,7 @@ if [ "$HAVE_LOG" = 0 ]; then
 	echo "NO LOG PARTITION - logging to tmpfs only" >"$CON"
 fi
 
+olpc-splash progress 30 "Mounting system"
 if want_root "$WAIT_SECS"; then :; else
 	fail "Root filesystem not found (wanted: $(cmdline_get olpcboy.root || echo LABEL=$ROOTLABEL))"
 fi

@@ -156,7 +156,7 @@ static int fb_open(void)
 		g_tty = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
 		if (g_tty < 0) g_tty = open("/dev/tty1", O_RDWR | O_NOCTTY | O_CLOEXEC);
 		if (g_tty >= 0) {
-			if (ioctl(g_tty, KDGETMODE, &g_kd_saved) < 0) g_kd_saved = KD_TEXT;
+			g_kd_saved = KD_TEXT;   /* the boot splash leaves tty1 in KD_GRAPHICS: never "restore" to that */
 			if (ioctl(g_tty, KDSETMODE, KD_GRAPHICS) == 0) g_kd_graphics = 1;
 		}
 	}
@@ -1100,7 +1100,13 @@ static void on_button(int bit, uint64_t now)
 		return;
 	}
 	if (screen == SC_NET) {
-		if (netui_button(bit, now)) { netui_busy_leave(); open_options(); }
+		if (netui_button(bit, now)) {
+			/* the network screen is larger than the options box: repaint the launcher under it first */
+			netui_busy_leave();
+			screen = SC_LIST;
+			draw_main(now_ms());
+			open_options();
+		}
 		return;
 	}
 	if (bit == J_A && cur_rom()) launch();

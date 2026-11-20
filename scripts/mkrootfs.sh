@@ -124,6 +124,14 @@ busybox ash -n "$R/usr/local/sbin/olpc-covers" || { echo "ERROR: syntax olpc-cov
 ls -l "$R/usr/local/sbin/png2obc" "$R/usr/local/sbin/olpc-covers-match" | sed "s/^/  /"
 # ---- end olpc-covers
 
+# ---- olpc-splash (also in the initramfs; the rootfs copy serves the OpenRC/tty1 milestones)
+echo "== olpc-splash"
+sh src/olpc-splash/test.sh >"$WORK/olpc-splash-test.log" 2>&1 \
+	|| { cat "$WORK/olpc-splash-test.log" >&2; echo "ERROR: olpc-splash tests failed" >&2; exit 1; }
+tail -n1 "$WORK/olpc-splash-test.log"
+make -C src/olpc-splash OUT="$R/usr/local/sbin" CFLAGS="-Os -march=geode -mtune=geode -Wall -Wextra"
+chmod 0755 "$R/usr/local/sbin/olpc-splash"
+
 # ---- olpc-menu (game launcher): unit + scripted-UI tests on the host, then the dynamic i386 build
 echo "== olpc-menu"
 sh src/olpc-menu/test.sh >"$WORK/olpc-menu-test.log" 2>&1 \

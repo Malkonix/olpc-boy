@@ -72,7 +72,7 @@ AUTOMARK=$LOCKBASE/wifi.autostarted
 SCANWAIT=${OLPC_WIFI_SCANWAIT:-4}
 UPREASON=""
 LOCKHELD=0
-THUMBS=http://thumbnails.libretro.com
+THUMBS=https://raw.githubusercontent.com/libretro-thumbnails
 NTP_HOST=pool.ntp.org
 
 if [ -z "$OLPC_WIFI_TEST" ]; then
@@ -555,16 +555,11 @@ do_check() {
 		step "check: no default gateway"
 	fi
 	_cs; _t0=$CS
-	_ns=$(bounded 10 nslookup thumbnails.libretro.com 2>&1 | sed -n 's/^Address[ 0-9]*: *\([0-9.]*\).*/\1/p' | tail -n1)
-	_cs; step "check: dns thumbnails.libretro.com -> ${_ns:-FAILED} in $(( (CS - _t0) * 10 ))ms"
+	_ns=$(bounded 10 nslookup raw.githubusercontent.com 2>&1 | sed -n 's/^Address[ 0-9]*: *\([0-9.]*\).*/\1/p' | tail -n1)
+	_cs; step "check: dns raw.githubusercontent.com -> ${_ns:-FAILED} in $(( (CS - _t0) * 10 ))ms"
 
-	for _set in "Nintendo - Game Boy" "Nintendo - Game Boy Color" "Nintendo - Nintendo Entertainment System"; do
-		_u="$THUMBS/$(urlenc "$_set")/Named_Boxarts/"
-		fetch "$_u" /tmp/wifi-index.html 90 "index '$_set'"
-		rm -f /tmp/wifi-index.html
-	done
-
-	_u="$THUMBS/$(urlenc "$COVER_SET")/Named_Boxarts/$(urlenc "$COVER_NAME")"
+	# one cover straight from the thumbnail repo (no GitHub API call: those are rate limited)
+	_u="$THUMBS/$(echo "$COVER_SET" | tr ' ' _)/master/Named_Boxarts/$(urlenc "$COVER_NAME")"
 	if fetch "$_u" "$WDIR/cover.png" 60 "cover '$COVER_NAME'"; then
 		cp "$WDIR/cover.png" "$BOOTDIR/wifi-cover-test.png" 2>/dev/null
 		step "cover saved to wifi-cover-test.png"
@@ -879,7 +874,17 @@ do_forget() {
 	ssid_arg "$1" || { fail_res badssid; return 1; }
 	cfg_commit del "$ARGSSID" ""; _r=$?
 	case $_r in
-	0) wl "forget: removed '$ARGSSID'"; result ok "Forgotten" ;;
+	0)	wl "forget: removed '$ARGSSID'"
+		# wpa_supplicant still holds the network: drop the link when it is the one in use
+		# (or still being tried), otherwise it stays connected to a network no longer saved
+		if wpa_running; then
+			_cur=$(wstat ssid)
+			if [ "$_cur" = "$ARGSSID" ] || [ "$(wstat wpa_state)" != COMPLETED ]; then
+				step "forget: '$ARGSSID' was in use, disconnecting"
+				do_down
+			fi
+		fi
+		result ok "Forgotten" ;;
 	2) fail_res notsaved; return 1 ;;
 	*) fail_res nostore; return 1 ;;
 	esac

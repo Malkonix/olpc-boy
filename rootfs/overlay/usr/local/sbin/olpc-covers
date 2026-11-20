@@ -6,10 +6,21 @@
 #
 # For every roms directory (a top-level "roms" directory, any case, on a
 # filesystem mounted under /mnt or /media, holding gb/gbc/nes directories) each
-# ROM without <roms>/../covers/<sys>/<name>.obc gets its libretro box art:
-# the Apache index of the system is fetched once (cached 30 days under
-# covers/.index/), the ROM name is matched by olpc-covers-match (exact rules,
-# no guessing), the PNG goes to tmpfs, png2obc converts it, the PNG is deleted.
+# ROM without <roms>/../covers/<sys>/<name>.obc gets its libretro box art.
+# Source: thumbnails.libretro.com (Apache index + PNGs) when it answers,
+# otherwise the same data from the libretro-thumbnails GitHub repositories
+# (git tree JSON via api.github.com, PNGs from raw.githubusercontent.com).
+# The index of a system is fetched once and cached 30 days under covers/.index/
+# (<sys>.html, always in the Apache-like form olpc-covers-match reads; the
+# GitHub JSON is converted on the fly by awk; <sys>.html.src remembers which
+# source it came from so the images are fetched from the same one).  The
+# unauthenticated GitHub API allows 60 requests/hour per IP, hence exactly two
+# API calls per system and only when the index is missing/stale/--force.
+# The ROM name is matched by olpc-covers-match (exact rules, no guessing), the
+# PNG goes to tmpfs, png2obc converts it, the PNG is deleted.  A git symlink
+# (mode 120000) comes back from raw.githubusercontent.com as the link text, not
+# a PNG: any download that lacks the PNG signature and is a short single
+# "<name>.png" line is re-fetched under that name (at most 2 hops).
 # ROMs without a cover on the server are remembered in covers/<sys>/.missing
 # (retried after 30 days or with --force; --force also refreshes the index).
 #
@@ -25,10 +36,88 @@ WORK=$RUN/covers.work
 LOG=${OLPC_COVERS_LOG:-/var/log/olpc-current/covers.log}
 BIN=${OLPC_COVERS_BIN:-/usr/local/sbin}
 THUMBS=${OLPC_COVERS_THUMBS:-http://thumbnails.libretro.com}
+GH_API=${OLPC_COVERS_GH_API:-https://api.github.com/repos/libretro-thumbnails}
+GH_RAW=${OLPC_COVERS_GH_RAW:-https://raw.githubusercontent.com/libretro-thumbnails}
 WGET=${OLPC_COVERS_WGET:-wget}
 WIFI=${OLPC_COVERS_WIFI:-/usr/local/sbin/olpc-wifi}
 MAXAGE=2592000			# 30 days
 TAB=$(printf '\t')
+
+# ---- JSON tree -> Apache-like index
+# AWKLIB: enc() percent-encodes everything outside a small safe set (non-ASCII
+# bytes pass through raw); jenc() decodes JSON string escapes (\" \\ \/ \b \f
+# \n \r \t \uXXXX incl. surrogate pairs, emitted as UTF-8) and encodes the
+# result, so the output is a usable URL path.  Real names today are plain ASCII.
+AWKLIB='
+function init(  i) { for (i = 1; i < 128; i++) ORD[sprintf("%c", i)] = i }
+function pct(b) { return sprintf("%%%02X", b) }
+function enc1(c) {
+	if (index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~()!,-", c)) return c
+	if (c in ORD) return pct(ORD[c])
+	return c
+}
+function hex4(s,   i, v, d) {
+	v = 0
+	for (i = 1; i <= 4; i++) {
+		d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
+		if (d < 0) return -1
+		v = v * 16 + d
+	}
+	return v
+}
+function utf8(cp) {
+	if (cp < 128) return enc1(sprintf("%c", cp))
+	if (cp < 2048) return pct(192 + int(cp / 64)) pct(128 + cp % 64)
+	if (cp < 65536) return pct(224 + int(cp / 4096)) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
+	return pct(240 + int(cp / 262144)) pct(128 + int(cp / 4096) % 64) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
+}
+function enc(s,   o, i) {
+	for (i = 1; i <= length(s); i++) o = o enc1(substr(s, i, 1))
+	return o
+}
+function jenc(s,   o, i, c, n, v, w) {
+	i = 1
+	while (i <= length(s)) {
+		c = substr(s, i, 1)
+		if (c != "\\") { o = o enc1(c); i++; continue }
+		n = substr(s, i + 1, 1)
+		if (n == "u" && (v = hex4(substr(s, i + 2, 4))) >= 0) {
+			i += 6
+			if (v >= 55296 && v < 56320 && substr(s, i, 2) == "\\u" && (w = hex4(substr(s, i + 2, 4))) >= 56320 && w < 57344) {
+				v = 65536 + (v - 55296) * 1024 + (w - 56320); i += 6
+			}
+			o = o utf8(v); continue
+		}
+		i += 2
+		if (n == "b") o = o pct(8)
+		else if (n == "f") o = o pct(12)
+		else if (n == "n") o = o pct(10)
+		else if (n == "r") o = o pct(13)
+		else if (n == "t") o = o pct(9)
+		else o = o enc1(n)
+	}
+	return o
+}
+'
+# tree2html: GitHub tree JSON on stdin -> one href line per .png entry,
+# streamed (the NES tree is ~5 MB).  Prints nothing at all when no .png found.
+tree2html() {
+	awk "$AWKLIB"'
+	BEGIN { init() }
+	/^[ ]*"path": "/ {
+		s = $0; sub(/^[ ]*"path": "/, "", s); sub(/",?[ \r]*$/, "", s)
+		h = jenc(s)
+		if (h ~ /\.png$/) { if (!n++) print "<table>"; print "<a href=\"" h "\">x</a>" }
+	}
+	END { if (n) print "</table>" }'
+}
+urlenc() { awk "$AWKLIB"'BEGIN { init() } { print enc($0) }'; }
+# tree_sha DIR: sha of the entry "DIR" in a tree JSON on stdin
+tree_sha() {
+	awk -v d="$1" '
+	index($0, "\"path\": \"" d "\"") { f = 1; next }
+	f && /"sha":/ { split($0, a, "\""); print a[4]; exit }'
+}
 
 mkdir -p "$RUN" 2>/dev/null
 
@@ -38,6 +127,7 @@ status)
 	[ -r "$STATUS" ] && cat "$STATUS" || echo idle
 	exit 0 ;;
 fetch) shift ;;
+tree2html) tree2html; exit 0 ;;	# internal: used by the tests
 *) echo "usage: olpc-covers fetch [--system gb|gbc|nes] [--force] | status" >&2; exit 2 ;;
 esac
 
@@ -119,6 +209,14 @@ sysdir_url() {
 	esac
 }
 
+sysrepo() { # GitHub repository of a system
+	case "$1" in
+	gb) echo "Nintendo_-_Game_Boy" ;;
+	gbc) echo "Nintendo_-_Game_Boy_Color" ;;
+	nes) echo "Nintendo_-_Nintendo_Entertainment_System" ;;
+	esac
+}
+
 # work list: sys TAB covers dir TAB ROM name (no extension), ordered by group
 : >"$WORK/list"
 for _sys in gb gbc nes; do
@@ -188,7 +286,27 @@ get() {
 	return 1
 }
 
-# ensure_index SYS COVDIR: sets IDX, empty when none is available
+# index_libretro SYS: Apache index into $WORK/index.html
+index_libretro() {
+	get "$THUMBS/$(sysdir_url "$1")/Named_Boxarts/" "$WORK/index.html" 240 &&
+	   grep -q '</table>' "$WORK/index.html"
+}
+# index_github SYS: git tree of Named_Boxarts converted into $WORK/index.html
+# (2 API calls; the JSON is streamed through awk, never held in a variable)
+index_github() {
+	_repo=$(sysrepo "$1")
+	get "$GH_API/$_repo/git/trees/master" "$WORK/root.json" 60 || return 1
+	_sha=$(tree_sha Named_Boxarts <"$WORK/root.json")
+	rm -f "$WORK/root.json"
+	case "$_sha" in ""|*[!0-9a-f]*) return 1 ;; esac
+	get "$GH_API/$_repo/git/trees/$_sha" "$WORK/tree.json" 240 || return 1
+	tree2html <"$WORK/tree.json" >"$WORK/index.html"
+	rm -f "$WORK/tree.json"
+	grep -q '</table>' "$WORK/index.html"
+}
+
+# ensure_index SYS COVDIR: sets IDX (empty when none is available) and SRC
+# (libretro|github: where IDX came from, so images are fetched from there)
 ensure_index() {
 	IDX=$2/.index/$1.html
 	_fresh=0
@@ -196,20 +314,53 @@ ensure_index() {
 		_n=$(now); _m=$(stat -c %Y "$IDX" 2>/dev/null || echo 0)
 		if [ "$_n" -lt 1704067200 ] || [ $((_n - _m)) -lt "$MAXAGE" ]; then _fresh=1; fi
 	fi
-	[ "$_fresh" = 1 ] && return 0
-	status "fetching index $1"
-	log "index $1: downloading"
-	mkdir -p "$2/.index" 2>/dev/null
-	if get "$THUMBS/$(sysdir_url "$1")/Named_Boxarts/" "$WORK/index.html" 240 &&
-	   grep -q '</table>' "$WORK/index.html"; then
-		cp "$WORK/index.html" "$IDX.part" && mv "$IDX.part" "$IDX"
+	if [ "$_fresh" != 1 ]; then
+		status "fetching index $1"
+		log "index $1: downloading"
+		mkdir -p "$2/.index" 2>/dev/null
+		_got=""
+		for _s in libretro github; do
+			rm -f "$WORK/index.html"
+			if "index_$_s" "$1"; then _got=$_s; break; fi
+			log "index $1: $_s failed"
+		done
+		if [ -n "$_got" ]; then
+			echo "$_got" >"$IDX.src.part" && mv "$IDX.src.part" "$IDX.src"
+			cp "$WORK/index.html" "$IDX.part" && mv "$IDX.part" "$IDX"
+			log "index $1: ok ($_got)"
+		else
+			log "index $1: download failed"
+			[ -s "$IDX" ] || IDX=""
+		fi
 		rm -f "$WORK/index.html" "$IDX.part"
-		log "index $1: ok"
-		return 0
 	fi
-	rm -f "$WORK/index.html" "$IDX.part"
-	log "index $1: download failed"
-	[ -s "$IDX" ] || IDX=""
+	SRC=libretro
+	[ -n "$IDX" ] && [ -r "$IDX.src" ] && read -r SRC <"$IDX.src"
+	return 0
+}
+
+is_png() { [ "$(head -c 8 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ]; }
+
+# fetch_cover SYS HREF DEST: the PNG from the source of the cached index.  A
+# GitHub symlink is served as its target name instead of a PNG: follow it.
+fetch_cover() {
+	_h=$2; _hop=0
+	while :; do
+		case "$SRC" in
+		github) _u=$GH_RAW/$(sysrepo "$1")/master/Named_Boxarts/$_h ;;
+		*) _u=$THUMBS/$(sysdir_url "$1")/Named_Boxarts/$_h ;;
+		esac
+		get "$_u" "$3" 90 || return 1
+		is_png "$3" && return 0
+		[ "$_hop" -ge 2 ] && break
+		[ "$(wc -c <"$3")" -le 512 ] || break
+		_t=$(tr -d '\r\n' <"$3")
+		case "$_t" in ""|*/*) break ;; *.png) ;; *) break ;; esac
+		_h=$(printf '%s' "$_t" | urlenc)
+		_hop=$((_hop + 1))
+	done
+	rm -f "$3"
+	return 1
 }
 
 miss_forget() { # COVDIR SYS NAME
@@ -248,7 +399,7 @@ while IFS="$TAB" read -r GSYS GCOV; do
 			MISS=$((MISS + 1)); log "$GSYS $NAME: missing"
 			continue
 		fi
-		if ! get "$THUMBS/$(sysdir_url "$GSYS")/Named_Boxarts/$HREF" "$WORK/cover.png" 90; then
+		if ! fetch_cover "$GSYS" "$HREF" "$WORK/cover.png"; then
 			FAIL=$((FAIL + 1)); log "$GSYS $NAME: download failed"
 			continue
 		fi

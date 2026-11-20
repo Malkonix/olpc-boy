@@ -12,6 +12,7 @@ depend() {
 
 start() {
 	. /usr/libexec/olpcboy/common.sh
+	/usr/local/sbin/olpc-splash progress 45 "Loading drivers"
 	ebegin "olpclog: boot dir $BOOTDIR"
 	mkdir -p "$BOOTDIR" /run/olpcboy
 	echo "$BOOTDIR" >/run/olpcboy/bootdir

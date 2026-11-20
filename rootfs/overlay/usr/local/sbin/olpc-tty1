@@ -15,12 +15,18 @@ mkdir -p /run/olpcboy
 
 if [ ! -e "$STATE" ]; then
 	: >"$STATE"
+	# The boot splash keeps the console in graphics mode (nothing below is painted).  The opt-in
+	# test screens print to the console, so they get the text console back first.
+	for o in buttons soundtest fbbench corebench tests; do
+		cmdline_has olpcboy.$o && { /usr/local/sbin/olpc-splash text; break; }
+	done
 	if cmdline_has olpcboy.buttons; then
 		tl "tty1: buttons start"
 		/usr/local/sbin/olpc-buttons
 		tl "tty1: buttons done"
 	fi
 	printf '\033[2J\033[H'
+	/usr/local/sbin/olpc-splash progress 85 "Checking hardware"
 	tl "tty1: selftest start"
 	/usr/local/sbin/olpc-selftest
 	tl "tty1: selftest done"
@@ -166,6 +172,8 @@ fi
 MENU=/usr/local/bin/olpc-menu
 if [ -x "$MENU" ] && ! cmdline_has olpcboy.nomenu; then
 	crashes=0
+	/usr/local/sbin/olpc-splash progress 95 "Starting launcher"
+	/usr/local/sbin/olpc-splash done
 	while [ "$crashes" -lt 5 ]; do
 		_cs; m0=$CS
 		tl "tty1: olpc-menu start"
@@ -179,6 +187,8 @@ if [ -x "$MENU" ] && ! cmdline_has olpcboy.nomenu; then
 	done
 	tl "tty1: olpc-menu not running (crashes=$crashes rc=$rc), status screen"
 fi
+# no launcher: the status screen is text, so give the console back (no-op if already text)
+/usr/local/sbin/olpc-splash text
 
 status_text() {
 	printf ' OLPC-BOY   boot %s\n\n' "$(basename "$(readlink -f "$BOOTDIR")")"

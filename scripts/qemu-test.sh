@@ -37,7 +37,7 @@ command -v mcopy >/dev/null            || die "mtools not installed"
 # Kernel command line = the one olpc.fth sets (the line ending in 'to boot-file').
 CMDLINE=$(sed -n 's/^" \(.*\)" to boot-file[[:space:]]*$/\1/p' "$FTH" | tail -n1)
 [ -n "$CMDLINE" ] || die "could not extract the command line from $FTH"
-CMDLINE="$CMDLINE console=ttyS0 olpcboy.nobuttons"
+CMDLINE="$CMDLINE console=ttyS0 loglevel=7 olpcboy.nobuttons"   # loglevel=7: kernel messages on serial for the opcode check
 
 mkdir -p out
 if [ "${ANALYZE_ONLY:-0}" != 1 ]; then

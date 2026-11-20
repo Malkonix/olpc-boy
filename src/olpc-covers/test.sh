@@ -158,6 +158,8 @@ while [ $# -gt 0 ]; do
 done
 echo "$url" >>"$FAKE_REQ"
 [ -n "$FAKE_DOWN" ] && exit 1
+# libretro host gone (404 everywhere): only the GitHub fixtures answer
+case "$url" in http://fake/api/*|http://fake/raw/*) ;; *) [ -n "$FAKE_NOLR" ] && exit 1 ;; esac
 p=${url#http://fake/}
 case "$p" in */) p=${p}index.html ;; esac
 [ -f "$FAKE_FIX/$p" ] || exit 1
@@ -175,9 +177,9 @@ trap 'kill $GAMEPID 2>/dev/null; rm -rf "$tmp"' EXIT
 run() { # args...; sets RC
 	: >"$REQ"
 	env OLPC_COVERS_TEST=1 OLPC_COVERS_RUN="$RUN" OLPC_COVERS_LOG="$LOGF" OLPC_COVERS_BIN="$tmp" \
-	    OLPC_COVERS_THUMBS=http://fake OLPC_COVERS_WGET="$tmp/fake-wget" OLPC_COVERS_WIFI="$tmp/fake-wifi" \
+	    OLPC_COVERS_THUMBS=http://fake OLPC_COVERS_GH_API=http://fake/api OLPC_COVERS_GH_RAW=http://fake/raw OLPC_COVERS_WGET="$tmp/fake-wget" OLPC_COVERS_WIFI="$tmp/fake-wifi" \
 	    OLPC_COVERS_MOUNTPOINTS="$MNT" OLPC_COVERS_ROUTE="${ROUTE:-echo default via 10.0.0.1}" \
-	    FAKE_REQ="$REQ" FAKE_FIX="$FIX" FAKE_RUN="$RUN" FAKE_DOWN="$FAKE_DOWN" \
+	    FAKE_REQ="$REQ" FAKE_FIX="$FIX" FAKE_RUN="$RUN" FAKE_DOWN="$FAKE_DOWN" FAKE_NOLR="$FAKE_NOLR" \
 	    FAKE_GAME_AFTER="$FAKE_GAME_AFTER" FAKE_GAME_PID="$GAMEPID" \
 	    sh "$SCRIPT" "$@"
 	RC=$?
@@ -277,6 +279,129 @@ run fetch; run fetch   # fill everything
 ROUTE="echo" run fetch; eq "nonet but nothing to do: rc" $RC 0
 eq "nonet but nothing to do: status" "$(st)" "done 0 ok 0 missing 0 failed"
 eq "nonet but nothing to do: wifi not touched" "$(nreq wifi-up)" 0
+
+# ---- GitHub fallback (libretro host answers nothing)
+echo "== olpc-covers (GitHub fallback)"
+# tree2html: escapes and filtering
+cat >"$tmp/tree.json" <<'EOT'
+{
+  "sha": "abc",
+  "tree": [
+    {
+      "path": "Quote \" Back \\ Amp \u0026 Caf\u00e9 \ud83c\udfae (World).png",
+      "mode": "100644",
+      "sha": "1"
+    },
+    {
+      "path": "notes.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "A [b] 100% #1?.png",
+      "mode": "120000"
+    }
+  ],
+  "truncated": false
+}
+EOT
+OLPC_COVERS_TEST=1 sh "$SCRIPT" tree2html <"$tmp/tree.json" >"$tmp/t2h.out"
+eq "tree2html: table open/close" "$(sed -n 1p "$tmp/t2h.out") $(tail -n1 "$tmp/t2h.out")" "<table> </table>"
+eq "tree2html: escapes decoded and encoded" "$(sed -n 2p "$tmp/t2h.out")" '<a href="Quote%20%22%20Back%20%5C%20Amp%20%26%20Caf%C3%A9%20%F0%9F%8E%AE%20(World).png">x</a>'
+eq "tree2html: special chars, symlink kept, .txt dropped" "$(sed -n 3p "$tmp/t2h.out") $(wc -l <"$tmp/t2h.out")" '<a href="A%20%5Bb%5D%20100%25%20%231%3F.png">x</a> 4'
+printf '{"tree": []}\n' | OLPC_COVERS_TEST=1 sh "$SCRIPT" tree2html >"$tmp/t2h.out"
+eq "tree2html: nothing -> empty" "$(wc -c <"$tmp/t2h.out")" 0
+
+GR=Nintendo_-_Game_Boy
+mkdir -p "$FIX/api/$GR/git/trees" "$FIX/raw/$GR/master/Named_Boxarts" "$tmp/mnt2/ROMs/GB"
+RAWD=$FIX/raw/$GR/master/Named_Boxarts
+cat >"$FIX/api/$GR/git/trees/master" <<EOT
+{
+  "sha": "r00t",
+  "tree": [
+    {
+      "path": "Named_Boards",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0000000000000000000000000000000000000000"
+    },
+    {
+      "path": "Named_Boxarts",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "1111111111111111111111111111111111111111"
+    }
+  ]
+}
+EOT
+cat >"$FIX/api/$GR/git/trees/1111111111111111111111111111111111111111" <<'EOT'
+{
+  "tree": [
+    {
+      "path": "Super Mario Land (World).png",
+      "mode": "100644"
+    },
+    {
+      "path": "Tetris (World).png",
+      "mode": "120000"
+    },
+    {
+      "path": "Tetris (World) (Rev 1).png",
+      "mode": "120000"
+    },
+    {
+      "path": "Tetris (World) (Rev 2).png",
+      "mode": "100644"
+    },
+    {
+      "path": "Loop (World).png",
+      "mode": "120000"
+    },
+    {
+      "path": "Hack \u0026 Slash (World).png",
+      "mode": "100644"
+    }
+  ],
+  "truncated": false
+}
+EOT
+"$G" png rgba 300 200 "$RAWD/Super%20Mario%20Land%20(World).png"
+"$G" png blue 64 64 "$RAWD/Tetris%20(World)%20(Rev%202).png"
+"$G" png pal 16 16 "$RAWD/Hack%20%26%20Slash%20(World).png"
+printf 'Tetris (World) (Rev 1).png' >"$RAWD/Tetris%20(World).png"          # symlink, 2 hops
+printf 'Tetris (World) (Rev 2).png' >"$RAWD/Tetris%20(World)%20(Rev%201).png"
+printf 'Loop (World).png' >"$RAWD/Loop%20(World).png"                        # self-link: must give up
+: >"$tmp/mnt2/ROMs/GB/Super Mario Land (World).zip"
+: >"$tmp/mnt2/ROMs/GB/Tetris (World).gb"
+: >"$tmp/mnt2/ROMs/GB/Hack & Slash (World).zip"
+: >"$tmp/mnt2/ROMs/GB/Loop (World).gb"
+MNT_SAVE=$MNT; MNT=$tmp/mnt2; COV=$MNT/covers
+FAKE_NOLR=1 run fetch --system gb; eq "github: rc" $RC 0
+eq "github: status (loop is a failure)" "$(st)" "done 3 ok 0 missing 1 failed"
+eq "github: index source remembered" "$(cat "$COV/.index/gb.html.src")" github
+eq "github: index converted" "$(grep -c '^<a href=' "$COV/.index/gb.html")" 6
+eq "github: covers made" "$(ls "$COV/gb" | grep '\.obc$' | sort | tr '\n' '|')" "Hack & Slash (World).obc|Super Mario Land (World).obc|Tetris (World).obc|"
+eq "github: symlink resolved to the real image" "$("$G" obc "$COV/gb/Tetris (World).obc" | tr '\n' ' ')" "64 64 "
+eq "github: exactly 2 API calls" "$(nreq fake/api)" 2
+eq "github: libretro tried for the index only" "$(grep -c 'fake/Nintendo' "$REQ")" 2
+eq "github: no libretro image requests" "$(grep 'fake/Nintendo' "$REQ" | grep -c '\.png')" 0
+eq "github: symlink hops (1 + 2 raw gets)" "$(nreq 'Tetris')" 3
+eq "github: self-link gives up (3 gets, then fail)" "$(nreq 'Loop')" 3
+# cached index keeps its source: no API calls, images from raw even with libretro back up
+rm -f "$COV/gb/"*.obc
+run fetch --system gb
+eq "cached github index: no api, no libretro index" "$(nreq fake/api) $(grep -c 'Named_Boxarts/$' "$REQ")" "0 0"
+eq "cached github index: images from raw" "$(nreq fake/raw)" "$(nreq .png)"
+eq "cached github index: still ok" "$(st)" "done 3 ok 0 missing 1 failed"
+# index refresh with libretro healthy again prefers libretro
+rm -rf "$tmp/mnt3"; mkdir -p "$tmp/mnt3/ROMs/GB"; : >"$tmp/mnt3/ROMs/GB/Tetris (World).gb"
+MNT=$tmp/mnt3; COV=$MNT/covers
+run fetch --system gb
+eq "libretro preferred when it answers" "$(cat "$COV/.index/gb.html.src") $(nreq fake/api)" "libretro 0"
+# both sources dead -> failed, no index
+rm -rf "$tmp/mnt3/covers"
+FAKE_DOWN=1 run fetch --system gb
+eq "all sources down: failed" "$(st) $([ -e "$COV/.index/gb.html" ] && echo idx || echo noidx)" "done 0 ok 0 missing 1 failed noidx"
+MNT=$MNT_SAVE; COV=$MNT/covers
 
 run bogus 2>/dev/null; eq "usage rc" $RC 2
 

@@ -346,6 +346,13 @@ head -n1 "$T/wifi.cfg" | grep -q '^# my networks' && ok "comment kept" || bad "c
 out=$(do_forget "Nope" 2>&1); rc=$?
 [ "$rc" != 0 ] && eq "forget unknown: notsaved" "$out" "RESULT notsaved $(reason_text notsaved)" || bad "forget unknown rc"
 do_forget 'Gone\x20Away' >/dev/null; eq "escaped SSID argument matches" "$(do_list)" "$(printf 'HomeNet\tWPA2')"
+# forgetting the network in use drops the link; another saved network stays connected
+reset; export OLPC_WIFI_CFG=$T/wifi.cfg; mkcfg "$T/wifi.cfg"; echo COMPLETED >"$T/wpa/state"; echo WepCafe >"$T/wpa/ssid"
+out=$( do_down() { echo DOWN; }; do_forget "WepCafe" )
+eq "forget connected network: disconnects" "$out" "$(printf 'DOWN\nRESULT ok Forgotten')"
+reset; export OLPC_WIFI_CFG=$T/wifi.cfg; mkcfg "$T/wifi.cfg"; echo COMPLETED >"$T/wpa/state"; echo HomeNet >"$T/wpa/ssid"
+out=$( do_down() { echo DOWN; }; do_forget "WepCafe" )
+eq "forget other network: stays connected" "$out" "RESULT ok Forgotten"
 
 # ================================================================ autoconnect
 echo "== autoconnect"

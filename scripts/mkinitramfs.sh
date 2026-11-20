@@ -37,6 +37,9 @@ for a in sh ash mount umount findfs blkid switch_root getty sync cat; do
 		|| ln -sf busybox "$OUT/bin/$a"
 done
 
+# boot splash (static, geode flags like the other tools); init draws it first thing
+make -s -C src/olpc-splash OUT="$PWD/$OUT/bin" CFLAGS="-Os -march=geode -mtune=geode -Wall -Wextra"
+
 install -m 0755 initramfs/init "$OUT/init"
 # /etc/mtab for busybox mount
 ln -sf ../proc/mounts "$OUT/etc/mtab"

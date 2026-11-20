@@ -10,6 +10,7 @@ depend() {
 }
 
 start() {
+	/usr/local/sbin/olpc-splash progress 70 "Mounting SD card"
 	ebegin "olpc-sd: SD card"
 	/usr/local/sbin/olpc-sdmount
 	eend 0
