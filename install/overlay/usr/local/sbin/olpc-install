@@ -453,12 +453,15 @@ fi
 
 # =================================================================================== INSTALL
 # ---- 1. gate -----------------------------------------------------------------------------------
-REINSTALL=0
+REINSTALL=0 ACCEPT=0
 cmdline_has olpcboy.reinstall && REINSTALL=1
 for _f in "$STICK"/*; do
 	[ -f "$_f" ] || continue
 	[ "$(basename "$_f" | tr 'A-Z' 'a-z')" = reinstall ] && REINSTALL=1
+	[ "$(basename "$_f" | tr 'A-Z' 'a-z')" = acceptchanges ] && ACCEPT=1
 done
+cmdline_has olpcboy.acceptchanges && ACCEPT=1
+ACCEPT_MAX=${OLPC_INSTALL_ACCEPT_MAX:-256}   # 32 MiB of changed blocks at most
 GATE=""
 if [ "$REINSTALL" = 1 ]; then
 	say "gate: re-install requested (flag); looking for the olpc-boy marker in erase block 0"
@@ -485,12 +488,19 @@ if [ -z "$GATE" ]; then
 			cmp_blocks "$RUN/pre.blk" "$EXP_RST"
 			say "precheck: vs restored layout: $CB_OUT differ outside the known bad blocks, $CB_BAD differ inside them"
 			if [ "$CB_NA" = "$CB_NE" ] && [ "$CB_OUT" = 0 ]; then GATE=backup; LAYOUT_NAME="restored layout"; fi
+			# The original OS, booted after a restore to prove it, writes a little to its JFFS2
+			# (logs, journal).  With an explicit ACCEPTCHANGES file (or olpcboy.acceptchanges) a few
+			# changed blocks are accepted: that data is the only thing lost, the backup is intact.
+			if [ -z "$GATE" ] && [ "$CB_NA" = "$CB_NE" ] && [ "$CB_OUT" -le "$ACCEPT_MAX" ] && [ "$ACCEPT" = 1 ]; then
+				GATE=backup; LAYOUT_NAME="restored layout, $CB_OUT block(s) changed since, accepted by ACCEPTCHANGES"
+				say "precheck: changed blocks accepted (ACCEPTCHANGES): $CB_LIST"
+			fi
 		fi
 		if [ -z "$GATE" ]; then
 			cp "$RUN/pre.blk" "$OUTD/precheck-blocks.txt" 2>/dev/null
 			fatal "the NAND matches neither the backup (differs in blocks: $O_LIST) nor the restored layout ($CB_OUT block(s) differ)" \
 				"A block changed since the backup, or a bad block grew during the restore: the backup no longer describes the NAND." \
-				"ABORTED before any write. (olpc-boy already installed? add an empty file REINSTALL to the stick.)"
+				"ABORTED before any write. (olpc-boy already installed? add an empty file REINSTALL to the stick. Original OS booted after a restore? an empty file ACCEPTCHANGES accepts up to $ACCEPT_MAX changed blocks.)"
 		fi
 	fi
 	say "precheck ok: the NAND equals the backup ($LAYOUT_NAME)"
@@ -573,6 +583,7 @@ if $MOUNT -o remount,rw "$MNT" 2>"$RUN/remount.err"; then
 		[ -f "$_f" ] || continue
 		_b=$(basename "$_f"); _u=$(echo "$_b" | tr 'a-z' 'A-Z')
 		[ "$_u" = REINSTALL ] && continue
+		[ "$_u" = ACCEPTCHANGES ] && continue
 		[ "$(wc -c <"$_f")" -le 65536 ] || continue
 		if cp "$_f" "$DST/olpclog/$_b" 2>>"$RUN/copy.err"; then NSET=$(( NSET + 1 )); [ "$_u" = WIFI.CFG ] && chmod 600 "$DST/olpclog/$_b"
 		else warn "could not copy $_b"; fi

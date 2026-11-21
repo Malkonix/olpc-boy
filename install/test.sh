@@ -355,6 +355,15 @@ for tb in 30 2; do
 	cp "$D/nand.rest" "$D/nand.img"; flipblk $tb; cp "$D/nand.img" "$D/nand.orig"
 	run_it; expect_abort "restored layout with a tampered block ($tb): aborted, nothing written" "matches neither the backup .*restored layout"
 done
+# the original OS booted after the restore changed blocks 2 and 30: ACCEPTCHANGES lets the install go on
+cp "$D/nand.rest" "$D/nand.img"; flipblk 30; flipblk 2; cp "$D/nand.img" "$D/nand.orig"
+touch "$D/stick/acceptchanges"; run_it; rc=$?
+[ $rc = 0 ] && grep -q 'changed blocks accepted (ACCEPTCHANGES): .*2' "$D/out" && grep -q 'precheck ok: .*accepted by ACCEPTCHANGES' "$D/out" \
+	&& ok "restored layout + 2 changed blocks + ACCEPTCHANGES: accepted, install completes" || { bad "acceptchanges rc=$rc"; shownt; }
+# more changed blocks than allowed: still aborted
+cp "$D/nand.rest" "$D/nand.img"; flipblk 30; flipblk 2; cp "$D/nand.img" "$D/nand.orig"
+run_it OLPC_INSTALL_ACCEPT_MAX=1; expect_abort "ACCEPTCHANGES with more changed blocks than allowed: aborted" "matches neither the backup"
+rm -f "$D/stick/acceptchanges"
 # a grown bad block during the restore: the data shifts by one block, so the restored list no longer matches (fail safe)
 cp "$D/nand.v0" "$D/nand.img"; cp "$D/nand.v0" "$D/nand.orig"
 FAKE_BAD="$BAD 5" "$tmp/bin/flash_erase" -q -j "$D/dev/mtd0" 0 0 2>/dev/null
