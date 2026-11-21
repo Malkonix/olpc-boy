@@ -123,7 +123,7 @@ bounded() {
 
 # does the kernel cmdline contain a word?
 cmdline_has() {
-	for _w in $(cat /proc/cmdline); do
+	for _w in $(cat "${OLPC_CMDLINE_FILE:-/proc/cmdline}"); do
 		[ "$_w" = "$1" ] && return 0
 	done
 	return 1

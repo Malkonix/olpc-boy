@@ -6,6 +6,9 @@
  *   olpc-covers-match -b index.html < names   one ROM name per line; prints
  *                                             rom TAB entry TAB href  (entry/href empty on a miss)
  *
+ *   olpc-covers-match --tree2html < tree.json   GitHub git-tree JSON -> index form
+ *   olpc-covers-match --tree-sha DIR < tree.json   sha of the tree entry DIR
+ *
  * Exit status: 0 match found (single mode) / ok (batch), 1 no match, 2 error.
  *
  * The index is streamed line by line; only the ROM names are kept in memory
@@ -306,10 +309,158 @@ static void rom_init(struct rom *r, const char *raw)
 	normalise(r->base, r->norm);
 }
 
+/* ---- GitHub tree JSON -> Apache-like index (streamed, constant memory).
+ * Byte-identical to the awk implementation it replaced (kept as the reference
+ * in test.sh).  Only lines  <spaces>"path": "<value>"[,]  are looked at. */
+static const char SAFE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~()!,-";
+
+static void put_pct(char **o, unsigned b)
+{
+	static const char hx[] = "0123456789ABCDEF";
+	*(*o)++ = '%'; *(*o)++ = hx[(b >> 4) & 15]; *(*o)++ = hx[b & 15];
+}
+
+/* one literal character: safe set as is, other ASCII %XX, bytes >= 128 raw */
+static void put_chr(char **o, unsigned char c)
+{
+	if (c && strchr(SAFE, c)) *(*o)++ = (char)c;
+	else if (c < 128) put_pct(o, c);
+	else *(*o)++ = (char)c;
+}
+
+static void put_utf8(char **o, unsigned long cp)
+{
+	if (cp == 0) return;		/* awk sprintf("%c", 0) is empty */
+	else if (cp < 128) put_chr(o, (unsigned char)cp);
+	else if (cp < 0x800) { put_pct(o, 0xC0 + cp / 64); put_pct(o, 0x80 + cp % 64); }
+	else if (cp < 0x10000) {
+		put_pct(o, 0xE0 + cp / 4096); put_pct(o, 0x80 + cp / 64 % 64); put_pct(o, 0x80 + cp % 64);
+	} else {
+		put_pct(o, 0xF0 + cp / 262144); put_pct(o, 0x80 + cp / 4096 % 64);
+		put_pct(o, 0x80 + cp / 64 % 64); put_pct(o, 0x80 + cp % 64);
+	}
+}
+
+/* 4 hex digits at s (n bytes available) -> value, or -1 */
+static long hex4(const char *s, size_t n)
+{
+	long v = 0;
+	int i;
+	if (n < 4) return -1;
+	for (i = 0; i < 4; i++) {
+		int c = (unsigned char)s[i], d;
+		if (c >= '0' && c <= '9') d = c - '0';
+		else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+		else return -1;
+		v = v * 16 + d;
+	}
+	return v;
+}
+
+/* decode JSON escapes of s[0..n) and percent-encode; o must hold 12*n+1 */
+static size_t jenc(const char *s, size_t n, char *out)
+{
+	char *o = out;
+	size_t i = 0;
+	while (i < n) {
+		unsigned char c = (unsigned char)s[i];
+		long v, w;
+		if (c != '\\') { put_chr(&o, c); i++; continue; }
+		if (i + 1 < n && s[i + 1] == 'u' && (v = hex4(s + i + 2, n - i - 2)) >= 0) {
+			i += 6;
+			if (v >= 0xD800 && v < 0xDC00 && i + 1 < n && s[i] == '\\' && s[i + 1] == 'u' &&
+			    (w = hex4(s + i + 2, n - i - 2)) >= 0xDC00 && w < 0xE000) {
+				v = 0x10000 + (v - 0xD800) * 1024 + (w - 0xDC00); i += 6;
+			}
+			put_utf8(&o, (unsigned long)v);
+			continue;
+		}
+		if (i + 1 >= n) break;		/* lone trailing backslash: dropped */
+		c = (unsigned char)s[i + 1]; i += 2;
+		switch (c) {
+		case 'b': put_pct(&o, 8); break;
+		case 'f': put_pct(&o, 12); break;
+		case 'n': put_pct(&o, 10); break;
+		case 'r': put_pct(&o, 13); break;
+		case 't': put_pct(&o, 9); break;
+		default: put_chr(&o, c);	/* \" \\ \/ and unknown escapes */
+		}
+	}
+	*o = 0;
+	return (size_t)(o - out);
+}
+
+/* start of the value of a  ^ *"path": "  line, or NULL */
+static const char *path_value(const char *l)
+{
+	while (*l == ' ') l++;
+	return startswith(l, "\"path\": \"") ? l + 9 : NULL;
+}
+
+static int tree2html(void)
+{
+	char *line = NULL, *out = NULL;
+	size_t lcap = 0, ocap = 0, n = 0;
+	ssize_t len;
+	while ((len = getline(&line, &lcap, stdin)) > 0) {
+		const char *v;
+		const char *q, *e;
+		size_t vl, ol;
+		if (line[len - 1] == '\n') line[--len] = 0;
+		if (!(v = path_value(line))) continue;
+		vl = strlen(v);
+		/* drop  ",?[ \r]*$  starting at the last quote */
+		q = strrchr(v, '"');
+		if (q) {
+			e = q + 1;
+			if (*e == ',') e++;
+			while (*e == ' ' || *e == '\r') e++;
+			if (!*e) vl = (size_t)(q - v);
+		}
+		if (ocap < vl * 12 + 1) {
+			ocap = vl * 12 + 1;
+			out = realloc(out, ocap);
+			if (!out) return 2;
+		}
+		ol = jenc(v, vl, out);
+		if (ol < 4 || strcmp(out + ol - 4, ".png")) continue;
+		if (!n++) fputs("<table>\n", stdout);
+		printf("<a href=\"%s\">x</a>\n", out);
+	}
+	if (n) fputs("</table>\n", stdout);
+	return ferror(stdout) ? 2 : 0;
+}
+
+/* sha of the entry DIR: the first "sha" line after its "path" line */
+static int tree_sha(const char *dir)
+{
+	char *line = NULL, *pat;
+	size_t lcap = 0;
+	int found = 0;
+	if (asprintf(&pat, "\"path\": \"%s\"", dir) < 0) return 2;
+	while (getline(&line, &lcap, stdin) > 0) {
+		if (!found) { found = strstr(line, pat) != NULL; continue; }
+		if (strstr(line, "\"sha\":")) {
+			char *p = line;
+			int k;
+			for (k = 0; k < 3 && p; k++) { p = strchr(p, '"'); if (p) p++; }
+			if (p) { char *e = strchr(p, '"'); if (e) *e = 0; else p[strcspn(p, "\n")] = 0; puts(p); }
+			else puts("");
+			return 0;
+		}
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	int batch = argc > 1 && strcmp(argv[1], "-b") == 0;
-	const char *index = argc > 1 + batch ? argv[1 + batch] : NULL;
+	int batch;
+	const char *index;
+	if (argc == 2 && !strcmp(argv[1], "--tree2html")) return tree2html();
+	if (argc == 3 && !strcmp(argv[1], "--tree-sha")) return tree_sha(argv[2]);
+	batch = argc > 1 && strcmp(argv[1], "-b") == 0;
+	index = argc > 1 + batch ? argv[1 + batch] : NULL;
 	struct rom *roms = NULL;
 	int n = 0, cap = 0, i;
 	char *line = NULL;

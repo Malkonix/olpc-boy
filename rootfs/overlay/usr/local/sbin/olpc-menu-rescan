@@ -1,0 +1,7 @@
+#!/bin/sh
+# Ask the running launcher to rescan the ROM directories (SIGUSR1), e.g. after copying
+# games in over SSH.  The launcher also notices changed ROM directories by itself within
+# a few seconds while its list is on screen.
+# busybox pkill -x does not match here: signal the pids from pidof
+p=$(pidof olpc-menu) && kill -USR1 $p 2>/dev/null && echo "rescan requested" || echo "olpc-menu is not running"
+exit 0

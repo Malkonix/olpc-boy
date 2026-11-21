@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# SSH test server (dropbear) + its cost logger, in the background after boot is
+# complete.  See rootfs/README.md.
+
+description="olpc-boy: dropbear SSH test server and cost logger"
+
+depend() {
+	need olpclog
+	after olpc-bootdone
+}
+
+start() {
+	ebegin "Starting SSH test server"
+	/usr/local/sbin/olpc-ssh start
+	eend 0
+}
+
+stop() {
+	/usr/local/sbin/olpc-ssh stop
+	return 0
+}

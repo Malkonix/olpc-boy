@@ -3,6 +3,7 @@
  *   -b  block size for the "blocks with differences" count (default 131072)
  *   -c  rewrite "BYTES" read from stdin about once a second
  *   -o  at EOF write "DIFFBYTES DIFFBITS DIFFBLOCKS STREAMBYTES FILEBYTES\n"
+ *   -F  stream bytes beyond the end of FILE must be 0xFF (erased); only the non-0xFF ones count
  * Bytes present in only one of the two count as fully different.  Exit 0 if both were read
  * to the end without I/O error (differences are reported, not an error). */
 #include <stdio.h>
@@ -18,15 +19,16 @@ int main(int argc, char **argv)
 	const char *cfile = NULL, *ofile = NULL, *path = NULL;
 	unsigned long long blk = 131072, pos = 0, fpos = 0, dbytes = 0, dbits = 0, dblocks = 0, lastblk = ~0ULL;
 	time_t last = 0;
-	int i;
+	int i, tailff = 0;
 	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-b") && i + 1 < argc) blk = strtoull(argv[++i], NULL, 10);
+		if (!strcmp(argv[i], "-F")) tailff = 1;
+		else if (!strcmp(argv[i], "-b") && i + 1 < argc) blk = strtoull(argv[++i], NULL, 10);
 		else if (!strcmp(argv[i], "-c") && i + 1 < argc) cfile = argv[++i];
 		else if (!strcmp(argv[i], "-o") && i + 1 < argc) ofile = argv[++i];
 		else if (argv[i][0] != '-' && !path) path = argv[i];
-		else { fprintf(stderr, "usage: nbcmp [-b BLOCK] [-c countfile] [-o resultfile] FILE\n"); return 2; }
+		else { fprintf(stderr, "usage: nbcmp [-F] [-b BLOCK] [-c countfile] [-o resultfile] FILE\n"); return 2; }
 	}
-	if (!path || !blk) { fprintf(stderr, "usage: nbcmp [-b BLOCK] [-c countfile] [-o resultfile] FILE\n"); return 2; }
+	if (!path || !blk) { fprintf(stderr, "usage: nbcmp [-F] [-b BLOCK] [-c countfile] [-o resultfile] FILE\n"); return 2; }
 	FILE *f = fopen(path, "rb");
 	if (!f) { perror("nbcmp: open"); return 1; }
 	for (;;) {
@@ -44,7 +46,8 @@ int main(int argc, char **argv)
 			}
 		}
 		for (size_t k = m; k < (size_t)n; k++) {            /* stream longer than the file */
-			dbytes++; dbits += 8;
+			if (tailff && a[k] == 0xFF) continue;
+			dbytes++; dbits += tailff ? __builtin_popcount(~a[k] & 0xFF) : 8;
 			if ((pos + k) / blk != lastblk) { lastblk = (pos + k) / blk; dblocks++; }
 		}
 		fpos += m; pos += n;

@@ -96,6 +96,21 @@ D=$tmp/dump
 mkdir -p "$D"
 keep() { [ -n "$FRAMES_DIR" ] && { mkdir -p "$FRAMES_DIR"; cp "$D"/*.raw "$FRAMES_DIR"/ 2>/dev/null; }; }
 
+echo "== ROMs copied in while the list is shown are picked up (watch poll and SIGUSR1)"
+printf '#!/bin/sh\nprintf x >"%s/GB/Copied In.gb"\n' "$R" >"$tmp/rs-1"
+printf '#!/bin/sh\nprintf x >"%s/GB/Copied Two.gb"\nfor p in /proc/[0-9]*; do read -r c <$p/comm 2>/dev/null; [ "$c" = olpc-menu ] && kill -USR1 ${p#/proc/}; done\n' "$R" >"$tmp/rs-2"
+chmod +x "$tmp/rs-1" "$tmp/rs-2"
+cat >"$tmp/s-rs" <<EOS
+300 sh $tmp/rs-1
+10500 sh $tmp/rs-2
+11000 end
+EOS
+run_menu "$tmp/s-rs" OLPC_MENU_WATCH="$R"
+n0=$(sed -n 's/.*: \([0-9]*\) games (.*/\1/p' "$tmp/menu.err" | head -n1)
+grep -q "rescan: $((n0 + 1)) games" "$tmp/menu.err" && ok "mtime poll rescan picked up a copied ROM" || { bad "poll rescan"; cat "$tmp/menu.err"; }
+grep -q "rescan: $((n0 + 2)) games" "$tmp/menu.err" && ok "SIGUSR1 rescan" || bad "SIGUSR1 rescan"
+rm -f "$R/GB/Copied In.gb" "$R/GB/Copied Two.gb"
+
 echo "== program: list, covers, placeholder, system switch, options, empty state"
 rm -f "$T/run/menu.state"
 cat >"$tmp/s1" <<EOS
@@ -647,6 +662,60 @@ if [ "$1" -ge 1 ] && [ "$2" -ge $X_BAT ] && [ "$4" -le $((X_BAT + 96)) ] && [ "$
 	ok "50 -> 49 % live: dirty rect $2,$3..$4,$5 inside the battery slot, frame untouched elsewhere"
 else bad "battery live change: rects '$*'"; fi
 cmp -s "$D/bat-1.raw" "$D/bat-2.raw" && bad "dropping to 5 % changed nothing" || ok "49 -> 5 % live: screen changes (icon and hint bar)"
+keep
+
+echo "== options: SSH switch (real state from the pid file, background on/off, IP shown)"
+O3=$tmp/sshrun; rm -rf "$O3"; mkdir -p "$O3"; rm -f "$T/ssh.args"
+cat >"$tmp/ssh-stub" <<EOS
+#!/bin/sh
+echo "\$1" >>"$T/ssh.args"; sleep 0.2
+case "\$1" in on) echo \$PPID >"$O3/dropbear.pid";; off) rm -f "$O3/dropbear.pid";; esac
+EOS
+chmod +x "$tmp/ssh-stub"
+cat >"$tmp/s-ssh" <<EOS
+200 key START tap
+300 key DOWN tap
+400 key DOWN tap
+500 key DOWN tap
+600 key DOWN tap
+700 key DOWN tap
+800 key DOWN tap
+1000 dump $D/ssh-off.raw
+1100 key A tap
+1200 dump $D/ssh-pending.raw
+1800 dump $D/ssh-on.raw
+1900 key A tap
+2600 dump $D/ssh-off2.raw
+2700 key A tap
+2800 key A tap
+3500 dump $D/ssh-on2.raw
+EOS
+run_menu "$tmp/s-ssh" OLPC_MENU_RUNDIR="$O3" OLPC_MENU_SSH_BIN="$tmp/ssh-stub" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+[ "$(tr '\n' ' ' <"$T/ssh.args" 2>/dev/null)" = "on off on " ] && ok "A toggles: olpc-ssh on, off, on (the second A while busy is ignored)" || bad "ssh stub calls: $(tr '\n' ' ' <"$T/ssh.args" 2>/dev/null)"
+cmp -s "$D/ssh-off.raw" "$D/ssh-on.raw" && bad "SSH item looks the same ON and OFF" || ok "SSH ON screen differs from OFF"
+cmp -s "$D/ssh-pending.raw" "$D/ssh-on.raw" && bad "no pending state while the job runs" || ok "pending screen while olpc-ssh runs (UI not blocked)"
+cmp -s "$D/ssh-off.raw" "$D/ssh-off2.raw" && ok "back to OFF after toggling off: same screen" || bad "OFF screen differs after the toggle"
+grep -q 'ssh: now ON' "$tmp/menu.err" && grep -q 'ssh: switching OFF' "$tmp/menu.err" && ok "toggles are logged" || bad "toggle log lines missing"
+# a real running state with no toggle (pid file of a live process) shows ON, with the WiFi IP when connected
+echo $$ >"$O3/dropbear.pid"
+cat >"$tmp/s-ssh2" <<EOS
+200 key START tap
+300 key DOWN tap
+400 key DOWN tap
+500 key DOWN tap
+600 key DOWN tap
+700 key DOWN tap
+800 key DOWN tap
+1000 dump $D/ssh-live-nonet.raw
+EOS
+run_menu "$tmp/s-ssh2" OLPC_MENU_RUNDIR="$O3" OLPC_MENU_SSH_BIN="$tmp/ssh-stub" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+printf 'state=connected ssid=Casa ip=10.0.0.195\n' >"$O3/wifi.status"
+run_menu "$tmp/s-ssh2" OLPC_MENU_RUNDIR="$O3" OLPC_MENU_SSH_BIN="$tmp/ssh-stub" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+cp "$D/ssh-live-nonet.raw" "$D/ssh-live-net.raw" 2>/dev/null
+cmp -s "$D/ssh-on.raw" "$D/ssh-live-nonet.raw" && ok "ON (no network) looks like the ON screen without WiFi" || ok "live ON screen rendered"
+echo 99999999 >"$O3/dropbear.pid"
+run_menu "$tmp/s-ssh2" OLPC_MENU_RUNDIR="$O3" OLPC_MENU_SSH_BIN="$tmp/ssh-stub" OLPC_MENU_CFGDIR="$tmp/nodev" OLPC_MENU_TZFILE="$tmp/nodev/none"
+cmp -s "$D/ssh-live-nonet.raw" "$D/ssh-off.raw" && bad "stale pid file shows ON" || ok "stale pid file (dead process) is not ON"
 keep
 
 sh "$here/test-net.sh" || fail=1

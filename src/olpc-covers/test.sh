@@ -14,7 +14,7 @@ bad() { echo "  FAIL: $*"; fail=1; }
 ok() { n=$((n + 1)); }
 eq() { ok; [ "$2" = "$3" ] || bad "$1: got '$2', want '$3'"; }
 
-CF="-O2 -march=geode -mtune=geode -Wall -Wextra"
+CF=${CF:-"-O2 -march=geode -mtune=geode -Wall -Wextra"}	# host runs: CF="-O2 -Wall -Wextra"
 $CC $CF -static -o "$tmp/png2obc" "$here/png2obc.c" || exit 1
 $CC $CF -static -o "$tmp/olpc-covers-match" "$here/olpc-covers-match.c" || exit 1
 $CC -O1 -o "$tmp/t_gen" "$here/t_gen.c" || exit 1
@@ -304,12 +304,120 @@ cat >"$tmp/tree.json" <<'EOT'
   "truncated": false
 }
 EOT
-OLPC_COVERS_TEST=1 sh "$SCRIPT" tree2html <"$tmp/tree.json" >"$tmp/t2h.out"
+"$M" --tree2html <"$tmp/tree.json" >"$tmp/t2h.out"
 eq "tree2html: table open/close" "$(sed -n 1p "$tmp/t2h.out") $(tail -n1 "$tmp/t2h.out")" "<table> </table>"
 eq "tree2html: escapes decoded and encoded" "$(sed -n 2p "$tmp/t2h.out")" '<a href="Quote%20%22%20Back%20%5C%20Amp%20%26%20Caf%C3%A9%20%F0%9F%8E%AE%20(World).png">x</a>'
 eq "tree2html: special chars, symlink kept, .txt dropped" "$(sed -n 3p "$tmp/t2h.out") $(wc -l <"$tmp/t2h.out")" '<a href="A%20%5Bb%5D%20100%25%20%231%3F.png">x</a> 4'
-printf '{"tree": []}\n' | OLPC_COVERS_TEST=1 sh "$SCRIPT" tree2html >"$tmp/t2h.out"
+printf '{"tree": []}\n' | "$M" --tree2html >"$tmp/t2h.out"
 eq "tree2html: nothing -> empty" "$(wc -c <"$tmp/t2h.out")" 0
+eq "script tree2html subcommand = helper" "$(OLPC_COVERS_TEST=1 OLPC_COVERS_BIN="$tmp" sh "$SCRIPT" tree2html <"$tmp/tree.json" | cksum)" "$("$M" --tree2html <"$tmp/tree.json" | cksum)"
+
+# Equivalence with the awk implementation the helper replaced (reference).
+cat >"$tmp/ref.awk" <<'EOT'
+function init(  i) { for (i = 1; i < 128; i++) ORD[sprintf("%c", i)] = i }
+function pct(b) { return sprintf("%%%02X", b) }
+function enc1(c) {
+	if (index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~()!,-", c)) return c
+	if (c in ORD) return pct(ORD[c])
+	return c
+}
+function hex4(s,   i, v, d) {
+	v = 0
+	for (i = 1; i <= 4; i++) {
+		d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
+		if (d < 0) return -1
+		v = v * 16 + d
+	}
+	return v
+}
+function utf8(cp) {
+	if (cp < 128) return enc1(sprintf("%c", cp))
+	if (cp < 2048) return pct(192 + int(cp / 64)) pct(128 + cp % 64)
+	if (cp < 65536) return pct(224 + int(cp / 4096)) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
+	return pct(240 + int(cp / 262144)) pct(128 + int(cp / 4096) % 64) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
+}
+function enc(s,   o, i) {
+	for (i = 1; i <= length(s); i++) o = o enc1(substr(s, i, 1))
+	return o
+}
+function jenc(s,   o, i, c, n, v, w) {
+	i = 1
+	while (i <= length(s)) {
+		c = substr(s, i, 1)
+		if (c != "\\") { o = o enc1(c); i++; continue }
+		n = substr(s, i + 1, 1)
+		if (n == "u" && (v = hex4(substr(s, i + 2, 4))) >= 0) {
+			i += 6
+			if (v >= 55296 && v < 56320 && substr(s, i, 2) == "\\u" && (w = hex4(substr(s, i + 2, 4))) >= 56320 && w < 57344) {
+				v = 65536 + (v - 55296) * 1024 + (w - 56320); i += 6
+			}
+			o = o utf8(v); continue
+		}
+		i += 2
+		if (n == "b") o = o pct(8)
+		else if (n == "f") o = o pct(12)
+		else if (n == "n") o = o pct(10)
+		else if (n == "r") o = o pct(13)
+		else if (n == "t") o = o pct(9)
+		else o = o enc1(n)
+	}
+	return o
+}
+
+BEGIN { init() }
+/^[ ]*"path": "/ {
+	s = $0; sub(/^[ ]*"path": "/, "", s); sub(/",?[ \r]*$/, "", s)
+	h = jenc(s)
+	if (h ~ /\.png$/) { if (!n++) print "<table>"; print "<a href=\"" h "\">x</a>" }
+}
+END { if (n) print "</table>" }
+EOT
+AWK=awk; command -v busybox >/dev/null 2>&1 && AWK="busybox awk"	# the XO's awk
+same() { # name file: helper and reference must agree byte for byte
+	$AWK -f "$tmp/ref.awk" <"$2" >"$tmp/ref.out"; "$M" --tree2html <"$2" >"$tmp/c.out"
+	cmp -s "$tmp/ref.out" "$tmp/c.out" && ok || bad "tree2html differs from awk reference: $1"
+}
+{ # escapes, surrogates, CRLF, trailing commas/blanks, odd lines
+printf '%s\r\n' '{' '      "path": "Q \" B \\ S \/ \b\f\n\r\t é € 🎮.png",' \
+ '  "path": "lone \ud83c x.png"' ' "path": "bad \u12g4 \u12" ' '"path": "no indent.png"' \
+ '   "path": "trail\\.png",   ' '   "path": "nonpng.PNG",' '   "path": "unk \q \x.png"' \
+ '   "path": "A.PNG.png"' '   "path": "A~ÿ.png"' '   "path": "back at end\\",' \
+ '   "path": "x.png\"",' '   "path": "x.png" junk",' '   "path": "x.png"  ' '   "path": "\ud83cA.png"' \
+ '   "path": "\udc00\ud83c.png"' '   "path": "\u0000x.png"' '   "path": "\ud83c\udc' '   "path": "🀀' \
+ '   "path": "short\u12'
+printf '\t"path": "tab indent.png"\n'
+# raw UTF-8 only: a unicode-aware busybox awk (Alpine) drops lines with invalid
+# UTF-8 (\377), which JSON from GitHub never contains; the helper passes bytes through
+printf '   "path": "raw \303\251 \001 q.png"\n   "path": "no newline at end.png"'
+} >"$tmp/edge.json"
+same "edge cases" "$tmp/edge.json"
+printf '   "path": "a.txt"\n' >"$tmp/e2.json"; same "no png" "$tmp/e2.json"
+: >"$tmp/e3.json"; same "empty input" "$tmp/e3.json"
+$AWK 'BEGIN { srand(7); n = split("a Z 0 _ \\\\ \\\" \\u \\ud83c \\udfae \\u00e9 \\n \" , .png \\/ \\uD83D \\uDE00 \\u12 \\q %", A, " ")
+	for (i = 0; i < 4000; i++) { v = ""; k = int(rand() * 9)
+		for (j = 0; j < k; j++) v = v A[1 + int(rand() * n)]
+		if (rand() < .5) v = v ".png"
+		printf "%s\"path\": \"%s%s\n", (rand() < .3 ? "      " : "  "), v, (rand() < .5 ? "\"," : "\"") } }' >"$tmp/fuzz.json"
+same "random escapes (4000 lines)" "$tmp/fuzz.json"
+[ -n "$OLPC_COVERS_REAL_TREE" ] && [ -r "$OLPC_COVERS_REAL_TREE" ] && same "real tree" "$OLPC_COVERS_REAL_TREE"
+cat >"$tmp/root.json" <<'EOT'
+{
+  "tree": [
+    {
+      "path": "Named_Snaps",
+      "sha": "1111"
+    },
+    {
+      "path": "Named_Boxarts",
+      "mode": "040000",
+      "sha": "abc123def",
+      "url": "x"
+    }
+  ]
+}
+EOT
+eq "tree-sha" "$("$M" --tree-sha Named_Boxarts <"$tmp/root.json")" abc123def
+eq "tree-sha: absent" "$("$M" --tree-sha Nope <"$tmp/root.json" | wc -c)" 0
 
 GR=Nintendo_-_Game_Boy
 mkdir -p "$FIX/api/$GR/git/trees" "$FIX/raw/$GR/master/Named_Boxarts" "$tmp/mnt2/ROMs/GB"
@@ -401,6 +509,35 @@ eq "libretro preferred when it answers" "$(cat "$COV/.index/gb.html.src") $(nreq
 rm -rf "$tmp/mnt3/covers"
 FAKE_DOWN=1 run fetch --system gb
 eq "all sources down: failed" "$(st) $([ -e "$COV/.index/gb.html" ] && echo idx || echo noidx)" "done 0 ok 0 missing 1 failed noidx"
+
+# shared index: a fresh copy in any mount's covers dir serves all mounts
+mkdir -p "$tmp/mnt4/ROMs/GB"; : >"$tmp/mnt4/ROMs/GB/Tetris (World).gb"
+MNT="$tmp/mnt2 $tmp/mnt4"; COV=$tmp/mnt4/covers
+run fetch --system gb
+eq "shared index: reused from the other mount, no request for it" "$(nreq 'Named_Boxarts/$') $(nreq fake/api)" "0 0"
+eq "shared index: not copied into the second mount" "$([ -e "$tmp/mnt4/covers/.index" ] && echo copy || echo none)" none
+eq "shared index: cover stored next to its ROMs" "$([ -s "$tmp/mnt4/covers/gb/Tetris (World).obc" ] && echo y)" y
+# empty first mount (nothing cached): the index is built in the first writable covers dir
+rm -rf "$tmp/mnt2/covers" "$tmp/mnt4/covers"; mkdir -p "$tmp/mnt5/ROMs/GB"; : >"$tmp/mnt5/ROMs/GB/Tetris (World).gb"
+MNT="$tmp/mnt4 $tmp/mnt5"
+run fetch --system gb
+eq "shared index: built once in the first mount" "$([ -s "$tmp/mnt4/covers/.index/gb.html" ] && echo y) $([ -e "$tmp/mnt5/covers/.index" ] && echo dup)" "y "
+eq "shared index: second mount's cover made" "$([ -s "$tmp/mnt5/covers/gb/Tetris (World).obc" ] && echo y)" y
+run fetch --system gb
+eq "shared index: later runs need no download" "$(nreq 'Named_Boxarts/$') $(nreq fake/api)" "0 0"
+
+# timing lines and resumable tree download
+: >"$LOGF"
+MNT=$tmp/mnt6; COV=$MNT/covers; mkdir -p "$MNT/ROMs/GB"; : >"$MNT/ROMs/GB/Tetris (World).gb"
+FAKE_NOLR=1 run fetch --system gb
+eq "log: tree download and conversion timed" "$(grep -c 'index gb: tree downloaded [0-9]* bytes in [0-9]* s' "$LOGF") $(grep -c 'index gb: converted in [0-9]* s' "$LOGF")" "1 1"
+eq "log: tree json removed once converted" "$(ls -A "$COV/.index" | tr '\n' ' ')" "gb.html gb.html.src "
+# a finished tree left behind by an aborted run is converted without downloading
+rm -f "$COV/.index/gb.html" "$COV/.index/gb.html.src" "$COV/gb/"*.obc
+cp "$FIX/api/$GR/git/trees/1111111111111111111111111111111111111111" "$COV/.index/gb.tree.json"
+FAKE_NOLR=1 run fetch --system gb --force
+eq "resume: no tree download" "$(nreq 'fake/api')" 0
+eq "resume: index built from the kept tree" "$(grep -c '^<a href=' "$COV/.index/gb.html") $([ -e "$COV/.index/gb.tree.json" ] && echo left)" "6 "
 MNT=$MNT_SAVE; COV=$MNT/covers
 
 run bogus 2>/dev/null; eq "usage rc" $RC 2

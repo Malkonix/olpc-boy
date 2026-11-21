@@ -1,0 +1,622 @@
+#!/bin/sh
+# olpc-install -- install olpc-boy on the internal NAND of an XO-1, or restore the original OS
+# from the NAND backup stick (runs from inittab, once, as root, from the boot stick).
+#
+#   olpcboy.install (kernel command line)  INSTALL
+#   olpcboy.restore                        RESTORE
+#
+# Writes only to mtd0 "olpcboy" = erase blocks 0..8187.  The 4 bad block table blocks (8188..8191)
+# are mtd1 "bbt", read-only; the driver never writes them (allow_bbt_write=0).  The kernel command
+# line (mtdparts=cafe_nand:1048064k(olpcboy),-(bbt)ro) makes that layout; this script refuses to
+# write unless sysfs confirms exactly it.  The only functions that erase/write are w_erase and
+# w_write, they address mtd0 only and refuse to run before the gate (ALLOW_WRITE) was opened.
+#
+# INSTALL
+#   0. prepare, layout check (no writes)
+#   1. gate: either the whole NAND still hashes, block by block, to the backup (so the backup
+#      describes what is destroyed; ~10.5 min), or this is a RE-install over an olpc-boy install
+#      (cmdline olpcboy.reinstall or a file REINSTALL on the stick, AND erase block 0 carries the
+#      olpc-boy marker or is erased).  Otherwise: ABORT, nothing written.
+#   2. flash_erase -j mtd0, nandwrite -p the JFFS2 image (bad blocks skipped)
+#   3. read back the written region and compare with the image (bad blocks accounted for)
+#   4. mount JFFS2 read-only, check marker, /boot files and the SHA-256 manifest of every file
+#   5. remount read-write, copy WIFI.CFG + settings, saves, states, covers and (if they fit) the
+#      ROMs from the stick into /data; unmount
+# RESTORE
+#   mount the backup stick (vfat label OLPCNAND) READ-ONLY, check NANDCOPY.DAT against SHA256SUMS,
+#   flash_erase -j mtd0, nandwrite -p NANDCOPY.DAT (what Open Firmware's nd-copy-nand does: the
+#   blocks one after the other into the good blocks, the rest erased with cleanmarkers), read the
+#   whole partition back and compare, mount the result read-only as a sanity check.
+# Log: logs/boot-NNNN/INSTALL.TXT (RESTORE.TXT) on the stick.  Env overrides for the test harness
+# (install/test.sh) are honoured only with IT_TEST=1.
+. "${OLPC_COMMON:-/usr/libexec/olpcboy/common.sh}"
+
+# ---- configuration ----------------------------------------------------------------------
+CMDLINE=${IT_CMDLINE:-/proc/cmdline}
+MODE=""
+SIM=0
+if [ -n "$IT_TEST" ]; then
+	MODE=${IT_MODE:-install}; [ -n "$IT_SIM" ] && SIM=1
+else
+	cmdline_has olpcboy.install && MODE=install
+	cmdline_has olpcboy.restore && MODE=restore
+	cmdline_has olpcboy.nandsim && SIM=1
+fi
+if [ "$SIM" = 1 ]; then
+	# nandsim: 256 MiB, 2048+64, 128 KiB blocks: the XO-1 layout scaled down (QEMU tests)
+	IT_ID="NAND 256MiB 3,3V 8-bit"
+	SIZE=268435456 ERASE=131072 WRITE=2048 OOB=64
+	PART_BLKS=2044 BBT_BLKS=4
+	BADBLKS=""
+	EXPD=${IT_EXPD:-/usr/share/olpc-install/sim}
+else
+	IT_ID=cafe_nand
+	SIZE=1073741824 ERASE=131072 WRITE=2048 OOB=64
+	PART_BLKS=8188 BBT_BLKS=4
+	BADBLKS="495 967 4039 4115 4644 4752 4791 4926 6373 6974 7748 7824 7863"
+	EXPD=${IT_EXPD:-/usr/share/olpc-install}
+fi
+if [ -n "$IT_TEST" ]; then
+	SIZE=${IT_SIZE:-$SIZE} ERASE=${IT_ERASE:-$ERASE} WRITE=${IT_WRITE:-$WRITE} OOB=${IT_OOB:-$OOB}
+	PART_BLKS=${IT_PART_BLKS:-$PART_BLKS} BBT_BLKS=${IT_BBT_BLKS:-$BBT_BLKS}
+	BADBLKS=${IT_BADBLKS-$BADBLKS}
+fi
+PART_KIB=$(( PART_BLKS * ERASE / 1024 ))
+WANT_PARTS="mtdparts=$IT_ID:${PART_KIB}k(olpcboy),-(bbt)ro"
+[ "$SIM" = 1 ] && WANT_PARTS="mtdparts=\"$IT_ID:${PART_KIB}k(olpcboy),-(bbt)ro\""
+[ -n "$IT_TEST" ] && WANT_PARTS=${IT_WANT_PARTS:-$WANT_PARTS}
+TOTAL_BLKS=$(( SIZE / ERASE ))
+P0=$(( PART_BLKS * ERASE )); P1=$(( SIZE - P0 ))
+MARK=OLPCBOY-NAND-INSTALL-1
+EXP_BLK=$EXPD/expected-blocks.txt
+EXP_RST=$EXPD/expected-blocks-restored.txt      # the NAND after restoring NANDCOPY.DAT (optional)
+INSTD=${IT_INSTD:-/usr/share/olpc-install}
+INST_IMG=$INSTD/nand-root.jffs2
+INST_SUM=$INSTD/nand-root.sha256
+
+PMTD=${IT_MTD0:-/dev/mtd0}                  # the ONLY device that is ever written
+BMTD=${IT_MTD1:-/dev/mtd1}
+BLK0=${IT_BLK0:-/dev/mtdblock0}
+SYSD=${IT_SYSD:-/sys/class/mtd}
+MODSYS=${IT_MODSYS:-/sys/module/cafe_nand}
+ND=${IT_NANDDUMP:-/usr/sbin/nanddump}
+NWRITE=${IT_NANDWRITE:-/usr/sbin/nandwrite}
+FERASE=${IT_FLASH_ERASE:-/usr/sbin/flash_erase}
+NBHASH=${IT_NBHASH:-/usr/local/sbin/nbhash}
+NBCMP=${IT_NBCMP:-/usr/local/sbin/nbcmp}
+NBTOOL=${IT_NBTOOL:-/usr/local/sbin/nbtool}
+NBJFFS=${IT_NBJFFS:-/usr/local/sbin/nbjffs}
+SPLASH=${IT_SPLASH:-/usr/local/sbin/olpc-splash}
+RUN=${IT_RUN:-/run/olpcboy/it}
+MNT=${IT_MNT:-/run/olpcboy/itmnt}
+BKMNT=${IT_BKMNT:-/run/olpcboy/itbackup}
+STICK=${IT_STICK:-/mnt/olpclog}             # the boot stick (FAT, OLPCLOG)
+TTY=${IT_TTY:-/dev/tty1}
+MOUNT=${IT_MOUNT:-mount}
+UMOUNT=${IT_UMOUNT:-umount}
+BLKIDS=${IT_BLKIDS:-olpc_blkid}
+MOUNTS=${IT_MOUNTS:-/proc/mounts}
+case $MODE in
+install) LOGNAME_=INSTALL.TXT; WHAT="NAND INSTALL" ;;
+restore) LOGNAME_=RESTORE.TXT; WHAT="NAND RESTORE" ;;
+*) LOGNAME_=INSTALL.TXT; WHAT="NAND INSTALL" ;;
+esac
+LOG=$BOOTDIR/$LOGNAME_
+OUTD=$BOOTDIR/install
+END_OK=${IT_END_OK:-120}; END_FAIL=${IT_END_FAIL:-900}; [ "$SIM" = 1 ] && END_OK=3 END_FAIL=3
+RESTORE_WAIT=${IT_RESTORE_WAIT:-120}
+
+mkdir -p "$RUN" "$OUTD" "$MNT" "$BKMNT" 2>/dev/null
+: >"$LOG"
+
+# ---- helpers ----------------------------------------------------------------------------
+up() { read -r _u _ <"${IT_UPTIME:-/proc/uptime}"; echo "${_u%.*}"; }
+T0=$(up)
+say() { echo "[install] $*"; echo "$(up) $*" >>"$LOG"; tl "install: $*"; }
+prog() { [ -x "$SPLASH" ] && "$SPLASH" progress "$1" "$2" 2>/dev/null; }
+sattr() { read -r _a <"$SYSD/mtd$1/$2" 2>/dev/null && echo "$_a" || echo "?"; }
+mbs() { _d=$2; [ "$_d" -ge 1 ] || _d=1; _v=$(( $1 * 1000 / 1048576 / _d )); echo "$(( _v / 10 )).$(( _v % 10 )) MB/s ($(( $2 / 100 )).$(( $2 % 100 )) s)"; }
+tcs() { _cs; echo "$CS"; }
+
+BKMOUNTED=0 NCHK=0 NFAIL=0 FAILED="" FINAL_RC=0 LAYOUT_OK=0 ALLOW_WRITE=0 MON="" MOUNTED=0 STATE="the NAND was NOT written" WARNINGS=""
+
+screen() {   # screen HEADLINE [line...]
+	_h=$1; shift
+	[ -x "$SPLASH" ] && "$SPLASH" text 2>/dev/null
+	{
+		printf '\033[2J\033[H\n\n'
+		printf '  ########################################################\n'
+		printf '  #                                                      #\n'
+		printf '  #   %-48s   #\n' "$_h"
+		printf '  #                                                      #\n'
+		printf '  ########################################################\n\n'
+		for _l in "$@"; do printf '  %s\n' "$_l"; done
+	} >"$TTY" 2>/dev/null
+	{ echo "== $_h"; for _l in "$@"; do echo "   $_l"; done; } >>"$LOG"
+	{ echo "== $_h"; for _l in "$@"; do echo "   $_l"; done; } >"$OUTD/final-screen.txt" 2>/dev/null
+}
+
+stop_monitor() { if [ -n "$MON" ]; then kill "$MON" 2>/dev/null; wait "$MON" 2>/dev/null; MON=""; fi; }
+
+finish() {   # finish SECONDS-TO-WAIT
+	sync
+	[ -n "$IT_NOPOWEROFF" ] || { say "powering off in $1 s"; olpc_sleep "$1"; sync; poweroff; olpc_sleep 20; poweroff -f; }
+	exit "$FINAL_RC"
+}
+
+# unrecoverable: no further writes.  STATE says what the NAND holds.
+fatal() {
+	stop_monitor
+	say "FATAL: $*"
+	[ "$MOUNTED" = 1 ] && { $UMOUNT "$MNT" 2>/dev/null && MOUNTED=0; }
+	[ "$BKMOUNTED" = 1 ] && { $UMOUNT "$BKMNT" 2>/dev/null && BKMOUNTED=0; }
+	say "state: $STATE"
+	FINAL_RC=1
+	screen "$WHAT FAILED" "$1" "$2" "$3" "No further writes were made." "State: $STATE" "Details: logs\\...\\$LOGNAME_ on the stick."
+	cp "$LOG" "$OUTD/$LOGNAME_" 2>/dev/null
+	finish "$END_FAIL"
+}
+
+chk() {   # chk NAME RC [DETAIL]   (RC 0 = pass)
+	NCHK=$(( NCHK + 1 ))
+	if [ "$2" = 0 ]; then say "PASS  $1${3:+: $3}"
+	else NFAIL=$(( NFAIL + 1 )); FAILED="$FAILED
+     - $1${3:+: $3}"; say "FAIL  $1${3:+: $3}"; fi
+}
+warn() { WARNINGS="$WARNINGS
+     - $1"; say "WARN  $1"; }
+
+# cmd LABEL command...: run, keep output in $RUN/LABEL.out, log command, rc, time.  Sets RC, DCS.
+cmd() {
+	_l=$1; shift
+	echo "$(up) \$ $*" >>"$LOG"
+	_cs; _a=$CS
+	"$@" >"$RUN/$_l.out" 2>&1; RC=$?
+	_cs; DCS=$(( CS - _a )); [ "$DCS" -ge 1 ] || DCS=1
+	echo "$(up)   rc=$RC, ${DCS} cs" >>"$LOG"
+	[ -s "$RUN/$_l.out" ] && head -c 300 "$RUN/$_l.out" | tr '\r' '\n' | tail -n 3 | sed 's/^/        /' >>"$LOG"
+	head -c 4000 "$RUN/$_l.out" >"$OUTD/$_l.out" 2>/dev/null
+	return "$RC"
+}
+
+# ---- the only two write primitives; both address mtd0 only, behind the gate ------------------
+w_erase() {   # w_erase LABEL
+	[ "$LAYOUT_OK" = 1 ] && [ "$ALLOW_WRITE" = 1 ] || fatal "internal error: erase attempted before the layout/gate checks"
+	_wl=$1; shift
+	STATE="the NAND was ERASED (a partial image may be on it): it will not boot olpc-boy yet"
+	cmd "$_wl" "$FERASE" -q -j "$PMTD" 0 0
+}
+w_write() {   # w_write LABEL FILE
+	[ "$LAYOUT_OK" = 1 ] && [ "$ALLOW_WRITE" = 1 ] || fatal "internal error: write attempted before the layout/gate checks"
+	_wl=$1; _wf=$2; shift 2
+	cmd "$_wl" "$NWRITE" -q -p "$PMTD" "$_wf"
+}
+
+# ---- reads ------------------------------------------------------------------------------------
+start_monitor() {   # start_monitor TAG LABEL BASE SPAN EXPECT
+	( _e=$(( $5 / 1048576 )); [ "$_e" -ge 1 ] || _e=1
+	  while :; do
+		_c=0; [ -r "$RUN/$1.cnt" ] && read -r _c <"$RUN/$1.cnt"
+		_c=$(( ${_c:-0} / 1048576 )); [ "$_c" -gt "$_e" ] && _c=$_e
+		prog $(( $3 + $4 * _c / _e )) "$2: $_c of $_e MiB"
+		olpc_sleep 3
+	  done ) &
+	MON=$!
+}
+
+# hash_pass TAG LABEL BASE SPAN: ECC dump of mtd0+mtd1 (every block, bad ones included),
+# SHA-256 per erase block into $RUN/TAG.blk.  Returns 0 if all stages ran and SIZE bytes came.
+hash_pass() {
+	_t=$1
+	rm -f "$RUN/$_t".*; : >"$RUN/$_t.cnt"; : >"$RUN/$_t.nd"
+	start_monitor "$_t" "$2" "$3" "$4" "$SIZE"
+	{ for _m in "$PMTD" "$BMTD"; do "$ND" -q --bb=dumpbad "$_m" 2>>"$RUN/$_t.err"; echo $? >>"$RUN/$_t.nd"; done; } \
+		| { "$NBHASH" -n -B "$ERASE" -L "$RUN/$_t.blk" -c "$RUN/$_t.cnt" -o "$RUN/$_t.sha"; echo $? >"$RUN/$_t.hs"; }
+	stop_monitor
+	head -n 100 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	_ok=0
+	_n=$(grep -c '^0$' "$RUN/$_t.nd" 2>/dev/null)
+	_h=x; read -r _h <"$RUN/$_t.hs" 2>/dev/null
+	_sha=""; _by=0; read -r _sha _by <"$RUN/$_t.sha" 2>/dev/null
+	[ "$_n" = 2 ] && [ "$_h" = 0 ] && [ "$_by" = "$SIZE" ] && _ok=1
+	[ "$_ok" = 1 ] || say "$_t: dump incomplete (nanddump ok=$_n/2, hash rc=$_h, bytes=${_by:-0} of $SIZE)"
+	[ "$_ok" = 1 ]
+}
+
+# cmp_blocks LIST [EXPECTED]: compare a per-block hash list with the backup's (or EXPECTED).  Sets CB_NA CB_NE CB_BAD CB_OUT CB_LIST.
+cmp_blocks() {
+	set -- $(awk -v bad="$BADBLKS" '
+		BEGIN { n = split(bad, b, " "); for (i = 1; i <= n; i++) isbad[b[i]] = 1 }
+		NR == FNR { e[$1] = $2; ne++; next }
+		{ na++; if (!($1 in e) || e[$1] != $2) { if ($1 in isbad) nb++; else { no++; if (no <= 40) l = l "," $1 } } }
+		END { printf "%d %d %d %d %s\n", na, ne, nb + 0, no + 0, (l == "" ? "-" : substr(l, 2)) }' "${2:-$EXP_BLK}" "$1" 2>/dev/null)
+	CB_NA=${1:-0} CB_NE=${2:-0} CB_BAD=${3:-0} CB_OUT=${4:-0} CB_LIST=${5:--}
+}
+
+# read_cmp TAG FILE [nbcmp options] -- [nanddump args]: dump compared with FILE.  Sets CMP_B CMP_BITS CMP_BLK CMP_N CMP_FN.
+read_cmp() {
+	_t=$1 _f=$2; shift 2
+	_co=""; while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do _co="$_co $1"; shift; done
+	[ "$1" = "--" ] && shift
+	rm -f "$RUN/$_t".*
+	# shellcheck disable=SC2086
+	{ "$ND" "$@" "$PMTD" 2>"$RUN/$_t.err"; echo $? >"$RUN/$_t.nd"; } \
+		| { if [ -n "$READ_CAP" ]; then head -c "$READ_CAP"; else cat; fi | "$NBCMP" -b "$ERASE" $_co -c "$RUN/$_t.cnt" -o "$RUN/$_t.res" "$_f"; echo $? >"$RUN/$_t.hs"; }
+	_a=x; _b=x; read -r _a <"$RUN/$_t.nd" 2>/dev/null; read -r _b <"$RUN/$_t.hs" 2>/dev/null
+	CMP_B=-1 CMP_BITS=0 CMP_BLK=0 CMP_N=0 CMP_FN=0
+	read -r CMP_B CMP_BITS CMP_BLK CMP_N CMP_FN <"$RUN/$_t.res" 2>/dev/null
+	head -n 50 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	# a pipe closed early by head makes nanddump exit non-zero: only the compare must be clean then
+	if [ -n "$READ_CAP" ]; then [ "$_b" = 0 ]; else [ "$_a" = 0 ] && [ "$_b" = 0 ]; fi
+}
+READ_CAP=""
+
+ecc_counts() {   # ecc_counts TAG -> "UNCORR_PAGES CORR_PAGES CORR_BITS" from nanddump's stderr
+	awk '/uncorrectable bitflip/ { up++ } /corrected bitflip/ { cp++; cb += $2 } END { printf "%d %d %d\n", up, cp, cb }' "$RUN/$1.err" 2>/dev/null
+}
+
+# bad blocks of the partition: the number the driver reports (the list is the fallback)
+nbad_part() {
+	_nb=$(sattr 0 bad_blocks)
+	case $_nb in ''|*[!0-9]*) set -- $BADBLKS; _nb=$# ;; esac
+	echo "$_nb"
+}
+
+# ---- 0. start and safety verification (no writes) ----------------------------------------
+case $MODE in install|restore) ;; *) fatal "no mode: the kernel command line has neither olpcboy.install nor olpcboy.restore" ;; esac
+say "start: $WHAT; mode $([ "$SIM" = 1 ] && echo SIMULATED || echo REAL); NAND $(( SIZE / 1048576 )) MiB, partition olpcboy = blocks 0..$(( PART_BLKS - 1 )) of $TOTAL_BLKS"
+prog 2 "Preparing"
+[ -w "$BOOTDIR" ] || fatal "boot stick not writable" "$BOOTDIR cannot be written."
+if [ "$MODE" = install ]; then
+	[ -r "$EXP_BLK" ] && [ -r "$INST_IMG" ] && [ -r "$INST_SUM" ] \
+		|| fatal "installer data missing from the stick" "Need $EXP_BLK, $INST_IMG, $INST_SUM"
+	[ "$(wc -l <"$EXP_BLK")" = "$TOTAL_BLKS" ] || fatal "expected block list has the wrong length" "$(wc -l <"$EXP_BLK") lines, expected $TOTAL_BLKS"
+	IMGSZ=$(wc -c <"$INST_IMG")
+	[ "$IMGSZ" -gt 0 ] && [ $(( IMGSZ % ERASE )) = 0 ] || fatal "NAND image has a bad size" "$IMGSZ bytes is not a multiple of $ERASE"
+	IMGBLK=$(( IMGSZ / ERASE ))
+	[ "$IMGBLK" -lt $(( PART_BLKS - 16 )) ] || fatal "NAND image does not fit" "$IMGBLK blocks"
+	# the image itself must carry summary nodes and the marker (build-time checks, repeated here)
+	set -- $("$NBJFFS" sum "$ERASE" <"$INST_IMG")
+	IMG_USED=${2:-0} IMG_SUMMED=${3:-0}
+	[ "$IMG_USED" -ge 1 ] && [ "$IMG_SUMMED" -ge $(( IMG_USED - 1 )) ] \
+		|| fatal "NAND image has no summary nodes" "used blocks $IMG_USED, with summary $IMG_SUMMED"
+	[ "$(dd if="$INST_IMG" bs="$ERASE" count=1 2>/dev/null | strings -a | grep -c "$MARK")" -ge 1 ] \
+		|| fatal "NAND image lacks the olpc-boy marker in erase block 0"
+fi
+
+# the backup stick is not used by the installer: never mount it, never run with it as the log device
+for _l in $($BLKIDS 2>/dev/null | while IFS= read -r _line; do
+		case $_line in *'LABEL="OLPCNAND"'*) echo "${_line%%:*}" ;; esac; done); do
+	if [ "$MODE" = install ]; then
+		say "note: a volume labelled OLPCNAND is present ($_l); the installer does not use or touch it"
+		grep -q "^$_l " "$MOUNTS" 2>/dev/null && fatal "the OLPCNAND backup stick is mounted ($_l)" "Remove it and boot again."
+	fi
+done
+
+# kernel command line: exactly the partitioning that protects the bad block tables
+_np=0; for _w in $(cat "$CMDLINE"); do case $_w in mtdparts=*) _np=$(( _np + 1 )) ;; esac; done
+case " $(cat "$CMDLINE") " in *" $WANT_PARTS "*) _pok=1 ;; *) _pok=0 ;; esac
+[ "$_np" = 1 ] && [ "$_pok" = 1 ] \
+	|| fatal "kernel command line lacks exactly $WANT_PARTS" "Refusing to load the NAND driver."
+if [ -z "$IT_TEST" ] && ls "$SYSD"/mtd[0-9]* >/dev/null 2>&1; then
+	fatal "an MTD device exists before the driver was loaded" "Unexpected; not continuing."
+fi
+BASEDMESG=$(dmesg | wc -l)
+if [ -z "$IT_NOLOAD" ]; then
+	if [ "$SIM" = 1 ]; then
+		modprobe --ignore-install nandsim id_bytes=0xec,0xda,0x10,0x95 2>"$RUN/modprobe.err" \
+			|| fatal "nandsim failed to load" "$(head -c 200 "$RUN/modprobe.err")"
+	else
+		modprobe --ignore-install cafe_nand allow_bbt_write=0 2>"$RUN/modprobe.err" \
+			|| fatal "cafe_nand failed to load" "$(head -c 200 "$RUN/modprobe.err")"
+	fi
+fi
+i=0
+while [ ! -d "$SYSD/mtd1" ] || [ ! -e "$BMTD" ] || [ ! -e "$PMTD" ]; do
+	i=$(( i + 1 ))
+	[ "$i" -gt 20 ] && fatal "no NAND found (the two MTD partitions did not appear)" "The driver loaded but did not detect a NAND." \
+		"$(dmesg | grep -v 'command line' | grep -i -E 'cafe_nand|cafe-nand|nandsim|mtd[0-9]' | tail -n 2 | cut -c1-70 | tr '\n' ' ')"
+	olpc_sleep 1
+done
+dmesg | tail -n +"$BASEDMESG" >"$OUTD/dmesg-nand.txt" 2>/dev/null
+
+# layout: every attribute must match before any write
+LAYOUT_ERR=""
+lay() { [ "$(sattr "$1" "$2")" = "$3" ] || LAYOUT_ERR="$LAYOUT_ERR mtd$1.$2=$(sattr "$1" "$2")(want $3);"; }
+_cnt=0
+for _d in "$SYSD"/mtd*; do
+	_b=${_d##*/}; case ${_b#mtd} in ''|*[!0-9]*) continue ;; esac
+	_cnt=$(( _cnt + 1 ))
+done
+[ "$_cnt" = 2 ] || LAYOUT_ERR="$LAYOUT_ERR $_cnt mtd devices instead of 2;"
+lay 0 name olpcboy; lay 1 name bbt
+lay 0 size "$P0"; lay 1 size "$P1"
+lay 0 offset 0; lay 1 offset "$P0"
+for _n in 0 1; do
+	lay $_n type nand; lay $_n erasesize "$ERASE"; lay $_n writesize "$WRITE"; lay $_n oobsize "$OOB"
+	_f=$(sattr $_n flags)
+	case $_f in
+	0x*|[0-9]*) _w=$(( _f & 0x400 ))
+		if [ "$_n" = 0 ]; then [ "$_w" -ne 0 ] || LAYOUT_ERR="$LAYOUT_ERR mtd0 is NOT writeable (flags $_f);"
+		else [ "$_w" -eq 0 ] || LAYOUT_ERR="$LAYOUT_ERR mtd$_n (bad block tables) IS WRITEABLE (flags $_f);"; fi ;;
+	*) LAYOUT_ERR="$LAYOUT_ERR mtd$_n flags unreadable;" ;;
+	esac
+done
+if [ "$SIM" != 1 ] && [ -z "$IT_NOLOAD" ]; then
+	_p=$(cat "$MODSYS/parameters/allow_bbt_write" 2>/dev/null)
+	[ "$_p" = 0 ] || LAYOUT_ERR="$LAYOUT_ERR allow_bbt_write='$_p';"
+fi
+{ echo "== /proc/mtd"; cat /proc/mtd 2>&1
+  for _n in 0 1; do echo "== mtd$_n"; for _a in name type flags size offset erasesize writesize oobsize ecc_strength bitflip_threshold ecc_failures corrected_bits bad_blocks bbt_blocks; do echo "$_a=$(sattr $_n $_a)"; done; done
+} >"$OUTD/mtd-info.txt" 2>&1
+[ -z "$LAYOUT_ERR" ] || fatal "MTD layout is not the expected one: $LAYOUT_ERR" "Nothing was written."
+LAYOUT_OK=1
+say "layout ok: mtd0 olpcboy rw $(( P0 / 1048576 )) MiB (blocks 0..$(( PART_BLKS - 1 ))), mtd1 bbt ro $(( P1 / 1024 )) KiB; geometry $ERASE/$WRITE/$OOB; bad blocks reported: $(sattr 0 bad_blocks)"
+
+# =================================================================================== RESTORE
+if [ "$MODE" = restore ]; then
+	say "restore: looking for the backup stick (volume label OLPCNAND)"
+	prog 3 "Restore: waiting for the backup stick"
+	BKDEV=""; i=0
+	while [ -z "$BKDEV" ]; do
+		BKDEV=$($BLKIDS 2>/dev/null | while IFS= read -r _line; do
+			case $_line in *'LABEL="OLPCNAND"'*) echo "${_line%%:*}"; break ;; esac; done)
+		[ -n "$BKDEV" ] && break
+		i=$(( i + 1 ))
+		if [ "$i" = 1 ]; then screen "$WHAT" "Plug in the backup stick (volume OLPCNAND)." "It is only read, never written." "Waiting up to $RESTORE_WAIT s..."; fi
+		[ "$i" -gt "$RESTORE_WAIT" ] && fatal "the backup stick (volume OLPCNAND) was not found" "Plug it in and boot this stick again." "Nothing was written."
+		olpc_sleep 1
+	done
+	say "restore: backup stick is $BKDEV"
+	grep -q "^$BKDEV " "$MOUNTS" 2>/dev/null && fatal "the backup stick $BKDEV is already mounted" "It must only be mounted read-only by this tool."
+	$BLKIDS 2>/dev/null | grep "^$BKDEV:" | grep -q 'TYPE="vfat"' || fatal "the backup stick $BKDEV is not a FAT volume" "Nothing was written."
+	$MOUNT -t vfat -o ro,noatime,nosuid,nodev,noexec "$BKDEV" "$BKMNT" 2>"$RUN/bkmount.err" \
+		|| fatal "cannot mount the backup stick read-only" "$(head -c 120 "$RUN/bkmount.err")" "Nothing was written."
+	BKMOUNTED=1
+	grep "^$BKDEV " "$MOUNTS" | grep -q -E ' ro[, ]' || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "the backup stick did not mount read-only" "Refusing to continue." "Nothing was written."; }
+	# the set: <stick>/nandbackup-NNN/NANDCOPY.DAT (or in the stick root); exactly one
+	set --
+	for _c in "$BKMNT"/*/NANDCOPY.DAT "$BKMNT"/NANDCOPY.DAT; do [ -f "$_c" ] && set -- "$@" "$_c"; done
+	# (vfat matches names case-insensitively: the lower-case spelling is only tried when nothing was found)
+	[ "$#" = 0 ] && for _c in "$BKMNT"/*/nandcopy.dat "$BKMNT"/nandcopy.dat; do [ -f "$_c" ] && set -- "$@" "$_c"; done
+	[ "$#" = 1 ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "$# NANDCOPY.DAT files on the backup stick (need exactly 1)" "Nothing was written."; }
+	DAT=$1; SETD=${DAT%/*}
+	say "restore: set $SETD ($(wc -c <"$DAT") bytes)"
+	DATSZ=$(wc -c <"$DAT")
+	GOODCAP=$(( PART_BLKS - $(nbad_part) ))
+	[ "$DATSZ" -gt 0 ] && [ $(( DATSZ % ERASE )) = 0 ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "NANDCOPY.DAT has a bad size ($DATSZ bytes)" "Not a multiple of the erase block."; }
+	[ $(( DATSZ / ERASE )) -le "$GOODCAP" ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "NANDCOPY.DAT does not fit ($(( DATSZ / ERASE )) blocks, $GOODCAP good blocks)" "Nothing was written."; }
+	[ -r "$SETD/SHA256SUMS" ] || [ -r "$SETD/sha256sums" ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "no SHA256SUMS next to NANDCOPY.DAT" "Nothing was written."; }
+	SUMF=$SETD/SHA256SUMS; [ -r "$SUMF" ] || SUMF=$SETD/sha256sums
+	WANTH=$(awk '{ n = $2; sub(/^\*/, "", n); if (n == "NANDCOPY.DAT" || n == "nandcopy.dat") { print tolower($1); exit } }' "$SUMF")
+	[ -n "$WANTH" ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "SHA256SUMS has no line for NANDCOPY.DAT" "Nothing was written."; }
+	prog 5 "Restore: checking NANDCOPY.DAT"
+	say "restore: SHA-256 of NANDCOPY.DAT vs $SUMF"
+	_cs; _a=$CS
+	: >"$RUN/dat.cnt"
+	start_monitor dat "Restore: checking NANDCOPY.DAT" 5 10 "$DATSZ"
+	"$NBHASH" -n -c "$RUN/dat.cnt" -o "$RUN/dat.sha" <"$DAT"; _rc=$?
+	stop_monitor
+	read -r GOTH GOTB <"$RUN/dat.sha" 2>/dev/null
+	[ "$_rc" = 0 ] && [ "$GOTB" = "$DATSZ" ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "cannot read NANDCOPY.DAT completely" "Nothing was written."; }
+	[ "$GOTH" = "$WANTH" ] || { $UMOUNT "$BKMNT" 2>/dev/null; fatal "NANDCOPY.DAT does not match SHA256SUMS" "got $GOTH" "Nothing was written."; }
+	say "restore: NANDCOPY.DAT verified ($(mbs "$DATSZ" "$(( $(tcs) - _a ))"))"
+	ALLOW_WRITE=1
+	prog 16 "Restore: erasing the NAND"
+	say "restore: erase mtd0 (flash_erase -j), then nandwrite -p NANDCOPY.DAT"
+	w_erase erase || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase.out")"
+	SP_ERASE=$(mbs "$P0" "$DCS")
+	prog 20 "Restore: writing the original OS"
+	if w_write write "$DAT"; then chk "restore: nandwrite of NANDCOPY.DAT" 0 "$(mbs "$DATSZ" "$DCS")"
+	else fatal "nandwrite failed (rc=$RC)" "$(head -c 100 "$RUN/write.out")"; fi
+	STATE="the NAND was written with the original OS but NOT verified yet"
+	# read the whole partition back (good blocks in order): the first DATSZ bytes must equal the file, the rest erased
+	prog 30 "Restore: verifying"
+	_cs; TR0=$CS
+	start_monitor rb "Restore: verifying" 30 60 "$P0"
+	if read_cmp rb "$DAT" -F -- -q --bb=skipbad; then
+		stop_monitor; _cs
+		if [ "$CMP_B" = 0 ] && [ "$CMP_N" -ge "$DATSZ" ]; then
+			chk "restore: read-back equals NANDCOPY.DAT, the rest of the partition is erased" 0 "$CMP_N bytes read, $(mbs "$CMP_N" "$(( CS - TR0 ))")"
+			STATE="the original OS was restored and verified"
+		else
+			chk "restore: read-back equals NANDCOPY.DAT" 1 "$CMP_B bytes / $CMP_BITS bits in $CMP_BLK blocks differ ($CMP_N bytes read)"
+		fi
+	else stop_monitor; chk "restore: read-back" 1 "nanddump/nbcmp error"; fi
+	set -- $(ecc_counts rb)
+	[ "$1" = 0 ] && chk "restore: no uncorrectable ECC errors on read-back" 0 "corrected pages $2, bits $3" \
+		|| chk "restore: no uncorrectable ECC errors on read-back" 1 "$1 page(s)"
+	# sanity: does the original JFFS2 mount (read-only)?
+	prog 96 "Restore: mounting read-only"
+	if $MOUNT -t jffs2 -o ro "$BLK0" "$MNT" 2>"$RUN/mount.err"; then
+		MOUNTED=1
+		if [ -r "$MNT/boot/olpc.fth" ]; then say "restore: mounted read-only, /boot/olpc.fth present"
+		else warn "restored NAND mounts but /boot/olpc.fth was not found"; fi
+		$UMOUNT "$MNT" 2>/dev/null && MOUNTED=0
+	else warn "restored NAND did not mount as JFFS2 here: $(head -c 100 "$RUN/mount.err")"; fi
+	$UMOUNT "$BKMNT" 2>/dev/null
+	TEND=$(up)
+	say "time: whole run $(( TEND - T0 )) s; erase $SP_ERASE"
+	if [ "$NFAIL" = 0 ]; then
+		prog 100 "Restore finished"
+		say "RESULT: OK ($NCHK checks)"
+		screen "RESTORED" "The original OS is back on the NAND." "Remove BOTH sticks and power the laptop off and on:" "it boots the original OS." "${WARNINGS:+Warnings:$WARNINGS}"
+		cp "$LOG" "$OUTD/$LOGNAME_" 2>/dev/null
+		finish "$END_OK"
+	fi
+	FINAL_RC=1
+	say "RESULT: FAILED ($NFAIL of $NCHK checks):$FAILED"
+	screen "RESTORE FAILED" "$NFAIL of $NCHK checks failed (first: $(echo "$FAILED" | sed -n 2p | cut -c1-60))" "State: $STATE" "Run the restore again, or use the Open Firmware fallback:" "nd-copy-nand u:\\NANDCOPY.DAT  (see the README)"
+	cp "$LOG" "$OUTD/$LOGNAME_" 2>/dev/null
+	finish "$END_FAIL"
+fi
+
+# =================================================================================== INSTALL
+# ---- 1. gate -----------------------------------------------------------------------------------
+REINSTALL=0
+cmdline_has olpcboy.reinstall && REINSTALL=1
+for _f in "$STICK"/*; do
+	[ -f "$_f" ] || continue
+	[ "$(basename "$_f" | tr 'A-Z' 'a-z')" = reinstall ] && REINSTALL=1
+done
+GATE=""
+if [ "$REINSTALL" = 1 ]; then
+	say "gate: re-install requested (flag); looking for the olpc-boy marker in erase block 0"
+	if "$ND" -q --bb=dumpbad -l "$ERASE" "$PMTD" >"$RUN/blk0.bin" 2>"$RUN/blk0.err"; then
+		_m=$(strings -a "$RUN/blk0.bin" | grep -c "$MARK")
+		_ff=$("$NBTOOL" ff <"$RUN/blk0.bin"); set -- $_ff
+		if [ "${_m:-0}" -ge 1 ]; then GATE=reinstall; say "gate: erase block 0 carries the olpc-boy marker: re-install allowed, backup precheck skipped"
+		elif [ "$1" = 0 ]; then GATE=reinstall; say "gate: erase block 0 is erased (an interrupted install): re-install allowed, backup precheck skipped"
+		else say "gate: erase block 0 has no olpc-boy marker: the flag does not apply, the backup precheck decides"; fi
+		rm -f "$RUN/blk0.bin"
+	else say "gate: cannot read erase block 0 ($(head -c 80 "$RUN/blk0.err")): the backup precheck decides"; fi
+fi
+if [ -z "$GATE" ]; then
+	say "step 1: precheck (no writes): full ECC dump, per-block SHA-256 vs the backup"
+	TA=$(tcs)
+	hash_pass pre "Precheck: reading the NAND" 4 54 || fatal "precheck dump failed" "See $LOG" "$(tail -n 1 "$OUTD/nanddump-pre.err" 2>/dev/null)"
+	cmp_blocks "$RUN/pre.blk"
+	say "precheck: $CB_NA blocks hashed; vs original layout: $CB_OUT differ outside the known bad blocks, $CB_BAD differ inside them; $(mbs "$SIZE" "$(( $(tcs) - TA ))")"
+	GATE=backup; LAYOUT_NAME="original layout"
+	if [ "$CB_NA" != "$CB_NE" ] || [ "$CB_OUT" != 0 ]; then
+		O_OUT=$CB_OUT O_LIST=$CB_LIST
+		GATE=""
+		if [ -r "$EXP_RST" ] && [ "$(wc -l <"$EXP_RST")" = "$TOTAL_BLKS" ]; then
+			cmp_blocks "$RUN/pre.blk" "$EXP_RST"
+			say "precheck: vs restored layout: $CB_OUT differ outside the known bad blocks, $CB_BAD differ inside them"
+			if [ "$CB_NA" = "$CB_NE" ] && [ "$CB_OUT" = 0 ]; then GATE=backup; LAYOUT_NAME="restored layout"; fi
+		fi
+		if [ -z "$GATE" ]; then
+			cp "$RUN/pre.blk" "$OUTD/precheck-blocks.txt" 2>/dev/null
+			fatal "the NAND matches neither the backup (differs in blocks: $O_LIST) nor the restored layout ($CB_OUT block(s) differ)" \
+				"A block changed since the backup, or a bad block grew during the restore: the backup no longer describes the NAND." \
+				"ABORTED before any write. (olpc-boy already installed? add an empty file REINSTALL to the stick.)"
+		fi
+	fi
+	say "precheck ok: the NAND equals the backup ($LAYOUT_NAME)"
+fi
+ALLOW_WRITE=1
+echo "$GATE" >"$OUTD/gate.txt"
+
+# ---- 2. erase + write --------------------------------------------------------------------------
+prog 58 "Step 2: erasing the NAND"
+say "step 2: flash_erase -j mtd0, then nandwrite -p the JFFS2 image ($IMGSZ bytes, $IMGBLK erase blocks)"
+w_erase erase || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase.out")"
+SP_ERASE=$(mbs "$P0" "$DCS")
+chk "erase: flash_erase -j of the whole partition" 0 "$SP_ERASE"
+prog 62 "Step 2: writing the system"
+if w_write write "$INST_IMG"; then
+	SP_WRITE=$(mbs "$IMGSZ" "$DCS"); chk "write: nandwrite of the JFFS2 image" 0 "$SP_WRITE"
+else fatal "nandwrite failed (rc=$RC)" "$(head -c 100 "$RUN/write.out")"; fi
+STATE="the NAND holds the olpc-boy image, NOT verified yet: do not rely on it; run the installer again (file REINSTALL) or restore"
+
+# ---- 3. read back the written region --------------------------------------------------------------
+prog 70 "Step 3: verifying the written image"
+NBAD=$(nbad_part)
+READ_CAP=$IMGSZ
+_cs; TR0=$CS
+if read_cmp rb "$INST_IMG" -- -q --bb=skipbad -l $(( (IMGBLK + NBAD) * ERASE )); then
+	_cs; SP_R=$(mbs "$IMGSZ" "$(( CS - TR0 ))")
+	if [ "$CMP_B" = 0 ] && [ "$CMP_N" = "$IMGSZ" ]; then chk "readback: the written region equals the image" 0 "$SP_R"
+	else chk "readback: the written region equals the image" 1 "$CMP_B bytes / $CMP_BITS bits in $CMP_BLK blocks differ ($CMP_N of $IMGSZ bytes read)"; fi
+else chk "readback" 1 "nanddump/nbcmp error"; fi
+READ_CAP=""
+set -- $(ecc_counts rb)
+[ "$1" = 0 ] && chk "readback: no uncorrectable ECC errors" 0 "corrected pages $2, bits $3" || chk "readback: no uncorrectable ECC errors" 1 "$1 page(s)"
+[ "$NFAIL" = 0 ] || fatal "the image on the NAND does not match what was written" "$(echo "$FAILED" | sed -n 2p | cut -c1-70)" "$(echo "$FAILED" | sed -n 3p | cut -c1-70)"
+STATE="the NAND holds the olpc-boy image (read back OK), the file check did not finish"
+
+# ---- 4. mount read-only, verify the files ------------------------------------------------------------
+mount_j() {   # mount_j OPTIONS
+	[ -b "$BLK0" ] || [ -n "$IT_TEST" ] || return 1
+	$MOUNT -t jffs2 -o "$1" "$BLK0" "$MNT" 2>"$RUN/mount.err" && MOUNTED=1
+}
+umount_j() {
+	_i=0; until $UMOUNT "$MNT" 2>"$RUN/umount.err"; do
+		_i=$(( _i + 1 )); [ "$_i" -ge 10 ] && return 1; olpc_sleep 1
+	done
+	MOUNTED=0
+}
+jffs2_msgs() { dmesg | tail -n +"$BASEDMESG" | grep -i jffs2 | grep -i -E 'error|corrupt|bad ' | head -n 5; }
+prog 78 "Step 4: checking the files"
+say "step 4: mount JFFS2 read-only, marker, /boot, SHA-256 of every file"
+if mount_j ro,noatime; then
+	_cs; _a=$CS
+	_nf=$(wc -l <"$INST_SUM")
+	read -r _mk <"$MNT/.olpcboy-nand" 2>/dev/null
+	[ "$_mk" = "$MARK" ] && chk "files: olpc-boy marker file" 0 || chk "files: olpc-boy marker file" 1 "got '$_mk'"
+	if [ -s "$MNT/boot/bzImage" ] && [ -s "$MNT/boot/initrd.img" ] && [ -s "$MNT/boot/olpc.fth" ] && [ -x "$MNT/sbin/init" -o -L "$MNT/sbin/init" ]; then
+		chk "files: /boot/{olpc.fth,bzImage,initrd.img} and /sbin/init present" 0
+	else chk "files: /boot/{olpc.fth,bzImage,initrd.img} and /sbin/init present" 1 "something is missing"; fi
+	read -r _l1 <"$MNT/boot/olpc.fth" 2>/dev/null
+	case $_l1 in '\ '*) chk "files: /boot/olpc.fth starts with a Forth comment" 0 ;; *) chk "files: /boot/olpc.fth starts with a Forth comment" 1 ;; esac
+	if ( cd "$MNT" && sha256sum -c "$INST_SUM" >"$RUN/vf.out" 2>&1 ) && [ "$(find "$MNT" -type f | wc -l)" = "$_nf" ]; then
+		_cs; chk "files: $_nf files mounted and hashed (SHA-256 manifest)" 0 "$(mbs "$(du -sk "$MNT" | cut -f1)000" "$(( CS - _a ))")"
+	else chk "files: SHA-256 manifest" 1 "$(grep -v ': OK' "$RUN/vf.out" | head -n 3 | tr '\n' ';') files: $(find "$MNT" -type f | wc -l) of $_nf"; fi
+	_m=$(jffs2_msgs); [ -z "$_m" ] && chk "files: no JFFS2 error messages in dmesg" 0 || chk "files: no JFFS2 error messages in dmesg" 1 "$_m"
+	if [ "$NFAIL" != 0 ]; then umount_j; fatal "the files on the NAND are not the expected ones" "$(echo "$FAILED" | sed -n 2p | cut -c1-70)" "$(echo "$FAILED" | sed -n 3p | cut -c1-70)"; fi
+	STATE="olpc-boy is installed and verified; the user data copy did not finish"
+else
+	chk "files: mount of the written NAND (JFFS2)" 1 "$(head -c 120 "$RUN/mount.err")"
+	fatal "the written NAND does not mount as JFFS2" "$(head -c 70 "$RUN/mount.err")"
+fi
+
+# ---- 5. user data ------------------------------------------------------------------------------------
+prog 86 "Step 5: copying settings and games"
+say "step 5: copy settings, saves, states, covers and ROMs from the stick into /data"
+if $MOUNT -o remount,rw "$MNT" 2>"$RUN/remount.err"; then
+	DST=$MNT/data
+	mkdir -p "$DST/olpclog" "$DST/roms" "$DST/covers"
+	# small root files of the stick (WIFI.CFG, settings): opaque copies, contents are never read here
+	NSET=0
+	for _f in "$STICK"/*; do
+		[ -f "$_f" ] || continue
+		_b=$(basename "$_f"); _u=$(echo "$_b" | tr 'a-z' 'A-Z')
+		[ "$_u" = REINSTALL ] && continue
+		[ "$(wc -c <"$_f")" -le 65536 ] || continue
+		if cp "$_f" "$DST/olpclog/$_b" 2>>"$RUN/copy.err"; then NSET=$(( NSET + 1 )); [ "$_u" = WIFI.CFG ] && chmod 600 "$DST/olpclog/$_b"
+		else warn "could not copy $_b"; fi
+	done
+	say "copied $NSET settings file(s) (WIFI.CFG among them: $([ -f "$DST/olpclog/WIFI.CFG" ] && echo yes || echo no))"
+	cp_tree() {   # cp_tree SRC DST LABEL: copy a directory tree, then compare it
+		[ -d "$1" ] || return 0
+		mkdir -p "$2"
+		if cp -R "$1"/. "$2"/ 2>>"$RUN/copy.err" && diff -rq "$1" "$2" >"$RUN/diff.out" 2>&1; then say "copied $3 ($(du -sk "$1" | cut -f1) KiB)"
+		else warn "copying $3 failed or differs: $(head -n 2 "$RUN/diff.out" "$RUN/copy.err" 2>/dev/null | tr '\n' ';' | cut -c1-90)"; fi
+	}
+	for _s in saves states; do [ -d "$STICK/roms/$_s" ] && cp_tree "$STICK/roms/$_s" "$DST/roms/$_s" "roms/$_s"; done
+	[ -d "$STICK/covers" ] && cp_tree "$STICK/covers" "$DST/covers" "covers"
+	# the ROMs themselves, if they fit with room to spare (JFFS2 needs headroom)
+	NEED=0
+	for _s in gb gbc nes; do [ -d "$STICK/roms/$_s" ] && NEED=$(( NEED + $(du -sk "$STICK/roms/$_s" | cut -f1) )); done
+	FREE=$(df -k "$MNT" | tail -n 1 | awk '{ print $4 }')
+	if [ "$NEED" -gt 0 ]; then
+		if [ "$(( NEED * 2 ))" -le "${FREE:-0}" ]; then
+			for _s in gb gbc nes; do [ -d "$STICK/roms/$_s" ] && cp_tree "$STICK/roms/$_s" "$DST/roms/$_s" "roms/$_s"; done
+		else warn "ROMs ($NEED KiB) do not fit in the free space (${FREE:-?} KiB) and were not copied"; fi
+	else say "no ROMs on the stick to copy"; fi
+	sync
+	df -k "$MNT" | tail -n 1 >>"$LOG"
+	umount_j || fatal "cannot unmount the new NAND root" "$(head -c 100 "$RUN/umount.err")"
+else
+	warn "could not remount the NAND read-write for the data copy: $(head -c 100 "$RUN/remount.err")"
+	umount_j || fatal "cannot unmount the new NAND root" "$(head -c 100 "$RUN/umount.err")"
+fi
+STATE="olpc-boy is installed on the NAND and verified"
+sync
+
+# ---- report ------------------------------------------------------------------------------------------
+TEND=$(up)
+say "time: whole run $(( TEND - T0 )) s; erase $SP_ERASE; write $SP_WRITE; gate: $GATE"
+if [ "$NFAIL" = 0 ]; then
+	prog 100 "Installed"
+	say "RESULT: OK ($NCHK checks)${WARNINGS:+, with warnings:$WARNINGS}"
+	screen "INSTALLED" "olpc-boy is on the internal NAND and verified ($NCHK checks)." "Remove the stick and power the laptop off and on." "It will boot from the NAND." "${WARNINGS:+Warnings:$WARNINGS}" "Details: $LOGNAME_ on the stick."
+	cp "$LOG" "$OUTD/$LOGNAME_" 2>/dev/null
+	finish "$END_OK"
+fi
+FINAL_RC=1
+say "RESULT: FAILED ($NFAIL of $NCHK checks):$FAILED"
+screen "INSTALL FAILED" "$NFAIL of $NCHK checks failed (first: $(echo "$FAILED" | sed -n 2p | cut -c1-60))" "State: $STATE" "Run the installer again (file REINSTALL on the stick) or restore." "Details: $LOGNAME_ on the stick."
+cp "$LOG" "$OUTD/$LOGNAME_" 2>/dev/null
+finish "$END_FAIL"

@@ -8,6 +8,9 @@
 # periodic job, and the loop's forks (pgrep) compete with the emulator.
 . /usr/libexec/olpcboy/common.sh
 i=0
+# On the internal NAND (JFFS2) every sync programs partial pages: flush rarely.
+PERIOD=3
+cmdline_has olpcboy.nand && PERIOD=30
 playing() {
 	read -r _pp </run/olpcboy/running 2>/dev/null || return 1
 	[ -n "$_pp" ] && [ -d "/proc/$_pp" ]
@@ -16,7 +19,7 @@ while :; do
 	i=$((i + 1))
 	if playing; then
 		# every 6th round only; i % 2 below is then always 0 on those rounds
-		[ $((i % 6)) -eq 0 ] || { olpc_sleep 3; continue; }
+		[ $((i % 6)) -eq 0 ] || { olpc_sleep $PERIOD; continue; }
 	fi
 	sync
 	if [ $((i % 2)) -eq 0 ] && [ -c /dev/kmsg ]; then
@@ -25,5 +28,5 @@ while :; do
 			cat /dev/kmsg >>"$BOOTDIR/kmsg.log" 2>/dev/null &
 		fi
 	fi
-	olpc_sleep 3
+	olpc_sleep $PERIOD
 done

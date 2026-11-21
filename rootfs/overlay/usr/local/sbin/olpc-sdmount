@@ -1,10 +1,13 @@
 #!/bin/sh
 # olpc-sdmount -- mount the SD card's first partition at /mnt/sd (read-write, noatime), or clean up
 # after the card was removed.  Idempotent; run at boot (olpc-sd service) and by olpc-menu when
-# /dev/mmcblk* appears or disappears.  Only that one partition is ever touched.
+# /dev/mmcblk* appears or disappears.  Only that one partition is ever touched; a card formatted
+# without a partition table ("superfloppy", filesystem on the whole device) is mounted as a whole.
+# A write-protected card (lock switch) is mounted read-only.
 # Overridable for tests: SD_DEV, SD_MNT, SD_BLKID, SD_MOUNT, SD_UMOUNT, SD_MOUNTS.
 . "${OLPC_COMMON:-/usr/libexec/olpcboy/common.sh}"
-DEV=${SD_DEV:-/dev/mmcblk0p1}
+DISK=${SD_DISK:-/dev/mmcblk0}
+DEV=${SD_DEV:-${DISK}p1}
 MNT=${SD_MNT:-/mnt/sd}
 BLKID=${SD_BLKID:-blkid}
 MOUNT=${SD_MOUNT:-mount}
@@ -20,8 +23,13 @@ if grep -q " $MNT " "$MOUNTS" 2>/dev/null; then
 	fi
 	exit 0
 fi
-[ -b "$DEV" ] || exit 0
-type=$($BLKID "$DEV" 2>/dev/null | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+fstype() { $BLKID "$1" 2>/dev/null | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p'; }
+if [ ! -b "$DEV" ]; then
+	# no partition 1: a filesystem directly on the disk?
+	[ -b "$DISK" ] && [ -n "$(fstype "$DISK")" ] || exit 0
+	DEV=$DISK
+fi
+type=$(fstype "$DEV")
 case "$type" in
 vfat)
 	# long names as UTF-8 when the kernel has it, plain otherwise
@@ -31,9 +39,21 @@ ext2|ext3|ext4|exfat) opts="rw,noatime" ;;
 esac
 for o in $opts; do
 	if $MOUNT -t "$type" -o "$o" "$DEV" "$MNT" 2>/dev/null; then
-		tl "sd: $DEV ($type) mounted at $MNT ($o)"
+		# mount falls back to read-only by itself on a write-protected card: say so
+		if grep " $MNT " "$MOUNTS" 2>/dev/null | grep -q " ro[, ]"; then
+			tl "sd: $DEV ($type) mounted READ-ONLY at $MNT (card write-protected? check the lock switch)"
+		else
+			tl "sd: $DEV ($type) mounted at $MNT ($o)"
+			# ROM folders ready for copying (~/ROMs points at roms/)
+			mkdir -p "$MNT/roms/gb" "$MNT/roms/gbc" "$MNT/roms/nes" 2>/dev/null
+		fi
 		exit 0
 	fi
 done
+# rw refused: write-protected card (lock switch) -> read-only, so at least the ROMs play
+if $MOUNT -t "$type" -o ro,noatime "$DEV" "$MNT" 2>/dev/null; then
+	tl "sd: $DEV ($type) mounted READ-ONLY at $MNT (card write-protected? check the lock switch)"
+	exit 0
+fi
 tl "sd: mounting $DEV ($type) failed"
 exit 0

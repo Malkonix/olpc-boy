@@ -10,12 +10,17 @@
 # Source: thumbnails.libretro.com (Apache index + PNGs) when it answers,
 # otherwise the same data from the libretro-thumbnails GitHub repositories
 # (git tree JSON via api.github.com, PNGs from raw.githubusercontent.com).
-# The index of a system is fetched once and cached 30 days under covers/.index/
-# (<sys>.html, always in the Apache-like form olpc-covers-match reads; the
-# GitHub JSON is converted on the fly by awk; <sys>.html.src remembers which
-# source it came from so the images are fetched from the same one).  The
-# unauthenticated GitHub API allows 60 requests/hour per IP, hence exactly two
-# API calls per system and only when the index is missing/stale/--force.
+# The index of a system is fetched once and cached 30 days, ONE copy shared by
+# all mounts: <covers>/.index/<sys>.html in the first writable mount's covers
+# dir (mount order); an existing fresh copy in any mount's covers dir is used
+# first.  It is always in the Apache-like form olpc-covers-match reads (the
+# GitHub JSON is converted by `olpc-covers-match --tree2html`; <sys>.html.src
+# remembers which source it came from so the images are fetched from the same
+# one).  The unauthenticated GitHub API allows 60 requests/hour per IP, hence
+# exactly two API calls per system and only when the index is missing/stale/
+# --force.  A finished tree download is kept as <sys>.tree.json (1 day) until
+# converted, so an abort (game start, menu exit) does not lose it.  Covers
+# themselves stay next to the ROMs: <mount>/covers/<sys>/.
 # The ROM name is matched by olpc-covers-match (exact rules, no guessing), the
 # PNG goes to tmpfs, png2obc converts it, the PNG is deleted.  A git symlink
 # (mode 120000) comes back from raw.githubusercontent.com as the link text, not
@@ -43,11 +48,9 @@ WIFI=${OLPC_COVERS_WIFI:-/usr/local/sbin/olpc-wifi}
 MAXAGE=2592000			# 30 days
 TAB=$(printf '\t')
 
-# ---- JSON tree -> Apache-like index
+# ---- helpers
 # AWKLIB: enc() percent-encodes everything outside a small safe set (non-ASCII
-# bytes pass through raw); jenc() decodes JSON string escapes (\" \\ \/ \b \f
-# \n \r \t \uXXXX incl. surrogate pairs, emitted as UTF-8) and encodes the
-# result, so the output is a usable URL path.  Real names today are plain ASCII.
+# bytes pass through raw); used by urlenc to turn a symlink target into a URL.
 AWKLIB='
 function init(  i) { for (i = 1; i < 128; i++) ORD[sprintf("%c", i)] = i }
 function pct(b) { return sprintf("%%%02X", b) }
@@ -56,68 +59,16 @@ function enc1(c) {
 	if (c in ORD) return pct(ORD[c])
 	return c
 }
-function hex4(s,   i, v, d) {
-	v = 0
-	for (i = 1; i <= 4; i++) {
-		d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
-		if (d < 0) return -1
-		v = v * 16 + d
-	}
-	return v
-}
-function utf8(cp) {
-	if (cp < 128) return enc1(sprintf("%c", cp))
-	if (cp < 2048) return pct(192 + int(cp / 64)) pct(128 + cp % 64)
-	if (cp < 65536) return pct(224 + int(cp / 4096)) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
-	return pct(240 + int(cp / 262144)) pct(128 + int(cp / 4096) % 64) pct(128 + int(cp / 64) % 64) pct(128 + cp % 64)
-}
 function enc(s,   o, i) {
 	for (i = 1; i <= length(s); i++) o = o enc1(substr(s, i, 1))
 	return o
 }
-function jenc(s,   o, i, c, n, v, w) {
-	i = 1
-	while (i <= length(s)) {
-		c = substr(s, i, 1)
-		if (c != "\\") { o = o enc1(c); i++; continue }
-		n = substr(s, i + 1, 1)
-		if (n == "u" && (v = hex4(substr(s, i + 2, 4))) >= 0) {
-			i += 6
-			if (v >= 55296 && v < 56320 && substr(s, i, 2) == "\\u" && (w = hex4(substr(s, i + 2, 4))) >= 56320 && w < 57344) {
-				v = 65536 + (v - 55296) * 1024 + (w - 56320); i += 6
-			}
-			o = o utf8(v); continue
-		}
-		i += 2
-		if (n == "b") o = o pct(8)
-		else if (n == "f") o = o pct(12)
-		else if (n == "n") o = o pct(10)
-		else if (n == "r") o = o pct(13)
-		else if (n == "t") o = o pct(9)
-		else o = o enc1(n)
-	}
-	return o
-}
 '
-# tree2html: GitHub tree JSON on stdin -> one href line per .png entry,
-# streamed (the NES tree is ~5 MB).  Prints nothing at all when no .png found.
-tree2html() {
-	awk "$AWKLIB"'
-	BEGIN { init() }
-	/^[ ]*"path": "/ {
-		s = $0; sub(/^[ ]*"path": "/, "", s); sub(/",?[ \r]*$/, "", s)
-		h = jenc(s)
-		if (h ~ /\.png$/) { if (!n++) print "<table>"; print "<a href=\"" h "\">x</a>" }
-	}
-	END { if (n) print "</table>" }'
-}
 urlenc() { awk "$AWKLIB"'BEGIN { init() } { print enc($0) }'; }
-# tree_sha DIR: sha of the entry "DIR" in a tree JSON on stdin
-tree_sha() {
-	awk -v d="$1" '
-	index($0, "\"path\": \"" d "\"") { f = 1; next }
-	f && /"sha":/ { split($0, a, "\""); print a[4]; exit }'
-}
+# GitHub tree JSON (stdin) -> Apache-like index, and the sha of one tree entry:
+# both are modes of the C helper (the NES tree is ~5 MB, far too slow in awk).
+tree2html() { "$BIN/olpc-covers-match" --tree2html; }
+tree_sha() { "$BIN/olpc-covers-match" --tree-sha "$1"; }
 
 mkdir -p "$RUN" 2>/dev/null
 
@@ -156,6 +107,7 @@ if [ -z "$OLPC_COVERS_NICED" ]; then
 fi
 
 up() { read -r _u _ </proc/uptime; echo "$_u"; }
+up_s() { read -r _u _ </proc/uptime; echo "${_u%.*}"; }
 log() { echo "$(up) $*" >>"$LOG" 2>/dev/null; }
 status() { echo "$*" >"$STATUS" 2>/dev/null; }
 now() { date +%s; }
@@ -179,7 +131,9 @@ fi
 echo $$ >"$LOCK/pid"
 rm -rf "$WORK"; mkdir -p "$WORK"
 trap 'rm -rf "$LOCK" "$WORK"' EXIT
-trap 'exit 130' INT TERM
+# stop (menu: game start / exit) also kills a running wget; a finished tree
+# download survives in the index dir (see index_github)
+trap 'kill $(jobs -p) 2>/dev/null; exit 130' INT TERM
 
 if game_running; then
 	status "game running"
@@ -218,7 +172,7 @@ sysrepo() { # GitHub repository of a system
 }
 
 # work list: sys TAB covers dir TAB ROM name (no extension), ordered by group
-: >"$WORK/list"
+: >"$WORK/list"; : >"$WORK/covdirs"
 for _sys in gb gbc nes; do
 	[ -n "$ONLY" ] && [ "$ONLY" != "$_sys" ] && continue
 	mountpoints | while read -r _mp; do
@@ -230,6 +184,7 @@ for _sys in gb gbc nes; do
 				[ -d "$_s" ] || continue
 				[ "$(lc "${_s##*/}")" = "$_sys" ] || continue
 				_cov=$_mp/covers
+				echo "$_cov" >>"$WORK/covdirs"
 				: >"$WORK/miss"
 				if [ "$FORCE" != 1 ] && [ -r "$_cov/$_sys/.missing" ]; then
 					_n=$(now)
@@ -253,6 +208,7 @@ for _sys in gb gbc nes; do
 		done
 	done
 done
+awk '!seen[$0]++' "$WORK/covdirs" >"$WORK/covdirs.u" && mv "$WORK/covdirs.u" "$WORK/covdirs"
 TOTAL=$(wc -l <"$WORK/list")
 OK=0; MISS=0; FAIL=0
 
@@ -291,48 +247,80 @@ index_libretro() {
 	get "$THUMBS/$(sysdir_url "$1")/Named_Boxarts/" "$WORK/index.html" 240 &&
 	   grep -q '</table>' "$WORK/index.html"
 }
-# index_github SYS: git tree of Named_Boxarts converted into $WORK/index.html
-# (2 API calls; the JSON is streamed through awk, never held in a variable)
+# fresh FILE SECS: FILE exists, is non-empty and younger than SECS (a clock
+# before 2024 is not trusted: anything counts as fresh)
+fresh() {
+	[ -s "$1" ] || return 1
+	_n=$(now); _m=$(stat -c %Y "$1" 2>/dev/null || echo 0)
+	[ "$_n" -lt 1704067200 ] || [ $((_n - _m)) -lt "$2" ]
+}
+
+# index_github SYS DIR: git tree of Named_Boxarts converted into $WORK/index.html
+# (2 API calls).  The big tree JSON goes to DIR/<sys>.tree.json (atomic rename
+# after a complete download) and is removed once converted: if the process is
+# stopped meanwhile, the next run converts it without downloading again.
 index_github() {
-	_repo=$(sysrepo "$1")
-	get "$GH_API/$_repo/git/trees/master" "$WORK/root.json" 60 || return 1
-	_sha=$(tree_sha Named_Boxarts <"$WORK/root.json")
-	rm -f "$WORK/root.json"
-	case "$_sha" in ""|*[!0-9a-f]*) return 1 ;; esac
-	get "$GH_API/$_repo/git/trees/$_sha" "$WORK/tree.json" 240 || return 1
-	tree2html <"$WORK/tree.json" >"$WORK/index.html"
-	rm -f "$WORK/tree.json"
+	_repo=$(sysrepo "$1"); _tj=$2/$1.tree.json
+	if fresh "$_tj" 86400; then
+		log "index $1: reusing downloaded tree"
+	else
+		rm -f "$_tj"
+		get "$GH_API/$_repo/git/trees/master" "$WORK/root.json" 60 || return 1
+		_sha=$(tree_sha Named_Boxarts <"$WORK/root.json")
+		rm -f "$WORK/root.json"
+		case "$_sha" in ""|*[!0-9a-f]*) return 1 ;; esac
+		_t0=$(up_s)
+		get "$GH_API/$_repo/git/trees/$_sha" "$_tj.dl" 240 || return 1
+		mv "$_tj.dl" "$_tj"
+		log "index $1: tree downloaded $(wc -c <"$_tj") bytes in $(($(up_s) - _t0)) s"
+	fi
+	_t0=$(up_s)
+	tree2html <"$_tj" >"$WORK/index.html"
+	log "index $1: converted in $(($(up_s) - _t0)) s"
+	rm -f "$_tj"
 	grep -q '</table>' "$WORK/index.html"
 }
 
-# ensure_index SYS COVDIR: sets IDX (empty when none is available) and SRC
-# (libretro|github: where IDX came from, so images are fetched from there)
+# ensure_index SYS: sets IDX (empty when none is available) and SRC
+# (libretro|github: where IDX came from, so images are fetched from there).
+# One shared copy: a fresh <covers>/.index/<sys>.html of any mount is used;
+# otherwise it is (re)built in the first writable mount's covers dir.
 ensure_index() {
-	IDX=$2/.index/$1.html
-	_fresh=0
-	if [ -s "$IDX" ] && [ "$FORCE" != 1 ]; then
-		_n=$(now); _m=$(stat -c %Y "$IDX" 2>/dev/null || echo 0)
-		if [ "$_n" -lt 1704067200 ] || [ $((_n - _m)) -lt "$MAXAGE" ]; then _fresh=1; fi
-	fi
-	if [ "$_fresh" != 1 ]; then
-		status "fetching index $1"
-		log "index $1: downloading"
-		mkdir -p "$2/.index" 2>/dev/null
-		_got=""
-		for _s in libretro github; do
-			rm -f "$WORK/index.html"
-			if "index_$_s" "$1"; then _got=$_s; break; fi
-			log "index $1: $_s failed"
-		done
-		if [ -n "$_got" ]; then
-			echo "$_got" >"$IDX.src.part" && mv "$IDX.src.part" "$IDX.src"
-			cp "$WORK/index.html" "$IDX.part" && mv "$IDX.part" "$IDX"
-			log "index $1: ok ($_got)"
+	IDX=""; _stale=""
+	while read -r _cd; do
+		_f=$_cd/.index/$1.html
+		[ -s "$_f" ] || continue
+		[ -n "$_stale" ] || _stale=$_f
+		if [ "$FORCE" != 1 ] && fresh "$_f" "$MAXAGE"; then IDX=$_f; break; fi
+	done <"$WORK/covdirs"
+	if [ -z "$IDX" ]; then
+		IDX=$_stale
+		_dir=""
+		while read -r _cd; do
+			mkdir -p "$_cd/.index" 2>/dev/null && : >"$_cd/.index/.w" 2>/dev/null &&
+				{ rm -f "$_cd/.index/.w"; _dir=$_cd/.index; break; }
+		done <"$WORK/covdirs"
+		if [ -z "$_dir" ]; then
+			log "index $1: no writable covers dir"
 		else
-			log "index $1: download failed"
-			[ -s "$IDX" ] || IDX=""
+			status "fetching index $1"
+			log "index $1: downloading (into $_dir)"
+			_got=""
+			for _s in libretro github; do
+				rm -f "$WORK/index.html"
+				if "index_$_s" "$1" "$_dir"; then _got=$_s; break; fi
+				log "index $1: $_s failed"
+			done
+			if [ -n "$_got" ]; then
+				IDX=$_dir/$1.html
+				echo "$_got" >"$IDX.src.part" && mv "$IDX.src.part" "$IDX.src"
+				cp "$WORK/index.html" "$IDX.part" && mv "$IDX.part" "$IDX"
+				log "index $1: ok ($_got)"
+			else
+				log "index $1: download failed"
+			fi
+			rm -f "$WORK/index.html" "$_dir/$1.html.part"
 		fi
-		rm -f "$WORK/index.html" "$IDX.part"
 	fi
 	SRC=libretro
 	[ -n "$IDX" ] && [ -r "$IDX.src" ] && read -r SRC <"$IDX.src"
@@ -376,7 +364,7 @@ cut -f1,2 "$WORK/list" | uniq >"$WORK/groups"
 while IFS="$TAB" read -r GSYS GCOV; do
 	[ "$STOP" = 1 ] && break
 	awk -F'\t' -v s="$GSYS" -v c="$GCOV" '$1 == s && $2 == c { print $3 }' "$WORK/list" >"$WORK/names"
-	ensure_index "$GSYS" "$GCOV"
+	ensure_index "$GSYS"
 	if [ -z "$IDX" ]; then
 		_k=$(wc -l <"$WORK/names")
 		FAIL=$((FAIL + _k)); I=$((I + _k))

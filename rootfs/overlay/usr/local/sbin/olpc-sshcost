@@ -1,0 +1,99 @@
+#!/bin/sh
+# Background cost logger for the SSH test: appends one key=value line per sample to
+# $BOOTDIR/sshcost.log (every 30 s for the first 10 min, then every 120 s).  Runs with
+# or without dropbear (olpcboy.nossh) so A/B boots are comparable.  No forks per sample:
+# only /proc reads and shell arithmetic.
+#   ssh=on|off  db_n  db_rss_kb  db_pss_kb (NA: kernel has no smaps)  db_jif (utime+stime
+#   incl. reaped children, cumulative)  db_jif_d (delta, never negative)  memfree_kb
+#   memavail_kb  idle_pct (idle only)  iow_pct (iowait)  cpu_dt (jiffies in the interval)
+#   load1/5/15  run (olpc-run alive 0|1)  run_rss_kb  run_jif_d
+# The first sample's deltas cover everything since boot.
+. /usr/libexec/olpcboy/common.sh
+
+OUT=$BOOTDIR/sshcost.log
+FAST_S=${OLPC_SSHCOST_FAST_S:-30}
+FAST_FOR=${OLPC_SSHCOST_FAST_FOR:-600}
+SLOW_S=${OLPC_SSHCOST_SLOW_S:-120}
+MAXN=${OLPC_SSHCOST_MAX:-0}          # stop after N samples (tests); 0 = run forever
+mkdir -p /run/olpcboy 2>/dev/null
+echo $$ >/run/olpcboy/sshcost.pid
+if cmdline_has olpcboy.nossh; then NOSSH=1; else NOSSH=0; fi
+
+pt=0; pi=0; pw=0; pdb=0; prun=0
+{
+	echo "# sshcost v1 nossh=$NOSSH sleepmode=${_SLEEPMODE:-unknown} fast=${FAST_S}s for ${FAST_FOR}s then ${SLOW_S}s"
+	echo "# HZ jiffies; pss needs CONFIG_PROC_PAGE_MONITOR (NA otherwise)"
+} >>"$OUT"
+
+# page size 4 KiB on i386
+sample() {
+	_cs; _up=$CS
+	read -r _c u n s i w q sq st _ </proc/stat
+	t=$((u + n + s + i + ${w:-0} + ${q:-0} + ${sq:-0} + ${st:-0}))
+	dt=$((t - pt)); di=$((i - pi)); dw=$((${w:-0} - pw))
+	[ "$dt" -gt 0 ] || dt=1
+	idle=$((di * 1000 / dt)); iow=$((dw * 1000 / dt))
+	pt=$t; pi=$i; pw=${w:-0}
+
+	mf=0; ma=0
+	while read -r k v _; do
+		case $k in MemFree:) mf=$v ;; MemAvailable:) ma=$v ;; esac
+	done </proc/meminfo
+	read -r l1 l5 l15 _ </proc/loadavg
+
+	dn=0; drss=0; dpss=0; djif=0; haspss=0
+	for d in /proc/[0-9]*; do
+		read -r c <"$d/comm" 2>/dev/null || continue
+		[ "$c" = dropbear ] || continue
+		read -r st <"$d/stat" 2>/dev/null || continue
+		st=${st#*) }
+		# shellcheck disable=SC2086
+		set -- $st
+		# $12 utime $13 stime $14 cutime $15 cstime
+		djif=$((djif + ${12} + ${13} + ${14} + ${15}))
+		read -r _a pages _ <"$d/statm" 2>/dev/null && drss=$((drss + pages * 4))
+		if [ -r "$d/smaps_rollup" ]; then
+			while read -r k v _; do
+				[ "$k" = Pss: ] && { dpss=$((dpss + v)); haspss=1; }
+			done <"$d/smaps_rollup"
+		fi
+		dn=$((dn + 1))
+	done
+	[ "$haspss" = 1 ] || dpss=NA
+	d_d=$((djif - pdb)); [ "$d_d" -ge 0 ] || d_d=0
+	pdb=$djif
+	[ "$dn" -gt 0 ] && sshs=on || sshs=off
+
+	run=0; rrss=0; rjd=0
+	rp=""
+	[ -r /run/olpcboy/running ] && read -r rp </run/olpcboy/running
+	if [ -n "$rp" ] && [ -r "/proc/$rp/stat" ]; then
+		run=1
+		read -r _a pages _ <"/proc/$rp/statm" 2>/dev/null && rrss=$((pages * 4))
+		read -r st <"/proc/$rp/stat" 2>/dev/null
+		st=${st#*) }
+		# shellcheck disable=SC2086
+		set -- $st
+		rj=$((${12} + ${13}))
+		rjd=$((rj - prun)); [ "$rjd" -ge 0 ] || rjd=0
+		prun=$rj
+	else
+		prun=0
+	fi
+
+	printf 'up=%d.%02d ssh=%s db_n=%d db_rss_kb=%d db_pss_kb=%s db_jif=%d db_jif_d=%d memfree_kb=%d memavail_kb=%s idle_pct=%d.%d iow_pct=%d.%d cpu_dt=%d load=%s,%s,%s run=%d run_rss_kb=%d run_jif_d=%d\n' \
+		$((_up / 100)) $((_up % 100)) "$sshs" "$dn" "$drss" "$dpss" "$djif" "$d_d" "$mf" "${ma:-NA}" \
+		$((idle / 10)) $((idle % 10)) $((iow / 10)) $((iow % 10)) "$dt" "$l1" "$l5" "$l15" \
+		"$run" "$rrss" "$rjd" >>"$OUT"
+}
+
+_cs; T0=$CS
+cnt=0
+while :; do
+	sample
+	cnt=$((cnt + 1))
+	[ "$MAXN" -gt 0 ] && [ "$cnt" -ge "$MAXN" ] && break
+	_cs
+	if [ $((CS - T0)) -lt $((FAST_FOR * 100)) ]; then olpc_sleep "$FAST_S"; else olpc_sleep "$SLOW_S"; fi
+done
+rm -f /run/olpcboy/sshcost.pid

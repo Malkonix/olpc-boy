@@ -8,6 +8,11 @@
 #      logs/boot-NNNN/ directory, start the kmsg copier
 #   3. find + mount the ext4 root (LABEL=OLPCROOT or olpcboy.root=)
 #   4. point the new root at the boot dir, move mounts, exec switch_root
+# NAND boot (kernel flag olpcboy.nand, set by the olpc.fth stored on the internal NAND): there is
+# no log partition and no label to look for.  The external initrd of that olpc.fth carries
+# cafe_nand.ko; steps 2-3 become: load the driver (allow_bbt_write=0), verify the MTD layout,
+# mount mtd0 (JFFS2) as root, keep boot logs in /data/olpclog/logs/boot-NNNN on that root, and
+# hand over with /data/olpclog bound on /mnt/olpclog and /data bound on /mnt/internal.
 # On failure: big message on the console, diagnostics to the log partition,
 # keep retrying forever; a getty on tty2 is available for a USB keyboard.
 # Never use `set -e` here: a failed probe must not abort logging.
@@ -59,6 +64,15 @@ olpc-splash init 5 "Starting kernel"
 grep -q olpcboy.verbose /proc/cmdline && dmesg -n 7   # verbose: kernel messages on screen again (loglevel=1 hides them)
 
 CMDLINE=$(cat /proc/cmdline)
+NANDMODE=0
+SIM=0
+for w in $CMDLINE; do
+	case "$w" in
+	olpcboy.nand) NANDMODE=1 ;;
+	olpcboy.nandsim) SIM=1 ;;
+	esac
+done
+NAND_KEEP=20                     # boot log directories kept on the NAND
 
 cmdline_get() {   # cmdline_get key  -> value of key=value (empty if absent)
 	for w in $CMDLINE; do
@@ -241,13 +255,20 @@ fail() {   # fail "reason line 1" ["reason line 2"]
 		echo "  Partitions seen by the kernel:"
 		sed -n '3,$p' /proc/partitions 2>/dev/null | head -n 8
 		echo
-		echo "  Still retrying every 10 s.  No keyboard needed."
-		echo "  Power off, plug the USB stick in a PC, read logs/."
+		if [ "$NANDMODE" = 1 ]; then
+			echo "  The internal NAND did not boot.  Power off and boot from a USB stick"
+			echo "  (the stick wins over the NAND); the README explains the way back."
+		else
+			echo "  Still retrying every 10 s.  No keyboard needed."
+			echo "  Power off, plug the USB stick in a PC, read logs/."
+		fi
 	} >"$CON" 2>&1
 	if [ "$HAVE_LOG" = 1 ] && [ -n "$BOOTDIR" ]; then
 		dump_diag "$BOOTDIR/initramfs-failure.txt"
 		echo "$*" >"$BOOTDIR/INITRAMFS_FAILURE"
 		sync
+	elif [ "$NANDMODE" = 1 ]; then
+		dump_diag /run/olpcboy/initramfs-failure.txt
 	fi
 }
 
@@ -280,6 +301,7 @@ mount_root() {
 handover() {
 	mkdir -p "$NEWROOT/run" "$NEWROOT/dev" "$NEWROOT/proc" "$NEWROOT/sys" \
 		"$NEWROOT/mnt/olpclog" "$NEWROOT/var/log" 2>/dev/null
+	[ "$NANDMODE" = 1 ] && mkdir -p "$NEWROOT/mnt/internal" "$NEWROOT/data/roms" "$NEWROOT/data/covers" 2>/dev/null
 
 	if [ "$HAVE_LOG" = 1 ]; then
 		TARGET=/mnt/olpclog/logs/$BOOTNAME
@@ -304,8 +326,12 @@ handover() {
 	# fstab with explicit devices: `mount LABEL=...` / remount at boot would
 	# probe every block device (mtdblock included).  The file is rewritten each boot.
 	{
-		echo "$ROOTDEV	/	ext4	rw,noatime	0 0"
-		[ "$HAVE_LOG" = 1 ] && echo "$LOGDEV	/mnt/olpclog	vfat	rw,noatime,flush,noauto	0 0"
+		if [ "$NANDMODE" = 1 ]; then
+			echo "$ROOTDEV	/	jffs2	rw,noatime	0 0"
+		else
+			echo "$ROOTDEV	/	ext4	rw,noatime	0 0"
+			[ "$HAVE_LOG" = 1 ] && echo "$LOGDEV	/mnt/olpclog	vfat	rw,noatime,flush,noauto	0 0"
+		fi
 		echo "tmpfs	/tmp	tmpfs	nosuid,nodev,size=32m	0 0"
 	} >"$NEWROOT/etc/fstab"
 
@@ -314,7 +340,16 @@ handover() {
 	[ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
 
 	# order matters: log partition first (needs the mountpoint on the new root)
-	[ "$HAVE_LOG" = 1 ] && mount --move "$LOGMNT" "$NEWROOT/mnt/olpclog"
+	if [ "$NANDMODE" = 1 ]; then
+		# the stick's role is played by directories of the JFFS2 root: /mnt/olpclog (logs, WIFI.CFG,
+		# settings) and /mnt/internal (the ROM tree); both show up in /proc/mounts
+		mount --bind "$NEWROOT/data/olpclog" "$NEWROOT/mnt/olpclog" \
+			&& mount --bind "$NEWROOT/data" "$NEWROOT/mnt/internal" \
+			|| tl "WARNING: bind mounts of /data failed"
+		echo 1 >/run/olpcboy/nand
+	elif [ "$HAVE_LOG" = 1 ]; then
+		mount --move "$LOGMNT" "$NEWROOT/mnt/olpclog"
+	fi
 	mount --move /dev "$NEWROOT/dev"
 	mount --move /proc "$NEWROOT/proc"
 	mount --move /sys "$NEWROOT/sys"
@@ -328,8 +363,119 @@ handover() {
 	return 1
 }
 
+# ---------------------------------------------------------------- NAND boot (olpcboy.nand)
+# Geometry of the layout the olpc.fth asks for (cmdline mtdparts): mtd0 "olpcboy" = every erase
+# block below the bad block tables (writeable, the JFFS2 root), mtd1 "bbt" = the 4 table blocks (read-only).
+if [ "$SIM" = 1 ]; then          # nandsim, 256 MiB: same geometry, scaled (QEMU tests)
+	NAND_ERASE=131072 NAND_WRITE=2048 NAND_P0=$((2044 * 131072)) NAND_P1=$((4 * 131072))
+else                             # XO-1 CaFe NAND, 1 GiB: blocks 0..8187 + 8188..8191
+	NAND_ERASE=131072 NAND_WRITE=2048 NAND_P0=$((8188 * 131072)) NAND_P1=$((4 * 131072))
+fi
+
+nand_attr() { read -r _na <"/sys/class/mtd/mtd$1/$2" 2>/dev/null && echo "$_na" || echo "?"; }
+
+nand_die() {   # nand_die REASON...   never returns: the message stays, nothing was written
+	fail "$@"
+	while :; do sleep 10; done
+}
+
+# the layout must be exactly the expected one before the root is mounted read-write
+nand_layout_check() {
+	_err=""
+	_cnt=0
+	for _d in /sys/class/mtd/mtd*; do
+		_b=${_d##*/}
+		case ${_b#mtd} in ''|*[!0-9]*) continue ;; esac
+		_cnt=$((_cnt + 1))
+	done
+	[ "$_cnt" = 2 ] || _err="$_err $_cnt mtd partitions instead of 2;"
+	[ "$(nand_attr 0 name)" = olpcboy ] || _err="$_err mtd0 name=$(nand_attr 0 name);"
+	[ "$(nand_attr 1 name)" = bbt ] || _err="$_err mtd1 name=$(nand_attr 1 name);"
+	[ "$(nand_attr 0 size)" = "$NAND_P0" ] || _err="$_err mtd0 size=$(nand_attr 0 size) (want $NAND_P0);"
+	[ "$(nand_attr 1 size)" = "$NAND_P1" ] || _err="$_err mtd1 size=$(nand_attr 1 size) (want $NAND_P1);"
+	[ "$(nand_attr 0 offset)" = 0 ] || _err="$_err mtd0 offset=$(nand_attr 0 offset);"
+	[ "$(nand_attr 1 offset)" = "$NAND_P0" ] || _err="$_err mtd1 offset=$(nand_attr 1 offset);"
+	for _n in 0 1; do
+		[ "$(nand_attr $_n type)" = nand ] || _err="$_err mtd$_n type=$(nand_attr $_n type);"
+		[ "$(nand_attr $_n erasesize)" = "$NAND_ERASE" ] || _err="$_err mtd$_n erasesize=$(nand_attr $_n erasesize);"
+		[ "$(nand_attr $_n writesize)" = "$NAND_WRITE" ] || _err="$_err mtd$_n writesize=$(nand_attr $_n writesize);"
+	done
+	_f=$(nand_attr 0 flags); _g=$(nand_attr 1 flags)
+	case $_f$_g in *'?'*) _err="$_err flags unreadable;" ;; *)
+		[ $((_f & 0x400)) -ne 0 ] || _err="$_err mtd0 is not writeable;"
+		[ $((_g & 0x400)) -eq 0 ] || _err="$_err mtd1 (bad block tables) IS WRITEABLE;" ;;
+	esac
+	if [ "$SIM" != 1 ]; then
+		read -r _p </sys/module/cafe_nand/parameters/allow_bbt_write 2>/dev/null
+		[ "$_p" = 0 ] || _err="$_err allow_bbt_write='$_p';"
+	fi
+	[ -z "$_err" ] && return 0
+	NAND_LAYOUT_ERR=$_err
+	return 1
+}
+
+nand_prune() {   # keep the newest NAND_KEEP boot directories
+	_n=$(ls -d "$LOGMNT"/logs/boot-[0-9]* 2>/dev/null | wc -l)
+	[ "$_n" -gt "$NAND_KEEP" ] || return 0
+	ls -d "$LOGMNT"/logs/boot-[0-9]* | sort | head -n $((_n - NAND_KEEP)) | while read -r _old; do rm -rf "$_old"; done
+}
+
+nand_main() {
+	olpc-splash progress 15 "Starting internal storage"
+	if [ "$SIM" = 1 ]; then _ko=/nandmods/nandsim.ko; _args="id_bytes=0xec,0xda,0x10,0x95"
+	else _ko=/nandmods/cafe_nand.ko; _args="allow_bbt_write=0"; fi
+	[ -f "$_ko" ] || nand_die "NAND driver module missing from the initrd" "$_ko"
+	say "NAND boot: loading $_ko $_args"
+	insmod "$_ko" $_args 2>/run/olpcboy/insmod.err \
+		|| nand_die "Cannot load the NAND driver" "$(cat /run/olpcboy/insmod.err)"
+	now_s; _end=$((NOW + 30))
+	while ! { [ -d /sys/class/mtd/mtd1 ] && [ -b /dev/mtdblock0 ]; }; do
+		now_s
+		[ "$NOW" -ge "$_end" ] && nand_die "No NAND found" "The driver loaded but mtd0/mtd1 did not appear." "$(dmesg | tail -n 3)"
+		sleep 1
+	done
+	if [ "$SIM" = 1 ]; then
+		# QEMU only: write the NAND image of the installer into the fresh simulated NAND
+		_fill=""
+		for w in $CMDLINE; do case "$w" in olpcboy.nandsimfill=*) _fill=${w#*=} ;; esac; done
+		if [ -n "$_fill" ]; then
+			_dev=${_fill%%:*}; _sz=${_fill#*:}
+			now_s; _end=$((NOW + 30))
+			while [ ! -b "/dev/$_dev" ]; do now_s; [ "$NOW" -ge "$_end" ] && nand_die "sim fill device $_dev missing"; sleep 1; done
+			say "sim: writing $_sz bytes from $_dev into the simulated NAND"
+			head -c "$_sz" "/dev/$_dev" | nandwrite -p /dev/mtd0 - >/run/olpcboy/simfill.out 2>&1 \
+				|| nand_die "sim fill failed" "$(cat /run/olpcboy/simfill.out)"
+		fi
+	fi
+	nand_layout_check || nand_die "The NAND layout is not the expected one" "$NAND_LAYOUT_ERR" "Refusing to mount it read-write."
+	say "NAND layout ok (mtd0 olpcboy rw, mtd1 bbt ro)"
+	olpc-splash progress 30 "Mounting system"
+	ROOTDEV=/dev/mtdblock0
+	rm -f /run/olpcboy/mount_root.err
+	mount -t jffs2 -o rw,noatime "$ROOTDEV" "$NEWROOT" 2>/run/olpcboy/mount_root.err \
+		|| nand_die "Cannot mount the NAND root (JFFS2)" "$(cat /run/olpcboy/mount_root.err)"
+	[ -x "$NEWROOT/sbin/init" ] || nand_die "The NAND root has no /sbin/init" "Is olpc-boy installed on it?"
+	say "root mounted (jffs2 on $ROOTDEV)"
+	LOGMNT=$NEWROOT/data/olpclog
+	mkdir -p "$LOGMNT"
+	if new_boot_dir; then
+		HAVE_LOG=1
+		nand_prune
+		start_kmsg_copier "$BOOTDIR/kmsg.log"
+		[ "$SIM" = 1 ] && [ -c /dev/ttyS0 ] && { tail -f "$BOOTDIR/timeline.log" >/dev/ttyS0 2>&1 & }
+	else
+		say "cannot create the boot dir on the NAND"
+		start_kmsg_copier /run/olpcboy/kmsg.log
+		spawn_tty2_shell
+	fi
+	handover   # does not return on success
+	nand_die "switch_root handover failed" "root=$ROOTDEV"
+}
+
 # ================================================================= main
 say "olpc-boy initramfs starting, cmdline: $CMDLINE"
+
+[ "$NANDMODE" = 1 ] && nand_main      # never returns
 
 olpc-splash progress 15 "Mounting storage"
 if mount_log; then

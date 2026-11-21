@@ -1,0 +1,9 @@
+# NAND installer/restore rootfs package list (Alpine 3.18, x86).  Deliberately tiny.
+busybox
+alpine-baselayout
+# modprobe/depmod for the explicit load of cafe_nand (and nandsim in the QEMU test)
+kmod
+# nanddump, nandwrite (mkinstall keeps only these two of the package)
+mtd-utils-nand
+# flash_erase (only this one is kept)
+mtd-utils-flash

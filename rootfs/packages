@@ -41,5 +41,9 @@ wireless-tools
 # mkrootfs.sh downloads them from linux-firmware git if ever missing)
 linux-firmware-libertas
 
-# --- remote debugging (installed, NOT enabled) ---------------------------
+# --- remote debugging: key-only root SSH, started by olpc-ssh unless
+# olpcboy.nossh (dropbear-scp: classic scp protocol, use `scp -O`)
 dropbear
+dropbear-scp
+# sftp subsystem (dropbear execs /usr/lib/ssh/sftp-server): plain scp, sftp, sshfs
+openssh-sftp-server

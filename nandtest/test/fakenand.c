@@ -83,6 +83,10 @@ static void sysbump(const char *dev, const char *attr, int by) {
 
 static int part(const char *dev, uint64_t *off, uint64_t *len, int *rw) {
 	const char *b = strrchr(dev, '/'); b = b ? b + 1 : dev;
+	if (getenv("FAKE_LAYOUT_INSTALL")) {          /* install layout: mtd0 = [0,PRE) writeable, mtd1 = the rest, read-only */
+		if (!strcmp(b, "mtd0")) { *off = 0; *len = PRE; *rw = 1; return 0; }
+		if (!strcmp(b, "mtd1")) { *off = PRE; *len = TOTAL - PRE; *rw = 0; return 0; }
+	}
 	if (!strcmp(b, "mtd0")) { *off = 0; *len = PRE; *rw = 0; }
 	else if (!strcmp(b, "mtd1")) { *off = PRE; *len = TEST; *rw = 1; }
 	else if (!strcmp(b, "mtd2")) { *off = PRE + TEST; *len = TOTAL - PRE - TEST; *rw = 0; }
@@ -94,7 +98,7 @@ static void rd(uint64_t pg) { fseeko(nand, (off_t)(pg * (WRITE + OOB)), SEEK_SET
 static void wr(uint64_t pg, const unsigned char *p) { fseeko(nand, (off_t)(pg * (WRITE + OOB)), SEEK_SET); fwrite(p, 1, WRITE + OOB, nand); }
 
 static int do_dump(int argc, char **argv, const char *dev, uint64_t off, uint64_t len) {
-	int oob = 0, noecc = 0, quiet = 0, i; uint64_t start = 0, pg, n;
+	int oob = 0, noecc = 0, quiet = 0, skip = 0, i; uint64_t start = 0, pg, sp, n, plen = len, nblk = ERASE / WRITE;
 	unsigned long long failed = 0;
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--oob") || !strcmp(argv[i], "-o")) oob = 1;
@@ -102,14 +106,19 @@ static int do_dump(int argc, char **argv, const char *dev, uint64_t off, uint64_
 		else if (!strcmp(argv[i], "-q")) quiet = 1;
 		else if (!strcmp(argv[i], "-l") && i + 1 < argc) len = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "-s") && i + 1 < argc) start = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--bb=skipbad")) skip = 1;   /* good blocks only; -l counts good bytes (as nanddump does) */
 		else if (!strncmp(argv[i], "--bb=", 5)) ;
 		else if (argv[i][0] == '-') { fprintf(stderr, "fakenand nanddump: unsupported option %s\n", argv[i]); return 2; }
 	}
 	(void)dev; (void)quiet;
 	n = len / WRITE;
-	for (pg = 0; pg < n; pg++) {
-		uint64_t abs = off / WRITE + start / WRITE + pg;
+	for (pg = 0, sp = 0; pg < n; pg++, sp++) {
+		uint64_t abs = off / WRITE + start / WRITE + sp;
 		int r = 0;
+		if (skip) {
+			while (abs < (off + plen) / WRITE && is_bad(abs / nblk)) { sp += nblk - sp % nblk; abs = off / WRITE + start / WRITE + sp; }
+			if (abs >= (off + plen) / WRITE) break;
+		}
 		rd(abs);
 		if (!noecc) {
 			r = ecc_check(page);

@@ -21,7 +21,8 @@ start() {
 	# make sure the logging fs is writable; if the initramfs could not mount
 	# it, try once more on the explicit device (never `mount LABEL=`: that
 	# would probe every block device, mtdblock included).  Never fatal.
-	if ! grep -q ' /mnt/olpclog ' /proc/mounts; then
+	# (NAND boot: /mnt/olpclog is a bind of /data/olpclog made by the initramfs; no stick is involved)
+	if ! cmdline_has olpcboy.nand && ! grep -q ' /mnt/olpclog ' /proc/mounts; then
 		tl "WARNING: /mnt/olpclog not mounted, retrying"
 		for d in $(olpc_blockdevs); do
 			case "$(blkid "$d" 2>/dev/null)" in

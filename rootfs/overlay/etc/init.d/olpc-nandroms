@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# Internal ROM storage when booted from the NAND (kernel flag olpcboy.nand; a no-op otherwise).
+# The initramfs bound /data on /mnt/internal, so the launcher and olpc-covers find the ROM tree
+# /mnt/internal/roms through their normal scan of /mnt/*.  This service makes sure the folders
+# exist and points ~/ROMs (scp target) at the SD card's roms when an SD card is mounted, else at
+# the internal roms.  Never fails the boot.
+
+description="olpc-boy: internal ROM folders and ~/ROMs (NAND boot)"
+
+depend() {
+	need olpclog
+	after olpc-sd olpc-ssh
+}
+
+start() {
+	. /usr/libexec/olpcboy/common.sh
+	cmdline_has olpcboy.nand || return 0
+	ebegin "olpc-nandroms: internal ROM folders"
+	I=${OLPC_INTERNAL:-/mnt/internal}
+	if grep -q " $I " /proc/mounts 2>/dev/null; then
+		mkdir -p "$I/roms/gb" "$I/roms/gbc" "$I/roms/nes" "$I/roms/saves" "$I/roms/states" "$I/covers" 2>/dev/null
+		if grep -q ' /mnt/sd ' /proc/mounts 2>/dev/null; then T=/mnt/sd/roms; else T=$I/roms; fi
+		ln -sfn "$T" "${OLPC_ROMS_LINK:-/root/ROMs}" 2>/dev/null
+		tl "nandroms: $I ready, ~/ROMs -> $T"
+	else
+		tl "nandroms: WARNING $I is not mounted"
+	fi
+	eend 0
+}

@@ -3,3 +3,4 @@ logs/
 .flash-device
 ROMs/
 wifi.cfg
+ssh_authorized_keys

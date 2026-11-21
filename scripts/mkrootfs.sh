@@ -144,6 +144,24 @@ ls -l "$R/usr/local/bin/olpc-menu" | sed "s/^/  /"
 mkdir -p "$R/mnt/sd"      # SD card mount point (olpc-sd service / olpc-sdmount)
 # ---- end olpc-menu
 
+echo "== ssh"
+sh scripts/test-olpc-ssh.sh >"$WORK/olpc-ssh-test.log" 2>&1 \
+	|| { cat "$WORK/olpc-ssh-test.log" >&2; echo "ERROR: olpc-ssh tests failed" >&2; exit 1; }
+tail -n1 "$WORK/olpc-ssh-test.log"
+# ssh exec sessions get dropbear's fixed PATH (no /usr/local/*): expose the user-facing helper
+ln -sf /usr/local/sbin/olpc-menu-rescan "$R/usr/bin/olpc-menu-rescan"
+# Authorized key(s) come from the local, git-ignored ssh_authorized_keys (public keys only).
+if [ -s ssh_authorized_keys ]; then
+	if grep -q 'PRIVATE KEY' ssh_authorized_keys; then
+		echo "ERROR: ssh_authorized_keys contains a private key" >&2; exit 1
+	fi
+	install -d -m 0700 "$R/root/.ssh"
+	install -m 0600 ssh_authorized_keys "$R/root/.ssh/authorized_keys"
+	echo "ssh: $(grep -c '^[^#]' ssh_authorized_keys) key line(s) -> /root/.ssh/authorized_keys; dropbear enabled"
+else
+	echo "ssh: no ssh_authorized_keys at the repo root: image built WITHOUT SSH (cost logger only)"
+fi
+
 echo "== runlevels"
 RL=$R/etc/runlevels
 rm -rf "$RL"
@@ -165,8 +183,10 @@ addsvc boot modules sysctl hostname hwclock bootmisc syslog root localmount
 addsvc default olpc-powerbtn olpc-chordd olpc-bootdone
 addsvc default olpc-sd        # SD card at /mnt/sd (olpc-menu block)
 addsvc default olpc-usbdiag   # Sony pad diagnostics (no-op without a VID 054c device)
+addsvc default olpc-ssh       # dropbear (needs /root/.ssh/authorized_keys) + sshcost logger
+addsvc default olpc-nandroms  # internal ROM folders + ~/ROMs (NAND boot only; no-op otherwise)
 addsvc shutdown mount-ro killprocs savecache
-# NOT enabled on purpose: networking wpa_supplicant dropbear acpid crond
+# NOT enabled on purpose: networking wpa_supplicant acpid crond (dropbear runs via olpc-ssh)
 
 echo "== firmware (libertas)"
 for fw in usb8388_v9.bin usb8388_olpc.bin; do

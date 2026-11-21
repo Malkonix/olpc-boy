@@ -10,6 +10,10 @@ Box art for the launcher: `png2obc` (PNG/JPEG to `.obc`) and
   exact area-average downscale, never upscaled, written atomically.  Rejects
   images above 4096 px per side or 8 Mpixel (exit 3).
 * `olpc-covers-match.c` -- see the header comment of the file for the rules.
+  Also `--tree2html` (GitHub tree JSON on stdin -> Apache-like index) and
+  `--tree-sha DIR`; test.sh checks `--tree2html` byte for byte against the awk
+  implementation it replaced (set `OLPC_COVERS_REAL_TREE=file.json` to add a
+  real tree).
 * `t_gen.c`, `test.sh` -- host tests (`sh src/olpc-covers/test.sh`).
 * `stb_image.h` -- v2.32, vendored unmodified from
   https://github.com/nothings/stb at commit

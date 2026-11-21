@@ -20,9 +20,9 @@ RUN_ROOT := $(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) $(BUILDER)
 # File-based prerequisites so a small change does not rebuild the world.
 INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs.sh
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
-ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
+ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh $(wildcard ssh_authorized_keys)
 
-.PHONY: nandtest-test nandtest-rootfs nandtest-check nandtest-image qemu-nandtest backup-test backup-rootfs backup-check backup-image qemu-backup olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: nand-image install-test install-rootfs install-check install-image restore-image qemu-install nandtest-test nandtest-rootfs nandtest-check nandtest-image qemu-nandtest backup-test backup-rootfs backup-check backup-image qemu-backup olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -67,7 +67,7 @@ logs:
 
 # out/ holds root-owned files from the container, so delete from inside it.
 clean:
-	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/olpc-boy-nandbackup.img out/backup-rootfs.tar out/backup-work out/backup-work.test.log out/qemu-backup-* out/olpc-boy-nandtest.img out/nandtest-rootfs.tar out/nandtest-work out/nandtest-work.test.log out/qemu-nandtest-* out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
+	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/olpc-boy-nandbackup.img out/backup-rootfs.tar out/backup-work out/backup-work.test.log out/qemu-backup-* out/olpc-boy-nandtest.img out/nandtest-rootfs.tar out/nand-root.* out/nand-initrd*.img out/install-rootfs.tar out/install-work out/install-work.test.log out/olpc-boy-install.img out/olpc-boy-restore.img out/qemu-install-* out/nandtest-work out/nandtest-work.test.log out/qemu-nandtest-* out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
 
 distclean:
 	$(RUN_ROOT) sh -c 'rm -rf out/* out/.*.stamp'
@@ -155,3 +155,48 @@ qemu-nandtest: out/olpc-boy-nandtest.img
 # Logic tests of the write-test script against a file-backed fake NAND (builder: gcc, mtd-utils).
 nandtest-test:
 	$(RUN_ROOT) sh nandtest/test.sh
+
+# ---- install olpc-boy on the internal NAND (separate sticks; the normal image is unaffected) ----
+# make nand-image     ->  out/nand-root.jffs2 (+ initrd): the whole NAND as one JFFS2, from out/rootfs.tar
+# make install-image  ->  out/olpc-boy-install.img: boot stick that installs it (needs the NAND backup, like nandtest)
+# make restore-image  ->  out/olpc-boy-restore.img: boot stick that restores the original OS from the OLPCNAND stick
+# make install-test   ->  logic tests of the installer/restore script against a fake NAND
+# make qemu-install   ->  QEMU + nandsim: install, boot from the NAND, restore (needs both images)
+NAND_SRC    := boot/olpc-nand.fth scripts/mknand.sh install/src/nbjffs.c
+INSTALL_SRC := $(shell find install -type f 2>/dev/null) scripts/mkinstall.sh backup/src/nbhash.c backup/src/nbcmp.c nandtest/src/nbtool.c nandtest/test/fakenand.c rootfs/overlay/usr/libexec/olpcboy/common.sh $(shell find src/olpc-splash src/common -type f 2>/dev/null)
+
+nand-image:      out/nand-root.jffs2
+install-rootfs:  out/install-rootfs.tar
+install-check:   out/.install-check.stamp
+install-image:   out/olpc-boy-install.img
+restore-image:   out/olpc-boy-restore.img
+
+out/nand-root.jffs2: out/rootfs.tar out/kernel/bzImage $(NAND_SRC)
+	$(RUN_ROOT) bash scripts/mknand.sh
+	@touch $@
+
+out/install-rootfs.tar: out/nand-root.jffs2 out/kernel/bzImage $(INSTALL_SRC)
+	@test -r "$(NAND_BACKUP_DIR)/nand-data-ecc.bin" || { \
+	  echo "ERROR: NAND backup not found in '$(NAND_BACKUP_DIR)' (need nand-data-ecc.bin); set NAND_BACKUP_DIR=..." >&2; exit 1; }
+	$(DOCKER) -v "$(NAND_BACKUP_DIR)":/nandbackup:ro -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) $(BUILDER) bash scripts/mkinstall.sh
+	@touch $@
+
+out/.install-check.stamp: out/install-rootfs.tar scripts/check-sse.sh
+	$(RUN_USER) bash scripts/check-sse.sh out/install-rootfs.tar
+	@touch $@
+
+out/olpc-boy-install.img: out/kernel/bzImage out/install-rootfs.tar out/.install-check.stamp install/olpc.fth scripts/mkimage.sh
+	$(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) -e IMG_OUT=out/olpc-boy-install.img \
+	  -e ROOTFS_TAR=out/install-rootfs.tar -e FTH=install/olpc.fth -e FREE_MIB=16 \
+	  $(BUILDER) bash scripts/mkimage.sh
+
+out/olpc-boy-restore.img: out/kernel/bzImage out/install-rootfs.tar out/.install-check.stamp install/olpc-restore.fth scripts/mkimage.sh
+	$(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) -e IMG_OUT=out/olpc-boy-restore.img \
+	  -e ROOTFS_TAR=out/install-rootfs.tar -e FTH=install/olpc-restore.fth -e NO_USERDATA=1 -e FREE_MIB=16 \
+	  $(BUILDER) bash scripts/mkimage.sh
+
+install-test:
+	$(RUN_ROOT) sh install/test.sh
+
+qemu-install: out/olpc-boy-install.img out/olpc-boy-restore.img out/nand-initrd-sim.img
+	bash scripts/qemu-install-test.sh

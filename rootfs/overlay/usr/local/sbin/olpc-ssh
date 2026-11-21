@@ -1,0 +1,132 @@
+#!/bin/sh
+# Test SSH server (dropbear): key-only root login, no forwarding, no banner.
+#   olpc-ssh start   decide, prepare the host key, launch dropbear, start the cost logger
+#   olpc-ssh stop    stop dropbear and the cost logger
+#   olpc-ssh on|off  (Options switch) persist the choice, then start / stop dropbear only
+# The choice is the flag file ssh.off in the OLPCLOG root (present = OFF, default ON); it
+# survives scripts/flash-keep.sh.  Boot honours it: "start" skips dropbear when it exists.
+# Skipped (one timeline line) with olpcboy.nossh or without /root/.ssh/authorized_keys
+# (the build installs it from the local, git-ignored ssh_authorized_keys).  The cost
+# logger (olpc-sshcost) runs in every case so on/off boots are comparable.
+# Host key: ed25519, generated on the first boot that gets here and kept on the root
+# fs (mode 0600), so the fingerprint stays stable until the stick is re-flashed.
+. /usr/libexec/olpcboy/common.sh
+
+KEYDIR=${OLPC_SSH_KEYDIR:-/etc/dropbear}
+KEY=$KEYDIR/dropbear_ed25519_host_key
+AUTH=${OLPC_SSH_AUTH:-/root/.ssh/authorized_keys}
+PORT=${OLPC_SSH_PORT:-22}
+DROPBEAR=${OLPC_DROPBEAR:-/usr/sbin/dropbear}
+DBKEY=${OLPC_DROPBEARKEY:-/usr/bin/dropbearkey}
+RUNDIR=/run/olpcboy
+PIDF=$RUNDIR/dropbear.pid
+OFFFLAG=${OLPC_SSH_CFGDIR:-/mnt/olpclog}/ssh.off
+LOG=$BOOTDIR/dropbear.log
+
+# is a TCP listener bound to port $1 (IPv4; the kernel has no IPv6)?
+listening() {
+	_hp=$(printf '%04X' "$1")
+	while read -r _sl _la _ra _st _; do
+		[ "$_st" = 0A ] && [ "${_la#*:}" = "$_hp" ] && return 0
+	done </proc/net/tcp
+	return 1
+}
+
+# after the launch: confirm the listener without delaying the caller
+confirm() {
+	_n=0
+	while [ "$_n" -lt 50 ]; do
+		if listening "$PORT"; then
+			tl "ssh: listening on tcp/$PORT"
+			netstat -ltn 2>/dev/null | grep ":$PORT " >>"$LOG"
+			return 0
+		fi
+		_n=$((_n + 1)); olpc_sleep 0.2
+	done
+	tl "ssh: ERROR not listening after 10 s (see dropbear.log)"
+}
+
+# is the dropbear of the pid file alive?
+running() {
+	[ -r "$PIDF" ] && read -r _rp <"$PIDF" && [ -n "$_rp" ] && kill -0 "$_rp" 2>/dev/null
+}
+
+start_ssh() {
+	mkdir -p "$RUNDIR"
+	if cmdline_has olpcboy.nossh; then tl "ssh: disabled (olpcboy.nossh)"; return 0; fi
+	if [ -e "$OFFFLAG" ]; then tl "ssh: disabled (saved OFF)"; return 0; fi
+	running && return 0
+	if [ ! -s "$AUTH" ]; then tl "ssh: skipped (no authorized_keys in the image)"; return 0; fi
+	[ -x "$DROPBEAR" ] || { tl "ssh: ERROR $DROPBEAR missing"; return 1; }
+	tl "ssh: start"
+	# ~/ROMs -> the SD card's ROM tree the launcher scans (scp game.gb root@xo:ROMs/gb/)
+	ROMS=${OLPC_ROMS_DIR:-/mnt/sd/roms}
+	LINK=${OLPC_ROMS_LINK:-/root/ROMs}
+	if grep -q " ${ROMS%/roms} " "${OLPC_MOUNTS:-/proc/mounts}" 2>/dev/null; then
+		mkdir -p "$ROMS/gb" "$ROMS/gbc" "$ROMS/nes" 2>/dev/null
+		tl "ssh: ROM dir $ROMS ready"
+	else
+		tl "ssh: no SD card mounted, ~/ROMs will dangle until one is inserted and rebooted"
+	fi
+	ln -sfn "$ROMS" "$LINK" 2>/dev/null
+	mkdir -p "$KEYDIR"; chmod 0700 "$KEYDIR"
+	if [ -s "$KEY" ]; then
+		tl "ssh: host key reused"
+	else
+		rm -f "$KEY.tmp"
+		if "$DBKEY" -t ed25519 -f "$KEY.tmp" >/dev/null 2>>"$LOG"; then
+			chmod 0600 "$KEY.tmp"; mv "$KEY.tmp" "$KEY"; sync
+			tl "ssh: host key generated (persisted in $KEYDIR)"
+		else
+			tl "ssh: ERROR dropbearkey failed"; return 1
+		fi
+	fi
+	# fingerprint only (dropbearkey -y also prints the public key; it is dropped)
+	_fp=$("$DBKEY" -y -f "$KEY" 2>/dev/null | sed -n 's/^Fingerprint: //p')
+	tl "ssh: host key fingerprint ${_fp:-unknown}"
+	# -s no password logins; -j -k no local/remote forwarding; no -b: no banner;
+	# -E log to stderr (dropbear.log).  nice 10: never competes with the emulator.
+	setsid nice -n 10 "$DROPBEAR" -F -E -s -j -k -T 3 -p "$PORT" -r "$KEY" -P "$PIDF" \
+		</dev/null >/dev/null 2>>"$LOG" &
+	tl "ssh: dropbear launched"
+	setsid nice -n 19 "$0" confirm </dev/null >/dev/null 2>&1 &
+}
+
+# kill dropbear only (the cost logger keeps running)
+stop_dropbear() {
+	if [ -r "$PIDF" ]; then
+		read -r _pid <"$PIDF" && [ -n "$_pid" ] && kill "$_pid" 2>/dev/null
+		rm -f "$PIDF"
+	fi
+}
+
+stop_ssh() {
+	for _p in "$PIDF" "$RUNDIR/sshcost.pid"; do
+		[ -r "$_p" ] || continue
+		read -r _pid <"$_p" && [ -n "$_pid" ] && kill "$_pid" 2>/dev/null
+		rm -f "$_p"
+	done
+	return 0
+}
+
+case "${1:-}" in
+start)
+	start_ssh
+	# cost logger (always)
+	setsid nice -n 19 /usr/local/sbin/olpc-sshcost </dev/null >/dev/null 2>&1 &
+	;;
+confirm) confirm ;;
+on)
+	rm -f "$OFFFLAG"; tl "ssh: switched ON from the menu"
+	start_ssh
+	# the menu redraws when this exits: wait (bounded) for dropbear's pid file
+	_n=0; while [ "$_n" -lt 20 ] && ! running; do _n=$((_n + 1)); olpc_sleep 0.1; done
+	;;
+off)
+	: >"$OFFFLAG" 2>/dev/null; tl "ssh: switched OFF from the menu"
+	stop_dropbear
+	;;
+stop) stop_ssh ;;
+*) echo "usage: olpc-ssh start|stop|on|off" >&2; exit 2 ;;
+esac
+exit 0

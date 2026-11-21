@@ -4,7 +4,7 @@
  *
  * Test hooks (all optional): OLPC_MENU_FAKEFB (file standing in for /dev/fb0), OLPC_MENU_SCAN (base
  * dirs, default /mnt:/media), OLPC_MENU_RUNDIR (default /run/olpcboy), OLPC_MENU_CHORD, OLPC_MENU_RUN,
- * OLPC_MENU_LOGDIR (per-game run-NNN.stats/.log; default $BOOTDIR, else /var/log/olpc-current, else the run dir), OLPC_MENU_COVERS_BIN, OLPC_MENU_WIFI_BIN, OLPC_MENU_SDMOUNT, OLPC_MENU_POWEROFF, OLPC_MENU_REBOOT,
+ * OLPC_MENU_LOGDIR (per-game run-NNN.stats/.log; default $BOOTDIR, else /var/log/olpc-current, else the run dir), OLPC_MENU_COVERS_BIN, OLPC_MENU_WIFI_BIN, OLPC_MENU_SDMOUNT, OLPC_MENU_SSH_BIN (olpc-ssh; run as "on"/"off" by the SSH switch), OLPC_MENU_POWEROFF, OLPC_MENU_REBOOT,
  * OLPC_MENU_INPUTDIR, OLPC_MENU_DEVDIR, OLPC_MENU_BACKLIGHT (glob pattern, default the backlight class dir plus a star),
  * OLPC_MENU_WIRELESS (default /proc/net/wireless), OLPC_MENU_CFGDIR (where TZ.CFG lives, default
  * /mnt/olpclog), OLPC_MENU_TZFILE (default /etc/TZ), OLPC_MENU_FAKETIME (epoch seconds standing in
@@ -46,8 +46,9 @@
 
 /* ------------------------------------------------------------------ config */
 
+static const char *e_watch;
 static const char *e_scan, *e_rundir, *e_chord, *e_run, *e_covers, *e_wifi, *e_sd, *e_poweroff, *e_reboot,
-		  *e_inputdir, *e_devdir, *e_backlight, *e_wireless, *e_cfgdir, *e_tzfile;
+		  *e_inputdir, *e_devdir, *e_backlight, *e_wireless, *e_cfgdir, *e_tzfile, *e_ssh;
 static char p_state[300], p_runerr[300], p_covstat[300], p_jobout[300], p_status[300], p_wifist[300];
 
 static const char *envd(const char *n, const char *d) { const char *v = getenv(n); return v && *v ? v : d; }
@@ -313,7 +314,7 @@ static int cov_w, cov_h;
 static enum { CV_BLANK, CV_PENDING, CV_SHOWN, CV_PLACEHOLDER } cov_state = CV_BLANK;
 static uint64_t cov_due;
 
-static volatile sig_atomic_t g_quit, g_chld;
+static volatile sig_atomic_t g_quit, g_chld, g_rescan;
 static const int exit_code = 0;
 
 static void layout(void)
@@ -753,7 +754,7 @@ static void switch_sys(int dir, uint64_t now)
 
 /* -------------------------------------------------------------------- jobs */
 
-enum { JOB_SD, JOB_NET, JOB_COVERS, NJOB };
+enum { JOB_SD, JOB_NET, JOB_COVERS, JOB_SSH, NJOB };
 enum { NET_UP, NET_DOWN };
 static struct { pid_t pid; int what; } jobs[NJOB];
 static char opt_msg[96], cov_line[96];
@@ -802,6 +803,20 @@ static void read_first_line(const char *path, char *out, size_t cap, int last)
 static void do_rescan(void);
 static void draw_options(void);
 
+static int g_ssh_want;            /* what the last SSH toggle asked for */
+
+/* the real state: the dropbear pid file (written by dropbear itself) names a live process */
+static int ssh_running(void)
+{
+	char path[320], l[32];
+	pid_t pid;
+
+	snprintf(path, sizeof path, "%s/dropbear.pid", e_rundir);
+	read_first_line(path, l, sizeof l, 0);
+	pid = (pid_t)atoi(l);
+	return pid > 1 && kill(pid, 0) == 0;
+}
+
 static void job_done(int k, int status)
 {
 	(void)status;
@@ -811,6 +826,11 @@ static void job_done(int k, int status)
 		if (screen == SC_LIST) draw_main(now_ms());
 	} else if (k == JOB_NET) {
 		read_wifi();                 /* olpc-wifi wrote its final state; the inotify event may not be served yet */
+	} else if (k == JOB_SSH) {
+		int on = ssh_running();
+		logf_("ssh: now %s", on ? "ON" : "OFF");
+		if (g_ssh_want && !on) snprintf(opt_msg, sizeof opt_msg, "SSH did not start (see timeline.log)");
+		else opt_msg[0] = 0;
 	} else if (k == JOB_COVERS) {
 		read_first_line(p_covstat, cov_line, sizeof cov_line, 1);
 		if (!cov_line[0]) snprintf(cov_line, sizeof cov_line, "download finished");
@@ -834,7 +854,7 @@ static void reap_jobs(void)
 
 /* ------------------------------------------------------------------ options */
 
-#define NOPT 6
+#define NOPT 7
 static int g_overlay = 1;       /* "In-game indicators": passed to olpc-run as --no-overlay when 0; kept in the state file */
 static void save_state(int best_effort_copy);
 static void opt_label(int i, char *b, size_t cap)
@@ -849,6 +869,12 @@ static void opt_label(int i, char *b, size_t cap)
 	case 2:
 		snprintf(b, cap, "WiFi networks...");
 		break;
+	case 6:
+		if (jobs[JOB_SSH].pid) snprintf(b, cap, "SSH: %s...", g_ssh_want ? "starting" : "stopping");
+		else if (!ssh_running()) snprintf(b, cap, "SSH: OFF");
+		else if (g_wifi.state == WS_CONNECTED && g_wifi.ip[0]) snprintf(b, cap, "SSH: ON  %s", g_wifi.ip);
+		else snprintf(b, cap, "SSH: ON (no network)");
+		break;
 	case 3: snprintf(b, cap, opt_confirm == 3 ? "Power off: press A again" : "Power off"); break;
 	case 4: snprintf(b, cap, opt_confirm == 4 ? "Reboot: press A again" : "Reboot"); break;
 	default: snprintf(b, cap, "In-game indicators: %s", g_overlay ? "ON" : "OFF"); break;
@@ -857,7 +883,7 @@ static void opt_label(int i, char *b, size_t cap)
 
 static void draw_options(void)
 {
-	int bw = 760, bh = 540, bx = (FBW - bw) / 2, by = (FBH - bh) / 2, i, y;
+	int bw = 760, bh = 560, bx = (FBW - bw) / 2, by = (FBH - bh) / 2, i, y;
 	char b[160];
 
 	fill(bx - 4, by - 4, bw + 8, bh + 8, C_BORDER);
@@ -937,6 +963,13 @@ static void opt_activate(void)
 		save_state(1);
 		snprintf(opt_msg, sizeof opt_msg, g_overlay ? "Indicators shown during games" : "Indicators hidden during games");
 		break;
+	case 6:
+		if (jobs[JOB_SSH].pid) { snprintf(opt_msg, sizeof opt_msg, "Busy, wait a moment"); break; }
+		if (!file_exec(e_ssh)) { snprintf(opt_msg, sizeof opt_msg, "olpc-ssh is not installed"); break; }
+		g_ssh_want = !ssh_running();
+		logf_("ssh: switching %s", g_ssh_want ? "ON" : "OFF");
+		jobs[JOB_SSH].pid = spawn(NULL, e_ssh, g_ssh_want ? "on" : "off");
+		break;
 	default:
 		if (opt_confirm != i) { opt_confirm = i; break; }
 		fill(0, 0, FBW, FBH, C_BG);
@@ -977,6 +1010,50 @@ static void apply_selection(int sys, const char *file)
 		}
 }
 
+/* Files copied in from outside (scp): a cheap signature of the ROM directories (mtime + link
+ * count of <watch>, <watch>/gb|gbc|nes and every romsdir of the last scan).  Polled every 4 s
+ * while the list is on screen; a rescan runs once the signature changed AND then held still
+ * for one poll, so a copy in progress is not listed half-way. */
+static unsigned long long sig_mix(unsigned long long h, const struct stat *sb)
+{
+	return h * 1000003ull + (unsigned long long)sb->st_mtim.tv_sec * 1000ull + (unsigned long long)sb->st_mtim.tv_nsec / 1000000 + sb->st_nlink;
+}
+
+/* mix in dir and each of its immediate subdirectories (gb/, GBC/, ...) */
+static unsigned long long sig_dir(unsigned long long h, const char *dir)
+{
+	struct stat sb;
+	struct dirent *e;
+	DIR *d;
+	char p[4400];
+
+	if (stat(dir, &sb) != 0) return h * 31;
+	h = sig_mix(h, &sb);
+	if (!(d = opendir(dir))) return h;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+		if (stat(p, &sb) == 0 && S_ISDIR(sb.st_mode)) h = sig_mix(h, &sb);
+	}
+	closedir(d);
+	return h;
+}
+
+static unsigned long long roms_sig(void)
+{
+	unsigned long long h = 1469598103ull;
+	char buf[1024];
+	char *w, *sv;
+	int i, j;
+
+	snprintf(buf, sizeof buf, "%s", e_watch);
+	for (w = strtok_r(buf, ":", &sv); w; w = strtok_r(NULL, ":", &sv)) h = sig_dir(h, w);
+	for (i = 0; i < NSYS; i++)
+		for (j = 0; j < L[i].n; j++)
+			if (j == 0 || strcmp(L[i].v[j].romsdir, L[i].v[j - 1].romsdir)) h = sig_dir(h, L[i].v[j].romsdir);
+	return h;
+}
+
 static void do_rescan(void)
 {
 	int i;
@@ -988,6 +1065,7 @@ static void do_rescan(void)
 	if (total_roms && !L[cur_sys].n)
 		for (i = 0; i < NSYS; i++) if (L[i].n) { cur_sys = i; break; }
 	if (st_sys >= 0) apply_selection(st_sys, st_file);
+	logf_("rescan: %d games", total_roms);
 	if (screen == SC_LIST) {
 		cov_state = CV_BLANK;
 	}
@@ -1033,6 +1111,9 @@ static uint16_t prev_m, blocked, taint;
 static int chord_now, g_resynced;
 static struct rep rep;
 static int ino_dev = -1, ino_run = -1;
+static unsigned long long rs_last;
+static uint64_t rs_due;
+static int rs_pend;
 static uint64_t sd_due;
 
 #define LONG_BITS (8 * sizeof(unsigned long))
@@ -1476,6 +1557,7 @@ static void script_dump(const char *path)
 
 static void on_sig(int s) { (void)s; g_quit = 1; }
 static void on_chld(int s) { (void)s; g_chld = 1; }
+static void on_usr1(int s) { (void)s; g_rescan = 1; }
 static void on_crash(int sig)
 {
 	static const char m[] = "olpc-menu: fatal signal, restoring the console\n";
@@ -1499,6 +1581,8 @@ static void install_signals(void)
 	for (i = 0; i < sizeof term / sizeof term[0]; i++) sigaction(term[i], &sa, NULL);
 	sa.sa_handler = on_chld;
 	sigaction(SIGCHLD, &sa, NULL);
+	sa.sa_handler = on_usr1;
+	sigaction(SIGUSR1, &sa, NULL);
 	sa.sa_handler = on_crash;
 	for (i = 0; i < sizeof crash / sizeof crash[0]; i++) sigaction(crash[i], &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
@@ -1550,6 +1634,7 @@ int main(int argc, char **argv)
 		else { usage(); return 2; }
 	}
 	e_scan = envd("OLPC_MENU_SCAN", "/mnt:/media");
+	e_watch = envd("OLPC_MENU_WATCH", "/mnt/sd/roms");
 	e_rundir = envd("OLPC_MENU_RUNDIR", "/run/olpcboy");
 	e_run = envd("OLPC_MENU_RUN", "/usr/local/bin/olpc-run");
 	e_covers = envd("OLPC_MENU_COVERS_BIN", "/usr/local/sbin/olpc-covers");
@@ -1562,6 +1647,7 @@ int main(int argc, char **argv)
 	e_backlight = envd("OLPC_MENU_BACKLIGHT", "/sys/class/backlight/*");
 	e_wireless = envd("OLPC_MENU_WIRELESS", "/proc/net/wireless");
 	e_cfgdir = envd("OLPC_MENU_CFGDIR", "/mnt/olpclog");
+	e_ssh = envd("OLPC_MENU_SSH_BIN", "/usr/local/sbin/olpc-ssh");
 	e_tzfile = envd("OLPC_MENU_TZFILE", "/etc/TZ");
 	snprintf(p_status, sizeof p_status, "%s/status", e_rundir);
 	snprintf(p_wifist, sizeof p_wifist, "%s/wifi.status", e_rundir);
@@ -1603,13 +1689,14 @@ int main(int argc, char **argv)
 	input_resync();       /* keys held while the menu starts must be released first */
 
 	sigemptyset(&blockset);
-	sigaddset(&blockset, SIGCHLD); sigaddset(&blockset, SIGINT); sigaddset(&blockset, SIGTERM); sigaddset(&blockset, SIGHUP);
+	sigaddset(&blockset, SIGCHLD); sigaddset(&blockset, SIGINT); sigaddset(&blockset, SIGTERM); sigaddset(&blockset, SIGHUP); sigaddset(&blockset, SIGUSR1);
 	sigprocmask(SIG_BLOCK, &blockset, &oldset);
 
 	net_host.g = &G; net_host.wall = wall; net_host.dirty = dirty_add; net_host.title = net_title; net_host.hint = draw_hint;
 	net_host.wifi = &g_wifi; net_host.wifi_bin = e_wifi; net_host.rundir = e_rundir;
 	netui_init(&net_host);
 	t_start = now_ms();
+	rs_last = roms_sig(); rs_due = t_start + 4000;
 	draw_main(t_start);
 	netui_autostart();            /* connect to a saved network in the background (olpc-wifi decides) */
 
@@ -1619,6 +1706,13 @@ int main(int argc, char **argv)
 		struct timespec ts;
 
 		if (g_chld) reap_jobs();
+		if (g_rescan) { g_rescan = 0; do_rescan(); rs_last = roms_sig(); rs_pend = 0; if (screen == SC_LIST) draw_main(now); }
+		if (screen == SC_LIST && now >= rs_due) {
+			unsigned long long sg = roms_sig();
+			rs_due = now + 4000;
+			if (sg != rs_last) { rs_last = sg; rs_pend = 1; }
+			else if (rs_pend) { rs_pend = 0; do_rescan(); rs_last = roms_sig(); draw_main(now); }
+		}
 		input_poll(&in, now * 1000000ull);        /* drains the pads, rescans on hotplug */
 		/* scripted key events (barriers wait until the screen has caught up) */
 		while (use_script && isev < nsev && !sev_barrier(&sev[isev]) && t_start + sev[isev].at <= now) {
@@ -1660,6 +1754,7 @@ int main(int argc, char **argv)
 		/* sleep: only timers that exist wake us up */
 		if (rep.dir) timeout = rep_timeout(&rep, now);
 		if (screen == SC_LIST && total_roms && cov_state == CV_PENDING) { t = cov_due > now ? (int)(cov_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
+		if (screen == SC_LIST) { t = rs_due > now ? (int)(rs_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (sd_due) { t = sd_due > now ? (int)(sd_due - now) : 0; if (timeout < 0 || t < timeout) timeout = t; }
 		if (in.rescan > 0 && (timeout < 0 || timeout > 100)) timeout = 100;
 		if (screen == SC_NET) { t = netui_timeout(now); if (t >= 0 && (timeout < 0 || t < timeout)) timeout = t; }

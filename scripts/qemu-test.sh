@@ -13,6 +13,9 @@
 # Env: QEMU_CPU   (default "pentium,+mmx,+cmov": this QEMU has no pentium-mmx model)
 #      KERNEL / IMAGE   override input paths   TIMEOUT  seconds (default 180)
 #      STOP_ON  regex: end the run early once the serial log matches it
+#      EXTRA_CMDLINE  words appended to the kernel command line (e.g. olpcboy.nossh)
+#      REBOOT=1  boot the existing out/qemu-test.img again (keeps the first boot's state:
+#                host key reuse, boot-0002) instead of a fresh copy
 #      ANALYZE_ONLY=1  skip the boot, only analyse the existing out/qemu-test.img
 # Exit: 0 pass, 1 test failure, 2 setup problem.
 set -euo pipefail
@@ -37,13 +40,13 @@ command -v mcopy >/dev/null            || die "mtools not installed"
 # Kernel command line = the one olpc.fth sets (the line ending in 'to boot-file').
 CMDLINE=$(sed -n 's/^" \(.*\)" to boot-file[[:space:]]*$/\1/p' "$FTH" | tail -n1)
 [ -n "$CMDLINE" ] || die "could not extract the command line from $FTH"
-CMDLINE="$CMDLINE console=ttyS0 loglevel=7 olpcboy.nobuttons"   # loglevel=7: kernel messages on serial for the opcode check
+CMDLINE="$CMDLINE console=ttyS0 loglevel=7 olpcboy.nobuttons ${EXTRA_CMDLINE:-}"   # loglevel=7: kernel messages on serial for the opcode check
 
 mkdir -p out
 if [ "${ANALYZE_ONLY:-0}" != 1 ]; then
     [ -s "$KERNEL" ] || die "missing $KERNEL (make kernel)"
     [ -s "$IMAGE" ]  || die "missing $IMAGE (make image)"
-    cp --sparse=always "$IMAGE" "$COPY"        # the pristine image is never booted
+    [ "${REBOOT:-0}" = 1 ] || cp --sparse=always "$IMAGE" "$COPY"        # the pristine image is never booted
     : > "$SERIAL"
     echo "qemu-test: cpu=$QEMU_CPU timeout=${TIMEOUT}s"
     echo "qemu-test: cmdline: $CMDLINE"
@@ -95,6 +98,27 @@ else
         if [ -e "$B/$m" ]; then echo "qemu-test: marker $m present"
         else echo "qemu-test: FAIL: marker $m missing in boot-0001"; FAIL=1; fi
     done
+fi
+# SSH test server: dropbear listening (or a logged skip/disable), sshcost.log with samples.
+LAST=$(find "$LOGDIR" -maxdepth 2 -type d -name 'boot-[0-9]*' | sort | tail -n1)
+if [ -n "$LAST" ]; then
+    TL=$LAST/timeline.log
+    case "$CMDLINE" in
+    *olpcboy.nossh*)
+        grep -q 'ssh: disabled (olpcboy.nossh)' "$TL" && echo "qemu-test: ssh disabled by olpcboy.nossh (as expected)" \
+            || { echo "qemu-test: FAIL: olpcboy.nossh but no 'ssh: disabled' timeline line"; FAIL=1; } ;;
+    *)
+        if grep -q 'ssh: skipped' "$TL"; then
+            echo "qemu-test: ssh skipped (image built without ssh_authorized_keys)"
+        elif grep -q 'ssh: listening on' "$TL" && grep -q 'ssh: host key fingerprint SHA256:' "$TL"; then
+            echo "qemu-test: ssh: $(grep -E 'ssh: (host key (generated|reused)|listening)' "$TL" | cut -d' ' -f2- | tr '\n' ';')"
+        else
+            echo "qemu-test: FAIL: dropbear not listening / no fingerprint in $TL"; grep 'ssh:' "$TL" | sed 's/^/  /'; FAIL=1
+        fi ;;
+    esac
+    if grep -qv '^#' "$LAST/sshcost.log" 2>/dev/null; then
+        echo "qemu-test: sshcost.log: $(grep -vc '^#' "$LAST/sshcost.log") sample(s)"
+    else echo "qemu-test: FAIL: no sshcost.log samples in $LAST"; FAIL=1; fi
 fi
 if grep -rqi 'invalid opcode' "$SERIAL" "$LOGDIR" 2>/dev/null; then
     echo "qemu-test: FAIL: 'invalid opcode' found (SSE or other unsupported instruction!):"
