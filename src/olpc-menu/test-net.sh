@@ -13,7 +13,7 @@ ok()  { echo "  ok: $*"; }
 HCF="-O2 -Wall -Wextra"
 echo "== network screen: build, keyboard unit checks"
 $CC $HCF -o "$tmp/netselftest" "$here/netselftest.c" "$here/osk.c" 2>"$tmp/cc1.log" || { cat "$tmp/cc1.log"; exit 1; }
-$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/netui.c" "$here/osk.c" "$here/../common/status.c" \
+$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/netui.c" "$here/osk.c" "$here/wallpaper.c" "$here/../common/status.c" \
 	"$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" || { cat "$tmp/cc.log"; exit 1; }
 grep -E "netui\.c|osk\.c|netselftest\.c" "$tmp/cc.log" "$tmp/cc1.log" | grep -i warning && bad "compiler warnings in netui/osk"
 "$tmp/netselftest" || fail=1

@@ -6,9 +6,9 @@ CFLAGS  ?= -O2 -march=geode -mtune=geode -Wall -Wextra
 OUT     ?= .
 RUN     := ../olpc-run
 COM     := ../common
-SRCS    := olpc-menu.c menulib.c netui.c osk.c $(COM)/status.c $(COM)/gfx.c $(RUN)/input.c $(RUN)/diag.c
+SRCS    := olpc-menu.c menulib.c netui.c osk.c wallpaper.c $(COM)/status.c $(COM)/gfx.c $(RUN)/input.c $(RUN)/diag.c
 
-$(OUT)/olpc-menu: $(SRCS) menulib.h netui.h osk.h $(COM)/status.h $(COM)/gfx.h $(COM)/font8x16.h $(RUN)/input.h $(RUN)/diag.h
+$(OUT)/olpc-menu: $(SRCS) menulib.h netui.h osk.h wallpaper.h $(COM)/status.h $(COM)/gfx.h $(COM)/font8x16.h $(RUN)/input.h $(RUN)/diag.h
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 	strip $@
 

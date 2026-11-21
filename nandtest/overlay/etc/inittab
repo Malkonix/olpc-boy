@@ -1,0 +1,5 @@
+# NAND write test: busybox init, no OpenRC.  /dev /proc /sys /run were moved in by the initramfs.
+::sysinit:/bin/mkdir -p /run/olpcboy
+::wait:/usr/local/sbin/olpc-nandtest
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync

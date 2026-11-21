@@ -13,7 +13,7 @@ ok()  { echo "  ok: $*"; }
 
 HCF="-O2 -Wall -Wextra"
 $CC $HCF -o "$tmp/selftest" "$here/selftest.c" "$here/menulib.c" "$here/../common/status.c" || exit 1
-$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/netui.c" "$here/osk.c" "$here/../common/status.c" "$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
+$CC $HCF -o "$tmp/olpc-menu" "$here/olpc-menu.c" "$here/menulib.c" "$here/netui.c" "$here/osk.c" "$here/wallpaper.c" "$here/../common/status.c" "$here/../common/gfx.c" "$here/../olpc-run/input.c" "$here/../olpc-run/diag.c" 2>"$tmp/cc.log" \
 	|| { cat "$tmp/cc.log"; exit 1; }
 grep -E "olpc-menu\.c|menulib\.c|status\.c|gfx\.c" "$tmp/cc.log" | grep -i warning && bad "compiler warnings in olpc-menu"
 

@@ -1,0 +1,538 @@
+#!/bin/sh
+# olpc-nandtest -- non-destructive WRITE tests of the XO-1 NAND (runs from inittab, once, as root).
+#
+# Only a small, known-free window of the NAND is ever written: erase blocks 7300..7363
+# (8 MiB, offset 934400 KiB).  The kernel command line (mtdparts=cafe_nand:934400k(pre)ro,
+# 8192k(test),-(post)ro) makes mtd0 and mtd2 read-only and only mtd1 (the window) writeable;
+# this script refuses to write unless sysfs confirms exactly that layout.  The only two
+# functions that run flash_erase / nandwrite (w_erase, w_write) always target the window
+# device.  The driver never writes its bad block table (allow_bbt_write=0).
+#
+#   0. precheck, no writes: ECC dump of the whole NAND, SHA-256 per erase block, compared with
+#      the hashes of the backup made earlier (built into the image); raw dump of the window.
+#      Any difference outside the known bad blocks, or a window that is not all 0xFF: STOP.
+#   1. erase the window (no cleanmarkers), verify 0xFF (ECC and raw)
+#   2. pseudo-random and all-0x00 patterns: write, read back, raw dump (ECC bytes present),
+#      ECC counters; speeds
+#   3. ECC correction: raw-write pages with 1 flipped bit and with 2 bits in other places
+#   4. JFFS2 at run time: erase -j, mount, write files, sync, umount, remount, verify
+#   5. JFFS2 install path: the image made at build time (mkfs.jffs2 + sumtool) written with
+#      nandwrite, mounted, hashes verified
+#   6. restore: erase -j, raw OOB / data identical to the backup's, then the full ECC dump hashed
+#      again per block: the whole NAND must equal the backup
+# Results: logs/boot-NNNN/NANDTEST.txt on the boot stick (+ timeline lines).  The backup stick
+# (vfat OLPCNAND) is not needed and is never mounted or written.
+#
+# Env overrides exist for the test harness (nandtest/test.sh); NT_TEST=1 unlocks them.
+. "${OLPC_COMMON:-/usr/libexec/olpcboy/common.sh}"
+
+# ---- configuration ----------------------------------------------------------------------
+CMDLINE=${NT_CMDLINE:-/proc/cmdline}
+SIM=0
+if [ -n "$NT_TEST" ]; then [ -n "$NT_SIM" ] && SIM=1; else cmdline_has olpcboy.nandsim && SIM=1; fi
+
+if [ "$SIM" = 1 ]; then
+	# nandsim: 256 MiB, 2048+64, 128 KiB blocks; window = blocks 100..163 (same layout as the XO-1 scaled down)
+	NT_ID="NAND 256MiB 3,3V 8-bit"
+	SIZE=268435456 ERASE=131072 WRITE=2048 OOB=64
+	T_BLK0=100 T_BLKS=64 PRE_KIB=12800 TEST_KIB=8192
+	ECC_OFF=40 ECC_LEN=24 CM_OFF=2
+	BADBLKS=""
+	EXPD=${NT_EXPD:-/usr/share/nandtest/sim}
+else
+	NT_ID=cafe_nand
+	SIZE=1073741824 ERASE=131072 WRITE=2048 OOB=64
+	T_BLK0=7300 T_BLKS=64 PRE_KIB=934400 TEST_KIB=8192
+	ECC_OFF=0 ECC_LEN=14 CM_OFF=14
+	BADBLKS="495 967 4039 4115 4644 4752 4791 4926 6373 6974 7748 7824 7863"
+	EXPD=${NT_EXPD:-/usr/share/nandtest}
+fi
+if [ -n "$NT_TEST" ]; then
+	SIZE=${NT_SIZE:-$SIZE} ERASE=${NT_ERASE:-$ERASE} WRITE=${NT_WRITE:-$WRITE} OOB=${NT_OOB:-$OOB}
+	T_BLK0=${NT_BLK0:-$T_BLK0} T_BLKS=${NT_BLKS:-$T_BLKS} PRE_KIB=${NT_PRE_KIB:-$PRE_KIB} TEST_KIB=${NT_TEST_KIB:-$TEST_KIB}
+	ECC_OFF=${NT_ECC_OFF:-$ECC_OFF} ECC_LEN=${NT_ECC_LEN:-$ECC_LEN} CM_OFF=${NT_CM_OFF:-$CM_OFF}
+	BADBLKS=${NT_BADBLKS-$BADBLKS}
+fi
+WANT_PARTS="mtdparts=$NT_ID:${PRE_KIB}k(pre)ro,${TEST_KIB}k(test),-(post)ro"
+[ "$SIM" = 1 ] && WANT_PARTS="mtdparts=\"$NT_ID:${PRE_KIB}k(pre)ro,${TEST_KIB}k(test),-(post)ro\""
+[ -n "$NT_TEST" ] && WANT_PARTS=${NT_WANT_PARTS:-$WANT_PARTS}
+TOTAL_BLKS=$(( SIZE / ERASE ))
+TBYTES=$(( T_BLKS * ERASE ))
+TPAGES=$(( TBYTES / WRITE ))
+PPB=$(( ERASE / WRITE ))
+RAWPG=$(( WRITE + OOB ))
+CRIT_LEN=$(( CM_OFF + 8 )); [ $(( ECC_OFF + ECC_LEN )) -gt "$CRIT_LEN" ] && CRIT_LEN=$(( ECC_OFF + ECC_LEN ))
+EXP_BLK=$EXPD/expected-blocks.txt
+EXP_OOB=$EXPD/expected-oob.bin
+INSTD=${NT_INSTD:-/usr/share/nandtest}
+INST_IMG=$INSTD/install.jffs2
+INST_SUM=$INSTD/install.sha256
+
+MTD0=${NT_MTD0:-/dev/mtd0}; MTD1=${NT_MTD1:-/dev/mtd1}; MTD2=${NT_MTD2:-/dev/mtd2}
+TMTD=$MTD1                                  # the ONLY device that is ever written
+BLK1=${NT_BLK1:-/dev/mtdblock1}
+SYSD=${NT_SYSD:-/sys/class/mtd}
+MODSYS=${NT_MODSYS:-/sys/module/cafe_nand}
+ND=${NT_NANDDUMP:-/usr/sbin/nanddump}
+NWRITE=${NT_NANDWRITE:-/usr/sbin/nandwrite}
+FERASE=${NT_FLASH_ERASE:-/usr/sbin/flash_erase}
+NBHASH=${NT_NBHASH:-/usr/local/sbin/nbhash}
+NBCMP=${NT_NBCMP:-/usr/local/sbin/nbcmp}
+NBTOOL=${NT_NBTOOL:-/usr/local/sbin/nbtool}
+SPLASH=${NT_SPLASH:-/usr/local/sbin/olpc-splash}
+RUN=${NT_RUN:-/run/olpcboy/nt}
+MNT=${NT_MNT:-/run/olpcboy/ntmnt}
+TTY=${NT_TTY:-/dev/tty1}
+MOUNT=${NT_MOUNT:-mount}
+UMOUNT=${NT_UMOUNT:-umount}
+BLKIDS=${NT_BLKIDS:-olpc_blkid}
+LOG=$BOOTDIR/NANDTEST.txt
+OUTD=$BOOTDIR/nandtest
+END_WAIT=60; [ "$SIM" = 1 ] && END_WAIT=3
+[ -n "$NT_TEST" ] && END_WAIT=${NT_END_WAIT:-$END_WAIT}
+
+mkdir -p "$RUN" "$OUTD" "$MNT" 2>/dev/null
+: >"$LOG"
+
+# ---- helpers ----------------------------------------------------------------------------
+up() { read -r _u _ <"${NT_UPTIME:-/proc/uptime}"; echo "${_u%.*}"; }
+T0=$(up)
+say() { echo "[nandtest] $*"; echo "$(up) $*" >>"$LOG"; tl "nandtest: $*"; }
+prog() { [ -x "$SPLASH" ] && "$SPLASH" progress "$1" "$2" 2>/dev/null; }
+sattr() { read -r _a <"$SYSD/mtd$1/$2" 2>/dev/null && echo "$_a" || echo "?"; }
+# speed text for BYTES moved in DCS centiseconds
+mbs() { _d=$2; [ "$_d" -ge 1 ] || _d=1; _v=$(( $1 * 1000 / 1048576 / _d )); echo "$(( _v / 10 )).$(( _v % 10 )) MB/s ($(( $2 / 100 )).$(( $2 % 100 )) s)"; }
+tcs() { _cs; echo "$CS"; }
+
+NCHK=0 NFAIL=0 FAILED="" FINAL_RC=0 LAYOUT_OK=0 MON="" MOUNTED=0 WROTE=0
+
+screen() {   # screen HEADLINE [line...]
+	_h=$1; shift
+	[ -x "$SPLASH" ] && "$SPLASH" text 2>/dev/null
+	{
+		printf '\033[2J\033[H\n\n'
+		printf '  ########################################################\n'
+		printf '  #                                                      #\n'
+		printf '  #   %-48s   #\n' "$_h"
+		printf '  #                                                      #\n'
+		printf '  ########################################################\n\n'
+		for _l in "$@"; do printf '  %s\n' "$_l"; done
+	} >"$TTY" 2>/dev/null
+	{ echo "== $_h"; for _l in "$@"; do echo "   $_l"; done; } >>"$LOG"
+	{ echo "== $_h"; for _l in "$@"; do echo "   $_l"; done; } >"$OUTD/final-screen.txt" 2>/dev/null
+}
+
+stop_monitor() { if [ -n "$MON" ]; then kill "$MON" 2>/dev/null; wait "$MON" 2>/dev/null; MON=""; fi; }
+
+finish() {
+	sync
+	[ -n "$NT_NOPOWEROFF" ] || { say "powering off in $END_WAIT s"; olpc_sleep "$END_WAIT"; sync; poweroff; olpc_sleep 20; poweroff -f; }
+	exit "$FINAL_RC"
+}
+
+# unrecoverable: no further writes.  The window is left as it is (see the log).
+fatal() {
+	stop_monitor
+	say "FATAL: $*"
+	[ "$MOUNTED" = 1 ] && { $UMOUNT "$MNT" 2>/dev/null && MOUNTED=0; }
+	_st="the test window was NOT written"
+	[ "$WROTE" = 1 ] && _st="the test window (blocks $T_BLK0..$(( T_BLK0 + T_BLKS - 1 ))) was written and NOT restored: erase it with flash_erase -j"
+	say "state: $_st"
+	FINAL_RC=1
+	screen "NAND TEST FAILED" "$1" "$2" "$3" "No further writes were made. $_st" "Details: $LOG"
+	finish
+}
+
+chk() {   # chk NAME RC [DETAIL]   (RC 0 = pass)
+	NCHK=$(( NCHK + 1 ))
+	if [ "$2" = 0 ]; then say "PASS  $1${3:+: $3}"
+	else NFAIL=$(( NFAIL + 1 )); FAILED="$FAILED
+     - $1${3:+: $3}"; say "FAIL  $1${3:+: $3}"; fi
+}
+
+# cmd LABEL command...: run, keep output in $RUN/LABEL.out, log command, rc, time.  Sets RC, DCS.
+cmd() {
+	_l=$1; shift
+	echo "$(up) \$ $*" >>"$LOG"
+	_cs; _a=$CS
+	"$@" >"$RUN/$_l.out" 2>&1; RC=$?
+	_cs; DCS=$(( CS - _a )); [ "$DCS" -ge 1 ] || DCS=1
+	echo "$(up)   rc=$RC, ${DCS} cs" >>"$LOG"
+	[ -s "$RUN/$_l.out" ] && head -c 300 "$RUN/$_l.out" | tr '\r' '\n' | tail -n 3 | sed 's/^/        /' >>"$LOG"
+	head -c 4000 "$RUN/$_l.out" >"$OUTD/$_l.out" 2>/dev/null
+	return "$RC"
+}
+
+# ---- the only two write primitives; both address the window device only ---------------------
+w_erase() {   # w_erase LABEL [-j]
+	[ "$LAYOUT_OK" = 1 ] || fatal "internal error: write attempted before the layout was verified"
+	_wl=$1; shift
+	WROTE=1
+	cmd "$_wl" "$FERASE" -q "$@" "$TMTD" 0 0
+}
+w_write() {   # w_write LABEL FILE [nandwrite options]
+	[ "$LAYOUT_OK" = 1 ] || fatal "internal error: write attempted before the layout was verified"
+	_wl=$1; _wf=$2; shift 2
+	WROTE=1
+	cmd "$_wl" "$NWRITE" -q "$@" "$TMTD" "$_wf"
+}
+
+# ---- reads ----------------------------------------------------------------------------------
+start_monitor() {   # start_monitor TAG LABEL BASE SPAN EXPECT
+	( _e=$(( $5 / 1048576 )); [ "$_e" -ge 1 ] || _e=1
+	  while :; do
+		_c=0; [ -r "$RUN/$1.cnt" ] && read -r _c <"$RUN/$1.cnt"
+		_c=$(( ${_c:-0} / 1048576 )); [ "$_c" -gt "$_e" ] && _c=$_e
+		prog $(( $3 + $4 * _c / _e )) "$2: $_c of $_e MiB"
+		olpc_sleep 3
+	  done ) &
+	MON=$!
+}
+
+# hash_pass TAG LABEL BASE SPAN: ECC dump of mtd0+mtd1+mtd2 (every block, bad ones included),
+# SHA-256 per erase block into $RUN/TAG.blk.  Returns 0 if all stages ran and SIZE bytes came.
+hash_pass() {
+	_t=$1
+	rm -f "$RUN/$_t".*; : >"$RUN/$_t.cnt"; : >"$RUN/$_t.nd"
+	start_monitor "$_t" "$2" "$3" "$4" "$SIZE"
+	{ for _m in "$MTD0" "$MTD1" "$MTD2"; do "$ND" -q --bb=dumpbad "$_m" 2>>"$RUN/$_t.err"; echo $? >>"$RUN/$_t.nd"; done; } \
+		| { "$NBHASH" -n -B "$ERASE" -L "$RUN/$_t.blk" -c "$RUN/$_t.cnt" -o "$RUN/$_t.sha"; echo $? >"$RUN/$_t.hs"; }
+	stop_monitor
+	head -n 100 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	_ok=0
+	_n=$(grep -c '^0$' "$RUN/$_t.nd" 2>/dev/null)
+	_h=x; read -r _h <"$RUN/$_t.hs" 2>/dev/null
+	_sha=""; _by=0; read -r _sha _by <"$RUN/$_t.sha" 2>/dev/null
+	[ "$_n" = 3 ] && [ "$_h" = 0 ] && [ "$_by" = "$SIZE" ] && _ok=1
+	[ "$_ok" = 1 ] || say "$_t: dump incomplete (nanddump ok=$_n/3, hash rc=$_h, bytes=${_by:-0} of $SIZE)"
+	[ "$_ok" = 1 ]
+}
+
+# cmp_blocks LIST: compare a per-block hash list with the backup's.  Sets CB_NA CB_NE CB_BAD CB_OUT CB_LIST.
+cmp_blocks() {
+	set -- $(awk -v bad="$BADBLKS" '
+		BEGIN { n = split(bad, b, " "); for (i = 1; i <= n; i++) isbad[b[i]] = 1 }
+		NR == FNR { e[$1] = $2; ne++; next }
+		{ na++; if (!($1 in e) || e[$1] != $2) { if ($1 in isbad) nb++; else { no++; if (no <= 40) l = l "," $1 } } }
+		END { printf "%d %d %d %d %s\n", na, ne, nb + 0, no + 0, (l == "" ? "-" : substr(l, 2)) }' "$EXP_BLK" "$1" 2>/dev/null)
+	CB_NA=${1:-0} CB_NE=${2:-0} CB_BAD=${3:-0} CB_OUT=${4:-0} CB_LIST=${5:--}
+}
+
+# raw_oob_check [EXPECT_FILE]: raw (no ECC) dump of the window -> OC_PAGES OC_DNON OC_DB OC_DBITS OC_DPG OC_ECCFF OC_CRIT
+raw_oob_check() {
+	rm -f "$RUN/oob.res" "$RUN/oob.rep"
+	_x=""; [ -n "$1" ] && _x="-x $1 -r $RUN/oob.rep"
+	{ "$ND" -q --bb=dumpbad --oob --noecc "$TMTD" 2>"$RUN/oob.err"; echo $? >"$RUN/oob.nd"; } \
+		| { "$NBTOOL" oob -w "$WRITE" -o "$OOB" -E "$ECC_OFF" "$ECC_LEN" -K 0 "$CRIT_LEN" $_x >"$RUN/oob.res"; echo $? >"$RUN/oob.hs"; }
+	_a=x; _b=x; read -r _a <"$RUN/oob.nd" 2>/dev/null; read -r _b <"$RUN/oob.hs" 2>/dev/null
+	OC_PAGES=0 OC_DNON=0 OC_DB=0 OC_DBITS=0 OC_DPG=0 OC_ECCFF=0 OC_CRIT=0
+	read -r OC_PAGES OC_DNON OC_DB OC_DBITS OC_DPG OC_ECCFF OC_CRIT <"$RUN/oob.res" 2>/dev/null
+	head -n 40 "$RUN/oob.rep" >"$OUTD/oob-diff-$2.txt" 2>/dev/null
+	[ "$_a" = 0 ] && [ "$_b" = 0 ] && [ "$OC_PAGES" = "$TPAGES" ]
+}
+
+# read_cmp TAG FILE [nanddump args]: ECC read of the window compared with FILE.  Sets CMP_B CMP_BITS CMP_BLK.
+read_cmp() {
+	_t=$1 _f=$2; shift 2
+	rm -f "$RUN/$_t".*
+	{ "$ND" "$@" "$TMTD" 2>"$RUN/$_t.err"; echo $? >"$RUN/$_t.nd"; } \
+		| { "$NBCMP" -b "$ERASE" -o "$RUN/$_t.res" "$_f"; echo $? >"$RUN/$_t.hs"; }
+	_a=x; _b=x; read -r _a <"$RUN/$_t.nd" 2>/dev/null; read -r _b <"$RUN/$_t.hs" 2>/dev/null
+	CMP_B=-1 CMP_BITS=0 CMP_BLK=0 CMP_N=0 CMP_FN=0
+	read -r CMP_B CMP_BITS CMP_BLK CMP_N CMP_FN <"$RUN/$_t.res" 2>/dev/null
+	head -n 50 "$RUN/$_t.err" >"$OUTD/nanddump-$_t.err" 2>/dev/null
+	[ "$_a" = 0 ] && [ "$_b" = 0 ]
+}
+
+# ecc_counts TAG -> "UNCORR_PAGES CORR_PAGES CORR_BITS" from nanddump's stderr
+ecc_counts() {
+	awk '/uncorrectable bitflip/ { up++ } /corrected bitflip/ { cp++; cb += $2 } END { printf "%d %d %d\n", up, cp, cb }' "$RUN/$1.err" 2>/dev/null
+}
+ecc_sys() { echo "$(sattr 1 ecc_failures) $(sattr 1 corrected_bits)"; }
+
+all_ff() {   # all_ff TAG [raw]: ECC read of the window is all 0xFF -> 0
+	"$ND" -q --bb=dumpbad "$TMTD" 2>"$RUN/$1.err" | "$NBTOOL" ff >"$RUN/$1.res"
+	read -r _nf _fo _tot <"$RUN/$1.res"
+	FF_NON=${_nf:--1} FF_TOT=${_tot:-0}
+	[ "$FF_NON" = 0 ] && [ "$FF_TOT" = "$TBYTES" ]
+}
+
+# ---- 0. start and safety verification (no writes) ----------------------------------------
+say "start: NAND write tests; mode $([ "$SIM" = 1 ] && echo SIMULATED || echo REAL); window blocks $T_BLK0..$(( T_BLK0 + T_BLKS - 1 )) of $TOTAL_BLKS ($(( TBYTES / 1048576 )) MiB)"
+prog 2 "Preparing"
+[ -w "$BOOTDIR" ] || fatal "boot stick not writable" "$BOOTDIR cannot be written."
+[ -r "$EXP_BLK" ] && [ -r "$EXP_OOB" ] && [ -r "$INST_IMG" ] && [ -r "$INST_SUM" ] \
+	|| fatal "expected-data files missing in the image" "Need $EXP_BLK, $EXP_OOB, $INST_IMG, $INST_SUM"
+[ "$(wc -l <"$EXP_BLK")" = "$TOTAL_BLKS" ] || fatal "expected block list has the wrong length" "$(wc -l <"$EXP_BLK") lines, expected $TOTAL_BLKS"
+[ "$(wc -c <"$EXP_OOB")" = "$(( TPAGES * OOB ))" ] || fatal "expected OOB file has the wrong size" "$(wc -c <"$EXP_OOB") bytes, expected $(( TPAGES * OOB ))"
+
+# the backup stick is not needed: never touch it, and never run with it as the boot/log device
+for _l in $($BLKIDS 2>/dev/null | while IFS= read -r _line; do
+		case $_line in *'LABEL="OLPCNAND"'*) echo "${_line%%:*}" ;; esac; done); do
+	say "note: a volume labelled OLPCNAND is present ($_l); it is not used and not touched"
+	grep -q "^$_l " /proc/mounts 2>/dev/null && fatal "the OLPCNAND backup stick is mounted ($_l)" "Remove it and boot again."
+done
+
+# kernel command line: exactly the read-only partitioning
+_np=0; for _w in $(cat "$CMDLINE"); do case $_w in mtdparts=*) _np=$(( _np + 1 )) ;; esac; done
+case " $(cat "$CMDLINE") " in *" $WANT_PARTS "*) _pok=1 ;; *) _pok=0 ;; esac
+[ "$_np" = 1 ] && [ "$_pok" = 1 ] \
+	|| fatal "kernel command line lacks exactly $WANT_PARTS" "Refusing to load the NAND driver."
+if [ -z "$NT_TEST" ] && ls "$SYSD"/mtd[0-9]* >/dev/null 2>&1; then
+	fatal "an MTD device exists before the driver was loaded" "Unexpected; not continuing."
+fi
+BASEDMESG=$(dmesg | wc -l)
+if [ -z "$NT_NOLOAD" ]; then
+	if [ "$SIM" = 1 ]; then
+		modprobe --ignore-install nandsim id_bytes=0xec,0xda,0x10,0x95 2>"$RUN/modprobe.err" \
+			|| fatal "nandsim failed to load" "$(head -c 200 "$RUN/modprobe.err")"
+	else
+		modprobe --ignore-install cafe_nand allow_bbt_write=0 2>"$RUN/modprobe.err" \
+			|| fatal "cafe_nand failed to load" "$(head -c 200 "$RUN/modprobe.err")"
+	fi
+fi
+i=0
+while [ ! -d "$SYSD/mtd2" ] || [ ! -e "$MTD2" ] || [ ! -e "$MTD1" ]; do
+	i=$(( i + 1 ))
+	[ "$i" -gt 20 ] && fatal "no NAND found (the three MTD partitions did not appear)" "The driver loaded but did not detect a NAND." \
+		"$(dmesg | grep -v 'command line' | grep -i -E 'cafe_nand|cafe-nand|nandsim|mtd[0-9]' | tail -n 2 | cut -c1-70 | tr '\n' ' ')"
+	olpc_sleep 1
+done
+dmesg | tail -n +"$BASEDMESG" >"$OUTD/dmesg-nand.txt" 2>/dev/null
+
+# layout: every attribute must match before any write
+LAYOUT_ERR=""
+lay() { [ "$(sattr "$1" "$2")" = "$3" ] || LAYOUT_ERR="$LAYOUT_ERR mtd$1.$2=$(sattr "$1" "$2")(want $3);"; }
+_cnt=0
+for _d in "$SYSD"/mtd*; do
+	_b=${_d##*/}; case ${_b#mtd} in ''|*[!0-9]*) continue ;; esac
+	_cnt=$(( _cnt + 1 ))
+done
+[ "$_cnt" = 3 ] || LAYOUT_ERR="$LAYOUT_ERR $_cnt mtd devices instead of 3;"
+P0=$(( PRE_KIB * 1024 )); P1=$TBYTES; P2=$(( SIZE - P0 - P1 ))
+[ "$P1" = "$(( TEST_KIB * 1024 ))" ] || LAYOUT_ERR="$LAYOUT_ERR window size mismatch;"
+lay 0 name pre; lay 1 name test; lay 2 name post
+lay 0 size "$P0"; lay 1 size "$P1"; lay 2 size "$P2"
+lay 0 offset 0; lay 1 offset "$P0"; lay 2 offset "$(( P0 + P1 ))"
+for _n in 0 1 2; do
+	lay $_n type nand; lay $_n erasesize "$ERASE"; lay $_n writesize "$WRITE"; lay $_n oobsize "$OOB"
+	_f=$(sattr $_n flags)
+	case $_f in
+	0x*|[0-9]*) _w=$(( _f & 0x400 ))
+		if [ "$_n" = 1 ]; then [ "$_w" -ne 0 ] || LAYOUT_ERR="$LAYOUT_ERR mtd1 is NOT writeable (flags $_f);"
+		else [ "$_w" -eq 0 ] || LAYOUT_ERR="$LAYOUT_ERR mtd$_n IS WRITEABLE (flags $_f);"; fi ;;
+	*) LAYOUT_ERR="$LAYOUT_ERR mtd$_n flags unreadable;" ;;
+	esac
+done
+if [ "$SIM" != 1 ] && [ -z "$NT_NOLOAD" ]; then
+	_p=$(cat "$MODSYS/parameters/allow_bbt_write" 2>/dev/null)
+	[ "$_p" = 0 ] || LAYOUT_ERR="$LAYOUT_ERR allow_bbt_write='$_p';"
+fi
+{ echo "== /proc/mtd"; cat /proc/mtd 2>&1
+  for _n in 0 1 2; do echo "== mtd$_n"; for _a in name type flags size offset erasesize writesize oobsize ecc_strength bitflip_threshold ecc_failures corrected_bits bad_blocks bbt_blocks; do echo "$_a=$(sattr $_n $_a)"; done; done
+} >"$OUTD/mtd-info.txt" 2>&1
+[ -z "$LAYOUT_ERR" ] || fatal "MTD layout is not the expected one: $LAYOUT_ERR" "Nothing was written."
+LAYOUT_OK=1
+say "layout ok: mtd0 pre ro $(( P0 / 1048576 )) MiB, mtd1 test rw $(( P1 / 1048576 )) MiB @ $(( P0 / 1048576 )) MiB, mtd2 post ro $(( P2 / 1048576 )) MiB; geometry $ERASE/$WRITE/$OOB"
+ECC_SYS0=$(ecc_sys)
+
+# ---- 0a. precheck: the whole NAND against the backup ------------------------------------------
+say "step 0: precheck (no writes): full ECC dump, per-block SHA-256 vs the backup"
+TA=$(tcs)
+hash_pass pre "Precheck: reading the NAND" 4 30 || fatal "precheck dump failed" "See $LOG" "$(tail -n 1 "$OUTD/nanddump-pre.err" 2>/dev/null)"
+cmp_blocks "$RUN/pre.blk"
+say "precheck: $CB_NA blocks hashed; vs backup: $CB_OUT differ outside the known bad blocks, $CB_BAD differ inside them; $(mbs "$SIZE" "$(( $(tcs) - TA ))")"
+if [ "$CB_NA" != "$CB_NE" ] || [ "$CB_OUT" != 0 ]; then
+	cp "$RUN/pre.blk" "$OUTD/precheck-blocks.txt" 2>/dev/null
+	fatal "the NAND differs from the backup (blocks: $CB_LIST)" "$CB_OUT block(s) changed since the backup (or the dump is short)." "ABORTED before any write."
+fi
+prog 36 "Precheck: window OOB"
+if raw_oob_check "$EXP_OOB" pre; then
+	say "precheck window: $OC_PAGES pages; data bytes not 0xFF: $OC_DNON; OOB differs from the backup: $OC_DB bytes / $OC_DBITS bits in $OC_DPG pages (critical area: $OC_CRIT bytes)"
+	[ "$OC_DB" != 0 ] && say "precheck window: OOB differences (first lines): $(head -n 3 "$OUTD/oob-diff-pre.txt" 2>/dev/null | tr '\n' ';')"
+	[ "$OC_DNON" = 0 ] || fatal "the test window is not all 0xFF ($OC_DNON data bytes differ)" "Not touching it." "ABORTED before any write."
+else
+	fatal "raw precheck of the window failed" "nanddump/nbtool error; see $LOG" "ABORTED before any write."
+fi
+say "precheck ok: the NAND equals the backup; the window is erased"
+
+# ---- 1. erase ---------------------------------------------------------------------------------
+prog 40 "Step 1: erase the window"
+say "step 1: erase the window (no cleanmarkers), verify 0xFF"
+w_erase erase1 || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase1.out")"
+SP_ERASE=$(mbs "$TBYTES" "$DCS")
+if all_ff ff1; then chk "erase: ECC read all 0xFF" 0 "$SP_ERASE"; else chk "erase: ECC read all 0xFF" 1 "$FF_NON bytes not FF"; fi
+if raw_oob_check "" ff1; then
+	[ "$OC_DNON" = 0 ] && [ "$OC_ECCFF" = "$TPAGES" ] && chk "erase: raw dump all 0xFF data, ECC bytes erased on every page" 0 \
+		|| chk "erase: raw dump all 0xFF data, ECC bytes erased on every page" 1 "data non-FF $OC_DNON, pages with ECC bytes $(( TPAGES - OC_ECCFF ))"
+else chk "erase: raw dump" 1 "dump failed"; fi
+say "erase speed: $SP_ERASE"
+
+# ---- 2. patterns ------------------------------------------------------------------------------
+pattern_test() {   # pattern_test NAME GENCMD...
+	_pn=$1; shift
+	"$@" >"$RUN/pat.bin" || fatal "cannot generate pattern $_pn"
+	[ "$(wc -c <"$RUN/pat.bin")" = "$TBYTES" ] || fatal "pattern $_pn has the wrong size"
+	_e0=$(ecc_sys)
+	if w_write "wr-$_pn" "$RUN/pat.bin" -p; then
+		SP_W=$(mbs "$TBYTES" "$DCS"); chk "$_pn: nandwrite" 0 "$SP_W"
+	else fatal "nandwrite failed (rc=$RC) for pattern $_pn" "$(head -c 100 "$RUN/wr-$_pn.out")"; fi
+	_cs; _a=$CS
+	if read_cmp "rd-$_pn" "$RUN/pat.bin" -q --bb=dumpbad; then
+		_cs; SP_R=$(mbs "$TBYTES" "$(( CS - _a ))")
+		if [ "$CMP_B" = 0 ] && [ "$CMP_N" = "$TBYTES" ]; then chk "$_pn: ECC read-back identical" 0 "$SP_R"
+		else chk "$_pn: ECC read-back identical" 1 "$CMP_B bytes / $CMP_BITS bits in $CMP_BLK blocks differ ($CMP_N bytes read)"; fi
+	else chk "$_pn: ECC read-back" 1 "nanddump/nbcmp error"; fi
+	set -- $(ecc_counts "rd-$_pn"); _up=$1; _cp=$2; _cb=$3
+	[ "$_up" = 0 ] && chk "$_pn: no uncorrectable ECC errors on read-back" 0 "corrected pages $_cp, bits $_cb" \
+		|| chk "$_pn: no uncorrectable ECC errors on read-back" 1 "$_up page(s)"
+	_t=$(tcs)
+	"$ND" -q --bb=dumpbad --oob --noecc "$TMTD" >"$RUN/raw-$_pn.bin" 2>"$RUN/raw-$_pn.err"; _rc=$?
+	if [ "$_rc" = 0 ] && "$NBTOOL" oob -w "$WRITE" -o "$OOB" -E "$ECC_OFF" "$ECC_LEN" <"$RUN/raw-$_pn.bin" >"$RUN/raw-$_pn.res"; then
+		read -r _p _dn _db _dbi _dp _eff _cr <"$RUN/raw-$_pn.res"
+		if [ "$_pn" = zero ]; then   # the ECC of all-zero data may legitimately be all 0xFF (Hamming) : information only
+			[ "$_p" = "$TPAGES" ] && chk "$_pn: raw dump complete" 0 "$_p pages; pages whose ECC bytes are all 0xFF: $_eff (info: the ECC of zero data may be FF)" \
+				|| chk "$_pn: raw dump complete" 1 "pages $_p of $TPAGES"
+		else
+		[ "$_p" = "$TPAGES" ] && [ "$_eff" = 0 ] && chk "$_pn: raw dump: ECC bytes present on all $_p pages" 0 \
+			|| chk "$_pn: raw dump: ECC bytes present on all pages" 1 "pages $_p of $TPAGES, pages without ECC bytes: $_eff"
+		fi
+	else chk "$_pn: raw dump" 1 "rc=$_rc"; fi
+	_e1=$(ecc_sys)
+	say "$_pn: sysfs ecc_failures/corrected_bits $_e0 -> $_e1 (info; the dump's own ECC lines are authoritative)"
+	set -- $_e0 $_e1
+	case $1$3 in *[!0-9]*) ;; *) [ "$3" = "$1" ] && chk "$_pn: sysfs ecc_failures unchanged" 0 || chk "$_pn: sysfs ecc_failures unchanged" 1 "$1 -> $3" ;; esac
+}
+prog 44 "Step 2: pseudo-random pattern"
+say "step 2: patterns (write, read back, raw check)"
+pattern_test random "$NBTOOL" gen 20260 "$TBYTES"
+cp "$RUN/raw-random.bin" "$RUN/raw-keep.bin" 2>/dev/null
+cp "$RUN/pat.bin" "$RUN/pat-random.bin" 2>/dev/null
+say "random speeds: write $SP_W, read $SP_R"
+w_erase erase2 || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase2.out")"
+prog 52 "Step 2: all-0x00 pattern"
+pattern_test zero "$NBTOOL" fill 00 "$TBYTES"
+say "zero speeds: write $SP_W, read $SP_R"
+w_erase erase3 || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase3.out")"
+rm -f "$RUN/raw-zero.bin" "$RUN/raw-random.bin"
+all_ff ff3 && chk "erase after patterns: all 0xFF" 0 "$(mbs "$TBYTES" "$DCS")" || chk "erase after patterns: all 0xFF" 1 "$FF_NON bytes not FF"
+
+# ---- 3. ECC correction -------------------------------------------------------------------------
+prog 58 "Step 3: ECC correction"
+say "step 3: ECC correction (raw page writes with flipped bits)"
+# pages 0 and 1 of the random pattern (data+ECC+OOB as the controller wrote them), then flips
+dd if="$RUN/raw-keep.bin" of="$RUN/two.bin" bs="$RAWPG" count=2 2>/dev/null
+head -c 4096 "$RUN/pat-random.bin" >"$RUN/two.exp"
+if [ "$(wc -c <"$RUN/two.bin")" = "$(( 2 * RAWPG ))" ]; then
+	# page 0: one data bit; page 1: two bits in different places (separate ECC symbols)
+	"$NBTOOL" flip "$RUN/two.bin" 100 3
+	"$NBTOOL" flip "$RUN/two.bin" "$(( RAWPG + 100 ))" 5
+	"$NBTOOL" flip "$RUN/two.bin" "$(( RAWPG + 1500 ))" 0
+	_e0=$(ecc_sys)
+	if w_write rawpg "$RUN/two.bin" -n -o; then
+		if read_cmp ecc1 "$RUN/two.exp" --bb=dumpbad -l 4096; then
+			set -- $(ecc_counts ecc1); _up=$1; _cp=$2; _cb=$3
+			if [ "$CMP_B" = 0 ] && [ "$CMP_N" = 4096 ]; then chk "ECC: original data returned for 1 + 2 flipped bits" 0
+			else chk "ECC: original data returned for 1 + 2 flipped bits" 1 "$CMP_B bytes differ, nanddump: uncorrectable pages $_up"; fi
+			[ "$_cb" -ge 3 ] 2>/dev/null && chk "ECC: nanddump reports the corrections" 0 "$_cp page(s), $_cb bit(s)" \
+				|| chk "ECC: nanddump reports the corrections" 1 "corrected pages $_cp, bits $_cb (expected 3 bits in 2 pages)"
+		else chk "ECC: read of the flipped pages" 1 "nanddump/nbcmp error"; fi
+		_e1=$(ecc_sys); say "ECC: sysfs ecc_failures/corrected_bits $_e0 -> $_e1 (info)"
+	else
+		chk "ECC: raw page write (nandwrite -n -o)" 1 "rc=$RC: $(head -c 100 "$RUN/rawpg.out")"
+	fi
+else chk "ECC: raw pages of the random pattern" 1 "raw dump too short"; fi
+rm -f "$RUN/raw-keep.bin" "$RUN/pat-random.bin" "$RUN/two.bin"
+w_erase erase4 || fatal "flash_erase failed (rc=$RC)" "$(head -c 100 "$RUN/erase4.out")"
+all_ff ff4 && chk "erase after ECC test: all 0xFF" 0 || chk "erase after ECC test: all 0xFF" 1 "$FF_NON bytes not FF"
+
+# ---- 4. JFFS2 at run time ----------------------------------------------------------------------
+mount_j() { [ -b "$BLK1" ] || [ -n "$NT_TEST" ] || return 1; $MOUNT -t jffs2 "$BLK1" "$MNT" 2>"$RUN/mount.err" && MOUNTED=1; }
+umount_j() {
+	_i=0; until $UMOUNT "$MNT" 2>"$RUN/umount.err"; do
+		_i=$(( _i + 1 )); [ "$_i" -ge 10 ] && return 1; olpc_sleep 1
+	done
+	MOUNTED=0
+}
+jffs2_msgs() { dmesg | tail -n +"$BASEDMESG" | grep -i jffs2 | grep -i -E 'error|corrupt|bad ' | head -n 5; }
+prog 62 "Step 4: JFFS2"
+say "step 4: JFFS2 at run time"
+w_erase erase5 -j || fatal "flash_erase -j failed (rc=$RC)" "$(head -c 100 "$RUN/erase5.out")"
+SRC=$RUN/src; rm -rf "$SRC"; mkdir -p "$SRC/sub"
+"$NBTOOL" gen 77 3145728 >"$SRC/big.bin"
+"$NBTOOL" fill 00 262144 >"$SRC/zero.bin"
+i=0; while [ "$i" -lt 150 ]; do echo "olpc nandtest small file $i" >"$SRC/s$i.txt"; i=$(( i + 1 )); done
+i=0; while [ "$i" -lt 20 ]; do "$NBTOOL" gen "$i" "$(( 1000 + i * 733 ))" >"$SRC/sub/r$i.bin"; i=$(( i + 1 )); done
+( cd "$SRC" && find . -type f | sort | xargs sha256sum ) >"$RUN/src.sha"
+NF=$(wc -l <"$RUN/src.sha")
+J_OK=1
+if mount_j; then
+	_cs; _a=$CS
+	cp -R "$SRC"/. "$MNT"/ 2>"$RUN/cp.err" && sync || { chk "jffs2: write files" 1 "$(head -c 100 "$RUN/cp.err")"; J_OK=0; }
+	_cs; say "jffs2: wrote $NF files ($(( (3145728 + 262144) / 1024 )) KiB + small ones): $(mbs 3407872 "$(( CS - _a ))")"
+	df -k "$MNT" 2>/dev/null | tail -n 1 >>"$LOG"
+	umount_j || fatal "cannot unmount the JFFS2 test mount" "$(head -c 100 "$RUN/umount.err")"
+	[ -n "$NT_TEST" ] || echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+	if mount_j; then
+		_cs; _a=$CS
+		if ( cd "$MNT" && sha256sum -c "$RUN/src.sha" >"$RUN/vf.out" 2>&1 ) && [ "$(find "$MNT" -type f | wc -l)" = "$NF" ]; then
+			_cs; chk "jffs2: $NF files verified after umount + remount" 0 "read+hash $(mbs 3407872 "$(( CS - _a ))")"
+		else chk "jffs2: files verified after remount" 1 "$(grep -v ': OK' "$RUN/vf.out" | head -n 3 | tr '\n' ';')"; fi
+		umount_j || fatal "cannot unmount the JFFS2 test mount" "$(head -c 100 "$RUN/umount.err")"
+	else chk "jffs2: remount" 1 "$(head -c 120 "$RUN/mount.err")"; fi
+else chk "jffs2: mount of the freshly cleanmarked window" 1 "$(head -c 120 "$RUN/mount.err")"; fi
+_m=$(jffs2_msgs); [ -z "$_m" ] && chk "jffs2: no error messages in dmesg" 0 || chk "jffs2: no error messages in dmesg" 1 "$_m"
+rm -rf "$SRC"
+
+# ---- 5. JFFS2 install path ---------------------------------------------------------------------
+prog 74 "Step 5: JFFS2 image install"
+say "step 5: install path: erase -j, nandwrite the build-time JFFS2 image ($(wc -c <"$INST_IMG") bytes), mount, verify"
+w_erase erase6 -j || fatal "flash_erase -j failed (rc=$RC)" "$(head -c 100 "$RUN/erase6.out")"
+if w_write inst "$INST_IMG" -p; then
+	chk "install: nandwrite of the JFFS2 image" 0 "$(mbs "$(wc -c <"$INST_IMG")" "$DCS")"
+	if mount_j; then
+		_nf=$(wc -l <"$INST_SUM")
+		if ( cd "$MNT" && sha256sum -c "$INST_SUM" >"$RUN/vf2.out" 2>&1 ) && [ "$(find "$MNT" -type f | wc -l)" = "$_nf" ]; then
+			chk "install: mounted, $_nf files verified" 0
+		else chk "install: files verified" 1 "$(grep -v ': OK' "$RUN/vf2.out" | head -n 3 | tr '\n' ';')"; fi
+		umount_j || fatal "cannot unmount the JFFS2 test mount" "$(head -c 100 "$RUN/umount.err")"
+	else chk "install: mount of the written image" 1 "$(head -c 120 "$RUN/mount.err")"; fi
+else chk "install: nandwrite of the JFFS2 image" 1 "rc=$RC: $(head -c 100 "$RUN/inst.out")"; fi
+_m=$(jffs2_msgs); [ -z "$_m" ] && chk "install: no JFFS2 error messages in dmesg" 0 || chk "install: no JFFS2 error messages in dmesg" 1 "$_m"
+
+# ---- 6. restore and compare everything -------------------------------------------------------------
+prog 80 "Step 6: restore"
+say "step 6: restore: erase -j, raw OOB identical to the backup, then the full dump vs the backup"
+w_erase erase7 -j || fatal "flash_erase -j failed (rc=$RC) while restoring" "$(head -c 100 "$RUN/erase7.out")"
+if raw_oob_check "$EXP_OOB" post; then
+	say "restore window: $OC_PAGES pages; data bytes not 0xFF: $OC_DNON; OOB vs backup: $OC_DB bytes / $OC_DBITS bits / $OC_DPG pages differ, ECC+cleanmarker area: $OC_CRIT bytes"
+	[ "$OC_DB" != 0 ] && say "restore OOB differences (first lines): $(head -n 5 "$OUTD/oob-diff-post.txt" 2>/dev/null | tr '\n' ';')"
+	[ "$OC_DNON" = 0 ] && chk "restore: window data all 0xFF (raw)" 0 || chk "restore: window data all 0xFF (raw)" 1 "$OC_DNON bytes"
+	[ "$OC_CRIT" = 0 ] && chk "restore: cleanmarkers and ECC area identical to the backup" 0 || chk "restore: cleanmarkers and ECC area identical to the backup" 1 "$OC_CRIT bytes differ"
+	[ "$OC_DB" = 0 ] && chk "restore: every page OOB identical to the backup" 0 || chk "restore: every page OOB identical to the backup" 1 "$OC_DB bytes / $OC_DBITS bits in $OC_DPG pages (see $OUTD/oob-diff-post.txt)"
+else chk "restore: raw dump of the window" 1 "dump failed"; fi
+prog 84 "Final check: reading the NAND"
+CB_OUT=unknown
+TA=$(tcs)
+if hash_pass post "Final check: reading the NAND" 84 14; then
+	cmp_blocks "$RUN/post.blk"
+	say "final: $CB_NA blocks hashed; vs backup: $CB_OUT differ outside the bad blocks, $CB_BAD inside them; $(mbs "$SIZE" "$(( $(tcs) - TA ))")"
+	if [ "$CB_NA" = "$CB_NE" ] && [ "$CB_OUT" = 0 ]; then chk "final: all $CB_NA erase blocks equal the backup" 0 "$CB_BAD bad-block hash difference(s)"
+	else cp "$RUN/post.blk" "$OUTD/final-blocks.txt" 2>/dev/null; chk "final: whole NAND equals the backup" 1 "$CB_OUT block(s) differ: $CB_LIST"; fi
+else chk "final: dump of the whole NAND" 1 "incomplete"; fi
+WROTE=0
+
+# ---- report ------------------------------------------------------------------------------------------
+TEND=$(up)
+say "time: whole run $(( TEND - T0 )) s; erase $SP_ERASE"
+if [ "$NFAIL" = 0 ]; then
+	prog 100 "NAND test passed"
+	say "RESULT: OK ($NCHK checks)"
+	screen "NAND TEST: OK" "All $NCHK checks passed; the NAND equals the backup again." "Erase $SP_ERASE; random write $SP_W." "Details: $LOG" "Powering off in $END_WAIT s."
+else
+	FINAL_RC=1
+	say "RESULT: FAILED ($NFAIL of $NCHK checks):$FAILED"
+	screen "NAND TEST: FAILED" "$NFAIL of $NCHK checks failed (first: $(echo "$FAILED" | sed -n 2p | cut -c1-60))" "The NAND $( [ "$CB_OUT" = 0 ] && echo 'equals the backup' || echo 'DIFFERS from the backup') in the final dump." "Details: $LOG" "Powering off in $END_WAIT s."
+fi
+cp "$LOG" "$OUTD/NANDTEST.txt" 2>/dev/null
+finish

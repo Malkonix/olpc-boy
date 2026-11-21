@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include "menulib.h"
 #include "netui.h"
+#include "wallpaper.h"
 #include "osk.h"
 
 static const struct netui_host *H;
@@ -29,7 +30,7 @@ void netui_init(const struct netui_host *h) { H = nd_h = h; }
 
 /* -------------------------------------------------------------------- drawing helpers */
 
-void nd_fill(int x, int y, int w, int h, uint16_t c)
+static void bg_fill(int x, int y, int w, int h, uint16_t c, int dim)
 {
 	int x1 = x + w, y1 = y + h;
 
@@ -38,9 +39,13 @@ void nd_fill(int x, int y, int w, int h, uint16_t c)
 	if (x1 > H->g->w) x1 = H->g->w;
 	if (y1 > H->g->h) y1 = H->g->h;
 	if (x1 <= x || y1 <= y) return;
-	gfx_fill(H->g, x, y, x1 - x, y1 - y, c);
+	if (c == NC_BG && H->wall) wp_blit(H->g->px, H->g->stride, H->wall, H->g->stride, x, y, x1 - x, y1 - y, dim);
+	else gfx_fill(H->g, x, y, x1 - x, y1 - y, c);
 	H->dirty(x, y, x1 - x, y1 - y);
 }
+
+void nd_fill(int x, int y, int w, int h, uint16_t c) { bg_fill(x, y, w, h, c, 0); }
+void nd_fill_dim(int x, int y, int w, int h) { bg_fill(x, y, w, h, NC_BG, 1); }
 
 void nd_frame(int x, int y, int w, int h, int t, uint16_t c)
 {
@@ -500,7 +505,8 @@ static void draw_row(int i)       /* i = row on screen */
 	uint16_t bg = on ? SEL : NC_BG;
 	char b[200];
 
-	nd_fill(LX, y, LW, RH, bg);
+	if (bg == NC_BG) nd_fill_dim(LX, y, LW, RH);
+	else nd_fill(LX, y, LW, RH, bg);
 	if (idx >= nrows) return;
 	if (rows[idx].kind == R_NET) {
 		const struct net *n = &nets[rows[idx].idx];
@@ -533,7 +539,7 @@ static void draw_scrollbar(void)
 {
 	int h = list_rows() * RH, th, ty;
 
-	nd_fill(LX + LW + 6, LIST_Y, 8, h, NC_BG);
+	nd_fill_dim(LX + LW + 6, LIST_Y, 8, h);
 	if (nrows <= list_rows()) return;
 	nd_fill(LX + LW + 6, LIST_Y, 8, h, NC_PANEL);
 	th = h * list_rows() / nrows;
@@ -546,7 +552,7 @@ static void draw_list(void)
 {
 	int i;
 
-	nd_fill(0, LIST_Y - 4, H->g->w, list_rows() * RH + 8, NC_BG);
+	nd_fill_dim(0, LIST_Y - 4, H->g->w, list_rows() * RH + 8);
 	for (i = 0; i < list_rows(); i++) draw_row(i);
 	draw_scrollbar();
 }

@@ -14,7 +14,7 @@
 
 /* osk.c draws through these; the unit checks never draw */
 static struct gfx fakeg = { NULL, 1200, 1200, 900 };
-static struct netui_host fakehost = { &fakeg, NULL, NULL, NULL, NULL, NULL, NULL };
+static struct netui_host fakehost = { &fakeg, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 const struct netui_host *nd_host(void) { return &fakehost; }
 void nd_fill(int x, int y, int w, int h, uint16_t c) { (void)x; (void)y; (void)w; (void)h; (void)c; }
 void nd_frame(int x, int y, int w, int h, int t, uint16_t c) { (void)x; (void)y; (void)w; (void)h; (void)t; (void)c; }

@@ -22,7 +22,7 @@ INITRAMFS_SRC := $(shell find initramfs -type f 2>/dev/null) scripts/mkinitramfs
 KERNEL_SRC    := $(shell find kernel -type f 2>/dev/null)
 ROOTFS_SRC    := $(shell find rootfs src -type f 2>/dev/null) scripts/mkrootfs.sh
 
-.PHONY: backup-test backup-rootfs backup-check backup-image qemu-backup olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
+.PHONY: nandtest-test nandtest-rootfs nandtest-check nandtest-image qemu-nandtest backup-test backup-rootfs backup-check backup-image qemu-backup olpc-splash-test chordd-test fbbench-test olpc-run-test olpc-menu-test all builder initramfs kernel rootfs check image qemu flash logs clean distclean
 all: image
 
 builder:
@@ -67,7 +67,7 @@ logs:
 
 # out/ holds root-owned files from the container, so delete from inside it.
 clean:
-	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/olpc-boy-nandbackup.img out/backup-rootfs.tar out/backup-work out/backup-work.test.log out/qemu-backup-* out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
+	$(RUN_ROOT) sh -c 'rm -rf out/olpc-boy.img out/olpc-boy-nandbackup.img out/backup-rootfs.tar out/backup-work out/backup-work.test.log out/qemu-backup-* out/olpc-boy-nandtest.img out/nandtest-rootfs.tar out/nandtest-work out/nandtest-work.test.log out/qemu-nandtest-* out/rootfs.tar out/rootfs-work out/initramfs out/kernel out/.*.stamp out/qemu-* out/test-*'
 
 distclean:
 	$(RUN_ROOT) sh -c 'rm -rf out/* out/.*.stamp'
@@ -119,3 +119,39 @@ qemu-backup: out/olpc-boy-nandbackup.img
 # Logic tests of the backup script against a fake MTD (needs zstd in the builder: apk add zstd).
 backup-test:
 	$(RUN_ROOT) sh -c 'apk add --no-cache zstd >/dev/null 2>&1; sh backup/test.sh'
+
+# ---- NAND write-test image (separate; the normal image is unaffected) ----------------------
+# make nandtest-image  ->  out/olpc-boy-nandtest.img: non-destructive write tests of an 8 MiB free
+# window of the XO-1 NAND (everything else read-only), then a full compare with the NAND backup.
+# The reference hashes are generated at build time from the backup (mounted read-only):
+#   NAND_BACKUP_DIR=<dir with nand-data-ecc.bin and nand-raw-oob.bin>   (default below)
+NAND_BACKUP_DIR ?= $(HOME)/olpc-nand-backup/run2-nandbackup-001
+NANDTEST_SRC := $(shell find nandtest -type f 2>/dev/null) scripts/mknandtest.sh backup/src/nbhash.c backup/src/nbcmp.c rootfs/overlay/usr/libexec/olpcboy/common.sh $(shell find src/olpc-splash src/common -type f 2>/dev/null)
+
+nandtest-rootfs: out/nandtest-rootfs.tar
+nandtest-check:  out/.nandtest-check.stamp
+nandtest-image:  out/olpc-boy-nandtest.img
+
+out/nandtest-rootfs.tar: out/kernel/bzImage $(NANDTEST_SRC)
+	@test -r "$(NAND_BACKUP_DIR)/nand-data-ecc.bin" -a -r "$(NAND_BACKUP_DIR)/nand-raw-oob.bin" || { \
+	  echo "ERROR: NAND backup not found in '$(NAND_BACKUP_DIR)' (need nand-data-ecc.bin and nand-raw-oob.bin); set NAND_BACKUP_DIR=..." >&2; exit 1; }
+	$(DOCKER) -v "$(NAND_BACKUP_DIR)":/nandbackup:ro -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) $(BUILDER) bash scripts/mknandtest.sh
+	@touch $@
+
+out/.nandtest-check.stamp: out/nandtest-rootfs.tar scripts/check-sse.sh
+	$(RUN_USER) bash scripts/check-sse.sh out/nandtest-rootfs.tar
+	@touch $@
+
+out/olpc-boy-nandtest.img: out/kernel/bzImage out/nandtest-rootfs.tar out/.nandtest-check.stamp nandtest/olpc.fth scripts/mkimage.sh
+	$(DOCKER) -e HOST_UID=$(UID_) -e HOST_GID=$(GID_) -e IMG_OUT=out/olpc-boy-nandtest.img \
+	  -e ROOTFS_TAR=out/nandtest-rootfs.tar -e FTH=nandtest/olpc.fth -e NO_USERDATA=1 -e FREE_MIB=8 \
+	  $(BUILDER) bash scripts/mkimage.sh
+
+# QEMU has no CAFE controller: boots the image once without NAND (must stop safely) and once with
+# nandsim (simulated NAND, all six steps end to end).
+qemu-nandtest: out/olpc-boy-nandtest.img
+	bash scripts/qemu-nandtest-test.sh
+
+# Logic tests of the write-test script against a file-backed fake NAND (builder: gcc, mtd-utils).
+nandtest-test:
+	$(RUN_ROOT) sh nandtest/test.sh

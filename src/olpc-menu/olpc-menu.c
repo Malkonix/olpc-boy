@@ -42,6 +42,7 @@
 #include "../common/gfx.h"
 #include "../olpc-run/input.h"
 #include "netui.h"
+#include "wallpaper.h"
 
 /* ------------------------------------------------------------------ config */
 
@@ -84,6 +85,7 @@ static uint64_t now_ms(void)
 /* ------------------------------------------------------------ framebuffer */
 
 static int FBW = 1200, FBH = 900;
+static uint16_t *wall;                     /* pre-rendered wallpaper, same layout as bb (NULL: flat C_BG) */
 static uint16_t *bb;                       /* back buffer: what the screen shows; never read the fb */
 static struct gfx G;                       /* the back buffer as a drawing surface */
 static uint8_t *fbmap;
@@ -232,13 +234,14 @@ static void flush(void)
 
 #define RGB(r, g, b) ((uint16_t)((((r) & 0xf8) << 8) | (((g) & 0xfc) << 3) | ((b) >> 3)))
 static const uint16_t C_BG = RGB(14, 18, 26), C_TEXT = RGB(235, 238, 242), C_DIM = RGB(150, 160, 178),
-		      C_PANEL = RGB(26, 32, 44), C_BORDER = RGB(80, 92, 116), C_HINT = RGB(22, 26, 36),
+		      C_PANEL = RGB(26, 32, 44), C_WELL = RGB(20, 24, 34), C_BORDER = RGB(80, 92, 116), C_HINT = RGB(22, 26, 36),
 		      C_OK = RGB(150, 230, 150), C_BOX = RGB(30, 38, 54);
 /* per system: title bar, selection bar */
 static const uint16_t C_TITLE[NSYS] = { RGB(52, 78, 30), RGB(66, 42, 112), RGB(122, 30, 30) };
 static const uint16_t C_SEL[NSYS] = { RGB(88, 128, 44), RGB(110, 70, 180), RGB(190, 50, 50) };
 
-static void fill(int x, int y, int w, int h, uint16_t c)
+/* A fill with C_BG restores the wallpaper (dim: darkened, calm panel behind list text); others are flat. */
+static void fill_bg(int x, int y, int w, int h, uint16_t c, int dim)
 {
 	int x1 = x + w, y1 = y + h;
 
@@ -247,9 +250,14 @@ static void fill(int x, int y, int w, int h, uint16_t c)
 	if (x1 > FBW) x1 = FBW;
 	if (y1 > FBH) y1 = FBH;
 	if (x1 <= x || y1 <= y) return;
-	gfx_fill(&G, x, y, x1 - x, y1 - y, c);
+	if (c == C_BG && wall) wp_blit(bb, FBW, wall, FBW, x, y, x1 - x, y1 - y, dim);
+	else gfx_fill(&G, x, y, x1 - x, y1 - y, c);
 	dirty_add(x, y, x1 - x, y1 - y);
 }
+
+static void fill(int x, int y, int w, int h, uint16_t c) { fill_bg(x, y, w, h, c, 0); }
+/* list panel background: wallpaper at half brightness */
+static void fill_dim(int x, int y, int w, int h) { fill_bg(x, y, w, h, C_BG, 1); }
 
 static void frame(int x, int y, int w, int h, int t, uint16_t c)
 {
@@ -314,6 +322,12 @@ static void layout(void)
 	list_rows = (FBH - HINT_H - 12 - list_top_y) / ROW_H;
 	cov_x = FBW - PANEL - 24;
 	cov_y = TITLE_H + 24;
+}
+
+static void wall_init(void)
+{
+	wall = malloc((size_t)FBW * FBH * 2);
+	if (wall) wp_render(wall, FBW, FBH, FBH - HINT_H);
 }
 
 static struct rom *cur_rom(void)
@@ -562,7 +576,8 @@ static void draw_row(int i)       /* i = row on screen */
 	int idx = topi[cur_sys] + i, y = list_top_y + i * ROW_H;
 	int isel = idx == sel[cur_sys];
 
-	fill(LIST_X, y, LIST_W, ROW_H, isel ? C_SEL[cur_sys] : C_BG);
+	if (isel) fill(LIST_X, y, LIST_W, ROW_H, C_SEL[cur_sys]);
+	else fill_dim(LIST_X, y, LIST_W, ROW_H);
 	if (idx < L[cur_sys].n)
 		utext(LIST_X + 14, y + (ROW_H - 32) / 2, 2, C_TEXT, L[cur_sys].v[idx].name, (LIST_W - 28) / 16);
 }
@@ -571,7 +586,7 @@ static void draw_scrollbar(void)
 {
 	int n = L[cur_sys].n, h = list_rows * ROW_H, th, ty;
 
-	fill(SB_X, list_top_y, 8, h, C_BG);
+	fill_dim(SB_X, list_top_y, 8, h);
 	if (n <= list_rows) return;
 	fill(SB_X, list_top_y, 8, h, C_PANEL);
 	th = h * list_rows / n;
@@ -584,7 +599,7 @@ static void draw_list_all(void)
 {
 	int i;
 
-	fill(0, list_top_y - 12, SB_X + 10, FBH - HINT_H - list_top_y + 12, C_BG);
+	fill_dim(0, list_top_y - 12, SB_X + 10, FBH - HINT_H - list_top_y + 12);
 	if (!L[cur_sys].n) {
 		char b[96];
 		ctext((LIST_X + LIST_W) / 2, list_top_y + 80, 2, C_DIM, "No games here");
@@ -610,7 +625,7 @@ static void draw_cover_placeholder(void)
 
 	draw_cover_frame();
 	frame(cx - 90, cy - 120, 180, 190, 6, C_BORDER);               /* a cartridge-ish outline */
-	fill(cx - 66, cy - 98, 132, 84, C_BG);
+	fill(cx - 66, cy - 98, 132, 84, C_WELL);
 	ctext(cx, cy + 90, 3, C_DIM, SYS_TITLE[cur_sys]);
 	ctext(cx, cy + 150, 2, C_BORDER, "no cover");
 }
@@ -631,7 +646,7 @@ static void draw_info(void)
 	char lines[3][96], b[96];
 	unsigned char l1[512];
 
-	fill(cov_x - 4, y - 8, PANEL + 8, FBH - HINT_H - y, C_BG);
+	fill_dim(cov_x - 4, y - 8, PANEL + 8, FBH - HINT_H - y);
 	if (!r) return;
 	utf8_to_l1(r->name, l1, sizeof l1);
 	n = wrap_text(l1, PANEL / 16, lines, 3);
@@ -667,7 +682,7 @@ static void draw_empty_state(void)
 {
 	int x = 64, y = list_top_y + 40;
 
-	fill(0, list_top_y - 12, FBW, FBH - HINT_H - list_top_y + 12, C_BG);
+	fill_dim(0, list_top_y - 12, FBW, FBH - HINT_H - list_top_y + 12);
 	text(x, y, 3, C_TEXT, (const unsigned char *)"No games found");
 	text(x, y + 80, 2, C_TEXT, (const unsigned char *)"Put your game files in these folders on the SD card");
 	text(x, y + 116, 2, C_TEXT, (const unsigned char *)"or on the USB stick:");
@@ -1565,6 +1580,7 @@ int main(int argc, char **argv)
 	use_script = script != NULL;
 	layout();
 	if (fb_open() < 0) return 3;
+	wall_init();
 	install_signals();
 
 	input_init(&in, e_inputdir, NULL);
@@ -1590,7 +1606,7 @@ int main(int argc, char **argv)
 	sigaddset(&blockset, SIGCHLD); sigaddset(&blockset, SIGINT); sigaddset(&blockset, SIGTERM); sigaddset(&blockset, SIGHUP);
 	sigprocmask(SIG_BLOCK, &blockset, &oldset);
 
-	net_host.g = &G; net_host.dirty = dirty_add; net_host.title = net_title; net_host.hint = draw_hint;
+	net_host.g = &G; net_host.wall = wall; net_host.dirty = dirty_add; net_host.title = net_title; net_host.hint = draw_hint;
 	net_host.wifi = &g_wifi; net_host.wifi_bin = e_wifi; net_host.rundir = e_rundir;
 	netui_init(&net_host);
 	t_start = now_ms();

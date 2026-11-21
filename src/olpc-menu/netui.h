@@ -26,6 +26,7 @@ struct netui_host {
 	const struct wifistat *wifi;              /* live /run/olpcboy/wifi.status */
 	const char *wifi_bin;                     /* olpc-wifi */
 	const char *rundir;                       /* /run/olpcboy */
+	const uint16_t *wall;                     /* wallpaper, same layout as g (NULL: flat NC_BG) */
 };
 
 void netui_init(const struct netui_host *h);
@@ -54,7 +55,8 @@ void netui_busy_leave(void);                  /* the screen was left */
 #define NC_OK NRGB(150, 230, 150)
 #define NC_BOX NRGB(30, 38, 54)
 #define NC_WARN NRGB(255, 170, 120)
-void nd_fill(int x, int y, int w, int h, uint16_t c);
+void nd_fill(int x, int y, int w, int h, uint16_t c);      /* c == NC_BG restores the wallpaper */
+void nd_fill_dim(int x, int y, int w, int h);              /* the wallpaper at half brightness (list panels) */
 void nd_frame(int x, int y, int w, int h, int t, uint16_t c);
 int  nd_utext(int x, int y, int sc, uint16_t fg, const char *s, int maxch);    /* UTF-8, returns pixel width */
 void nd_ctext(int cx, int y, int sc, uint16_t fg, const char *s);              /* centred on cx */

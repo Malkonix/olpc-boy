@@ -359,3 +359,12 @@ Persistent background loop (service `olpc-usbdiag`, `nice 19`, poll 2 s; 6 s whi
   once per plug-in; never when the pad works.
 - Silent when idle: no files are written until the first event. Test:
   `docker run --rm -v $PWD:/work -w /work olpc-boy-builder sh scripts/test-olpc-usbdiag.sh`.
+
+## JFFS2 on NAND and the NAND simulator
+
+- `CONFIG_JFFS2_FS_WRITEBUFFER=y`: JFFS2 cannot run on NAND (CAFE) without the write buffer
+  (page-sized writes); the normal image never mounts the NAND, so this only matters for the
+  NAND write-test image.
+- `CONFIG_MTD_NAND_NANDSIM=m` (+ `CONFIG_MTD_NAND_ECC_SW_HAMMING=y`, which nandsim needs): a
+  simulated NAND for the QEMU run of the NAND write-test image (`make qemu-nandtest`). Never
+  loaded by the normal image.
